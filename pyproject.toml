@@ -1,0 +1,52 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [ "setuptools>=61", "wheel" ]
+
+[project]
+name = "aie4ml"
+version = "0.1.0"
+description = "AMD AIE backend plugin for hls4ml"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Dimitrios Danopoulos", email = "dimitrios.danopoulos@cern.ch" },
+]
+requires-python = ">=3.10"
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "hls4ml",
+  "jinja2",
+]
+urls.Homepage = "https://github.com/dimdano/aie4ml"
+urls.Issues = "https://github.com/dimdano/aie4ml/issues"
+entry-points."hls4ml.backends".AIE = "aie4ml.plugin:register"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = [ "src" ]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+target-version = "py310"
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "space"
+skip-magic-trailing-comma = false
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = []
+fixable = ["ALL"]
+unfixable = []
