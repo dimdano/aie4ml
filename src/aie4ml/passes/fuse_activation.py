@@ -12,8 +12,6 @@ class FuseActivationCasts(ModelOptimizerPass):
     def __init__(self):
         self.name = 'fuse_activation_casts'
 
-    ## TO DO: FIX  MATCH FOR NEW CASE
-
     def match(self, node):
         if getattr(node, 'op_type', None) != 'activation' or len(node.inputs) != 1:
             return False
@@ -23,7 +21,9 @@ class FuseActivationCasts(ModelOptimizerPass):
             return False
 
         prev_node = node.inputs[0].producer
-        if prev_node is None or getattr(prev_node, 'op_type', None) != 'dense':
+        if prev_node is None or \
+            (getattr(prev_node, 'op_type', None) != 'dense' and \
+             getattr(prev_node, 'op_type', None) != 'input'):
             return False
 
         return True
@@ -32,7 +32,8 @@ class FuseActivationCasts(ModelOptimizerPass):
         ctx = get_backend_context(model)
         graph: LogicalIR = ctx.ir.logical
 
-        for node in graph.nodes:
+        for i in range(len(graph.nodes) - 1, -1, -1):
+            node = graph.nodes[i]
             if self.match(node):
                 prev_node = node.inputs[0].producer
                 activation = node.metadata.get('activation', '').lower()
@@ -46,30 +47,4 @@ class FuseActivationCasts(ModelOptimizerPass):
 
                 graph.remove_node(node)
 
-        return True
-    
-    def _old_match(self, node):
-        if getattr(node, 'class_name', None) != 'Activation' or len(node.inputs) != 1:
-            return False
-
-        act = (node.get_attr('activation', '') or '').lower()
-        if act not in self._SUPPORTED:
-            return False
-
-        prev_node = node.get_input_node()
-        if prev_node is None or getattr(prev_node, 'class_name', None) != 'Dense':
-            return False
-
-        return True
-
-    def _old_transform(self, model, node):
-        dense = node.get_input_node()
-        activation = (node.get_attr('activation', '') or '').lower()
-
-        in_var = node.get_input_variable()
-        out_var = node.get_output_variable()
-        in_var.type.precision = out_var.type.precision
-
-        dense.set_attr('aie_fused_activation', activation)
-        model.remove_node(node)
         return True

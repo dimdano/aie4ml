@@ -28,9 +28,6 @@ class LowerToAieIr(ModelOptimizerPass):
     def __init__(self):
         self.name = 'lower_to_aie_ir'
 
-
-    # TO DO: ADD SUPPORT FOR ACTIVATION NODE
-
     def transform(self, model) -> bool:
         ctx = ensure_backend_context(model, lambda: self._create_context(model))
         ctx.reset_ir()
@@ -48,8 +45,6 @@ class LowerToAieIr(ModelOptimizerPass):
         created_nodes = set()
 
         for layer in layers:
-            if layer.class_name == 'Activation' and self._is_identity_activation(layer):
-                continue
 
             node = OpNode(
                 name=f'{layer.name}_aie',
@@ -149,7 +144,3 @@ class LowerToAieIr(ModelOptimizerPass):
             fused = (layer.get_attr('aie_fused_activation', '') or '').lower()
             if fused:
                 node.add_trait(TraitInstance('fused_activation', {'activation': fused}))
-
-    def _is_identity_activation(self, layer) -> bool:
-        act = (layer.get_attr('activation', '') or '').lower()
-        return act in ('', 'linear', 'identity')

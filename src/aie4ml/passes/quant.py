@@ -193,7 +193,6 @@ class IntegerQuantizer(ModelOptimizerPass):
                 continue
 
             source_layer_name = node.metadata.get('source_layer')
-            print("Processing IR node:", node.name, "of type:", node.op_type, "from source layer:", source_layer_name)
             layer = lookup_layer(model, source_layer_name)
             if layer is None:
                 log.warning('Unable to locate source layer "%s" for IR node %s.', source_layer_name, node.name)
@@ -268,14 +267,9 @@ class IntegerQuantizer(ModelOptimizerPass):
             quant_metadata['bias_precision'] = bias_intent
         quant_metadata['output_precision'] = output_intent
 
-        print(f"Quantization info for layer {layer.name}: {quant_metadata}")
-
         return True
 
     def _quantize_activation_node(self, model, ctx, node, layer) -> bool:
-
-        print("Running activation quantization for layer:", layer.name)
-
         input_var = layer.get_input_variable()
         output_var = layer.get_output_variable()
         input_precision = getattr(input_var.type, 'precision', None)
@@ -289,7 +283,5 @@ class IntegerQuantizer(ModelOptimizerPass):
         quant_metadata = node.metadata.setdefault('quant', {})
         quant_metadata['input_precision'] = input_intent
         quant_metadata['output_precision'] = output_intent
-
-        print(f"Quantization info for layer {layer.name}: {quant_metadata}")
 
         return True
