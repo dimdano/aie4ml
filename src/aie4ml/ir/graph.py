@@ -131,6 +131,38 @@ class LogicalIR:
     def add_node(self, node: OpNode) -> None:
         self.nodes.append(node)
 
+    def remove_node(self, node: OpNode) -> None:
+        if len(node.inputs) > 1 or len(node.outputs) > 1:
+            raise Exception('Cannot delete a node with multiple inputs/outputs')
+        
+        in_tv = node.inputs[0]
+        out_tv = node.outputs[0]
+        if in_tv.producer is None:
+            raise ValueError('Cannot remove input node')
+    
+        dst_nodes = list(out_tv.consumers)
+        for dst in dst_nodes:
+            # Replace out_tv with in_tv in dst inputs
+            for i, tv in enumerate(dst.inputs):
+                if tv is out_tv:
+                    dst.inputs[i] = in_tv        
+            
+            if dst not in in_tv.consumers:
+                in_tv.consumers.append(dst)
+                
+        # Disconnect node from input tensor
+        if node in in_tv.consumers:
+            in_tv.consumers.remove(node)
+            
+        # Cleanup output tensor
+        out_tv.consumers.clear()
+        out_tv.producer = None
+        self.tensors.pop(out_tv.name, None)
+        
+        # Remove node
+        self.nodes.remove(node)
+
+
     # TODO graph inputs wrong
     def graph_inputs(self) -> List[TensorVar]:
         """Tensors with no producer."""
