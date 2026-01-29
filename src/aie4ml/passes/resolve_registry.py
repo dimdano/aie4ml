@@ -263,12 +263,14 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
             resolved['bias'] = AIEDataType(
                 width=bias_width,
                 signed=bool(intents['bias'].signed),
-                frac=int(intents['bias'].frac),
+                # Bias is consumed in accumulator scale by the AIE dense kernels.
+                frac=int(intents['input'].frac + intents['weight'].frac),
                 rounding=intents['bias'].rounding,
                 saturation=intents['bias'].saturation,
                 c_type=_ctype_for_width(bias_width, bool(intents['bias'].signed)),
             )
         else:
+            bias_width = 32
             accum_frac = int(intents['input'].frac + intents['weight'].frac)
             resolved['bias'] = AIEDataType(
                 width=bias_width,
@@ -492,7 +494,7 @@ def _validate_parallel_override(
     if in_slice_raw * input_elem_bytes % 4 != 0:  # PLIO 32-bit align
         if allow_failure:
             return None
-        raise ValueError(f'{layer_name}: raw IN slice not 32-bit aligned')
+        raise ValueError(f'{layer_name}: raw IN slice not 32-bit aligned ({in_slice_raw * input_elem_bytes}B).')
 
     out_slice = _align_up(out_slice_raw, align_n)
     in_slice = _align_up(in_slice_raw, align_k)
@@ -635,7 +637,7 @@ def _resolve_parallelism_numeric(
                 utilization_penalty = abs(
                     1.0 - (cand['tile_bytes'] / per_tile_limit)
                 )  # prefer to use the full tile memory
-                aspect = cand['input_slice'] / cand['output_slice']
+                # aspect = cand['input_slice'] / cand['output_slice']
                 shape_penalty = max(
                     0.0, (cand['output_slice'] - cand['input_slice']) / max(1.0, cand['input_slice'])
                 )  # penalize OUT >> IN

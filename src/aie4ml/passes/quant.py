@@ -224,6 +224,7 @@ class IntegerQuantizer(ModelOptimizerPass):
         input_intent = _to_quant_intent(input_precision)
         weight_intent = _to_quant_intent(weight_precision)
         output_intent = _to_quant_intent(result_precision)
+        accum_frac = int(input_intent.frac + weight_intent.frac)
 
         quant_weights = _quantize_to_int(
             weight_var.data,
@@ -243,8 +244,8 @@ class IntegerQuantizer(ModelOptimizerPass):
             bias_intent = _to_quant_intent(bias_precision)
             quant_bias = _quantize_to_int(
                 bias_var.data,
-                bias_intent.frac,
-                bias_intent.width,
+                accum_frac,  # Bias is added in the accumulator domain in the AIE dense kernels.
+                32,
                 signed=bias_intent.signed,
                 rounding_mode=bias_intent.rounding,
                 saturation_mode=bias_intent.saturation,
@@ -259,7 +260,14 @@ class IntegerQuantizer(ModelOptimizerPass):
         quant_metadata['input_precision'] = input_intent
         quant_metadata['weight_precision'] = weight_intent
         if bias_intent is not None:
-            quant_metadata['bias_precision'] = bias_intent
+            quant_metadata['bias_precision'] = QuantIntent(
+                width=32,
+                frac=accum_frac,
+                signed=bool(bias_intent.signed),
+                rounding=bias_intent.rounding,
+                saturation=bias_intent.saturation,
+            )
+
         quant_metadata['output_precision'] = output_intent
 
         return True
