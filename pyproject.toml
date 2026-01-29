@@ -34,6 +34,14 @@ classifiers = [
 dependencies = [
    "jinja2>=3.0"
 ]
+
+[project.optional-dependencies]
+testing = [
+  "pytest>=7.0",
+  "keras",
+  "qkeras",
+]
+
 [project.urls]
 Homepage = "https://github.com/dimdano/aie4ml"
 Issues = "https://github.com/dimdano/aie4ml/issues"
@@ -66,3 +74,9 @@ select = ["E", "F", "I", "W"]
 ignore = []
 fixable = ["ALL"]
 unfixable = []
+
+[tool.pytest.ini_options]
+markers = [
+  "aie_ir: tests that exercise the hls4ml AIE backend",
+  "requires_vitis: requires AMD Vitis installation",
+]
