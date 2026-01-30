@@ -403,6 +403,7 @@ class DenseKernelVariant(KernelVariant):
             ],
             'io_tiling_dimension': [attrs.slices['output_raw'], real_batch],
             'io_boundary_dimension': [real_out, real_batch],
+            'slice_dimension': 0,
         }
 
     def _describe_dense_ifm(
@@ -446,6 +447,7 @@ class DenseKernelVariant(KernelVariant):
             'boundary_dimension': [real_feat, real_batch],
             'io_tiling_dimension': [attrs.slices['input_raw'], real_batch],
             'io_boundary_dimension': [real_feat, real_batch],
+            'slice_dimension': 0,
         }
 
     def footprint(self, context: KernelPlacementContext) -> KernelFootprint:

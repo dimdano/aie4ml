@@ -227,7 +227,7 @@ class _CodegenPlanner:
                     f'(expected {consumer_ports} ports, assigned {start}).'
                 )
 
-        # Determine dim0 stride per port in buffer space (required for sharding/rebasing).
+        # Determine shard stride per port in buffer space (required for sharding/rebasing).
         if entry.producer:
             inst = self._kernel_inst(entry.producer)
             d0 = inst.variant.describe_output_staging(entry.producer, inst.attributes, 0, None, None)
@@ -236,8 +236,13 @@ class _CodegenPlanner:
                 if producer_ports > 1
                 else None
             )
-            port_stride0 = int(d1['offset'][0] - d0['offset'][0]) if d1 is not None else int(d0['buffer_dimension'][0])
-            full_dim0 = int(d0['buffer_dimension'][0])
+            shard_dim = int(d0['slice_dimension'])
+            port_stride0 = (
+                int(d1['offset'][shard_dim] - d0['offset'][shard_dim])
+                if d1 is not None
+                else int(d0['buffer_dimension'][shard_dim])
+            )
+            full_dim0 = int(d0['buffer_dimension'][shard_dim])
         else:
             c0 = consumers[0].consumer
             inst = self._kernel_inst(c0)
@@ -247,13 +252,18 @@ class _CodegenPlanner:
                 if producer_ports > 1
                 else None
             )
-            port_stride0 = int(d1['offset'][0] - d0['offset'][0]) if d1 is not None else int(d0['buffer_dimension'][0])
-            full_dim0 = int(d0['buffer_dimension'][0])
-
+            shard_dim = int(d0['slice_dimension'])
+            port_stride0 = (
+                int(d1['offset'][shard_dim] - d0['offset'][shard_dim])
+                if d1 is not None
+                else int(d0['buffer_dimension'][shard_dim])
+            )
+            full_dim0 = int(d0['buffer_dimension'][shard_dim])
         if full_dim0 != port_stride0 * int(producer_ports):
             raise RuntimeError(
-                f'{entry.tensor}: cannot shard dim0; expected buffer_dimension[0]==port_stride0*ports '
-                f'({full_dim0} != {port_stride0}*{producer_ports}).'
+                f'{entry.tensor}: cannot shard dim{shard_dim}; '
+                f'expected buffer_dimension[{shard_dim}] == port_stride * ports '
+                f'({full_dim0} != {port_stride0} * {producer_ports}).'
             )
 
         # Prefix sums of sharded dim0 sizes, used for offset rebasing.
@@ -288,8 +298,9 @@ class _CodegenPlanner:
                 base = self._graph_input_writer_descriptor(entry)
 
             full_dims = list(base['buffer_dimension'])
-            shard_dim0 = int(unit_dim0_sizes[u])
-            buf_dims = [shard_dim0] + full_dims[1:]
+            shard_size = int(unit_dim0_sizes[u])
+            buf_dims = list(full_dims)
+            buf_dims[shard_dim] = shard_size
             unit_base_dim0 = int(unit_dim0_bases[u])
 
             name = self._buffer_name(entry.tensor, u, units)
@@ -310,13 +321,13 @@ class _CodegenPlanner:
                 if entry.producer is None:
                     desc = self._graph_input_writer_descriptor(entry)
                     desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][0] = (p - base_p) * port_stride0
+                    desc['offset'][shard_dim] = (p - base_p) * port_stride0
                 else:
                     inst = self._kernel_inst(entry.producer)
                     scheme = self._output_scheme(inst, entry.producer, entry.tensor)
                     desc = inst.variant.describe_output_staging(entry.producer, inst.attributes, p, buf_dims, scheme)
                     desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][0] -= unit_base_dim0
+                    desc['offset'][shard_dim] -= unit_base_dim0
 
                 buffer['writers'].append(
                     {
@@ -341,7 +352,7 @@ class _CodegenPlanner:
                         c.consumer, inst.attributes, i, buf_dims, scheme, entry.producer
                     )
                     desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][0] -= unit_base_dim0
+                    desc['offset'][shard_dim] -= unit_base_dim0
                     if units > 1:
                         desc['boundary_dimension'] = list(buf_dims)
                     local_out = flat - base_c
@@ -401,13 +412,14 @@ class _CodegenPlanner:
         p = entry.producer
         inst = self._kernel_inst(p)
         base = inst.variant.describe_output_staging(p, inst.attributes, port, buf_dims, None)
+        shard_dim = int(base['slice_dimension'])
         io_tile = list(base['io_tiling_dimension'])
         io_boundary = list(base['io_boundary_dimension'])
 
         offset = list(base['offset'])
-        offset[0] -= int(unit_base_dim0)
+        offset[shard_dim] -= int(unit_base_dim0)
         boundary = list(io_boundary)
-        boundary[0] = min(int(buf_dims[0]), max(0, int(io_boundary[0]) - int(unit_base_dim0)))
+        boundary[shard_dim] = min(int(buf_dims[shard_dim]), max(0, int(io_boundary[shard_dim]) - int(unit_base_dim0)))
         return {
             'access': 'read',
             'buffer_dimension': list(buf_dims),
