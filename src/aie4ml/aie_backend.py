@@ -113,14 +113,12 @@ class AIEBackend(Backend):
 
     def predict(self, model, X, simulator='x86', quantize_io=True):
         from .simulation import (
+            build_io_layout,
             collect_outputs,
             dequantize_outputs,
-            extract_dense_io,
-            numpy_emulate,
-            prepare_input_tensor,
+            prepare_inputs,
             run_simulation_target,
             write_input_files,
-            write_numpy_outputs,
         )
 
         output_dir = Path(model.config.get_output_dir())
@@ -129,24 +127,14 @@ class AIEBackend(Backend):
                 f'Output directory "{output_dir}" does not exist. Run write() and compile() before predicting.'
             )
 
-        first_layer, last_layer = extract_dense_io(model)
+        layout = build_io_layout(model)
         aie_cfg = model.config.get_config_value('AIEConfig', {}) or {}
-        batch_size = int(aie_cfg.get('BatchSize'))
         iterations = int(aie_cfg.get('Iterations'))
-        quantize_inputs = bool(quantize_io)
-
-        prepared_inputs = prepare_input_tensor(
-            model=model,
-            X=X,
-            io_info=first_layer,
-            batch_size=batch_size,
-            iterations=iterations,
-            quantize_inputs=quantize_inputs,
-        )
+        quantize_io = bool(quantize_io)
 
         plio_width = int(aie_cfg.get('PLIOWidthBits', 128))
-        vals_per_line_in = max(1, plio_width // first_layer.input_bitwidth)
-        write_input_files(output_dir, prepared_inputs, first_layer, vals_per_line_in)
+        prepared_inputs = prepare_inputs(layout, X, iterations=iterations, quantize=quantize_io)
+        write_input_files(output_dir, layout, prepared_inputs, plio_width_bits=plio_width)
 
         sim_key = simulator.lower()
         if sim_key == 'x86':
@@ -159,22 +147,17 @@ class AIEBackend(Backend):
         log.info('Running %s simulation using make %s', model.config.get_project_name(), make_target)
         run_simulation_target(output_dir, make_target)
 
-        # numpy sim needed only for debugging purposes
-        np_out = numpy_emulate(model, prepared_inputs)
-        vals_per_line_out = max(1, plio_width // last_layer.output_bitwidth)
-        write_numpy_outputs(
-            output_dir=output_dir,
-            np_outputs=np_out,
-            io_info=last_layer,
-            batch_size=batch_size,
-            iterations=iterations,
-            vals_per_line=vals_per_line_out,
-        )
+        sim_out = collect_outputs(output_dir, sim_key, layout)
+        final_out = dequantize_outputs(layout, sim_out) if quantize_io else sim_out
 
-        sim_out = collect_outputs(output_dir, sim_key, last_layer, batch_size, iterations)
-        final_out = dequantize_outputs(sim_out, last_layer) if quantize_inputs else sim_out
+        def _flatten_iters(arr):
+            if getattr(arr, 'ndim', 0) >= 2:
+                return arr.reshape(arr.shape[0] * arr.shape[1], *arr.shape[2:])
+            return arr
 
-        return final_out
+        if len(final_out) == 1:
+            return _flatten_iters(next(iter(final_out.values())))
+        return {k: _flatten_iters(v) for k, v in final_out.items()}
 
     def write(self, model):
         model.apply_flow(self.get_writer_flow())

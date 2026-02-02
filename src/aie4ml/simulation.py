@@ -6,11 +6,11 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 
-from .aie_types import RoundingMode, SaturationMode
+from .aie_types import AIEDataType
 from .ir import get_backend_context
 from .passes.quant import apply_rounding, dtype_for_precision, handle_overflow
 
@@ -142,221 +142,200 @@ def compute_ops(model):
     ops = 0
     for node in ctx.ir.logical:
         if node.op_type == 'dense':
-            n_in = int(node.metadata.get('n_in', 0))
-            n_out = int(node.metadata.get('n_out', 0))
+            n_in = int(node.metadata['n_in'])
+            n_out = int(node.metadata['n_out'])
             ops += 2 * n_in * n_out
     return ops
 
 
 @dataclass
-class LayerIOInfo:
-    cas_length: int
-    cas_num: int
-    in_features: int
-    out_features: int
-    in_feat_slice: int
-    out_feat_slice: int
-    raw_in_feat_slice: int
-    raw_out_feat_slice: int
-    padded_in_features: int
-    padded_out_features: int
-    input_bitwidth: int
-    output_bitwidth: int
-    input_fractional_bits: int = 0
-    output_fractional_bits: int = 0
-    input_rounding_mode: RoundingMode = RoundingMode.RND
-    input_saturation_mode: SaturationMode = SaturationMode.SAT
-    input_signed: bool = True
-    output_signed: bool = True
+class IOPortLayout:
+    direction: str
+    port: int
+    tensor: str
+    descriptor: Dict
+    staging: Dict
+    dtype: AIEDataType
+
+    @property
+    def rank(self) -> int:
+        return len(self.staging['io_boundary_dimension'])
+
+    @property
+    def slice_dimension(self) -> int:
+        return int(self.staging['slice_dimension'])
+
+    @property
+    def io_boundary_dimension(self) -> List[int]:
+        return [int(x) for x in self.staging['io_boundary_dimension']]
+
+    @property
+    def io_tiling_dimension(self) -> List[int]:
+        return [int(x) for x in self.staging['io_tiling_dimension']]
+
+    @property
+    def offset(self) -> List[int]:
+        # Host-visible tensor slicing must use the kernel staging descriptor.
+        # Physical plan offsets may be shard-rebased for memtile units>1.
+        return [int(x) for x in self.staging['offset']]
+
+    @property
+    def tiling_dimension(self) -> List[int]:
+        # Files stream IO tiles, not kernel tiles.
+        return [int(x) for x in self.staging['io_tiling_dimension']]
+
+    @property
+    def numpy_boundary_shape(self) -> Tuple[int, ...]:
+        return tuple(self.io_boundary_dimension[::-1])
+
+    @property
+    def numpy_tile_shape(self) -> Tuple[int, ...]:
+        return tuple(self.tiling_dimension[::-1])
 
 
-def extract_dense_io(model):
+@dataclass
+class IOLayout:
+    inputs: Dict[str, List[IOPortLayout]]
+    outputs: Dict[str, List[IOPortLayout]]
+
+    def input_tensors(self) -> List[str]:
+        return list(self.inputs.keys())
+
+    def output_tensors(self) -> List[str]:
+        return list(self.outputs.keys())
+
+
+def build_io_layout(model) -> IOLayout:
+    """
+    Build a canonical per-port IO layout strictly from:
+      - ctx.ir.physical.plan['buffers'] (external endpoint discovery/mapping: ifm[x]/ofm[x])
+      - ctx.ir.kernels (kernel instances + staging descriptors + numeric specs)
+    """
     ctx = get_backend_context(model)
-    dense_nodes = [node for node in ctx.ir.logical if node.op_type == 'dense']
-    if not dense_nodes:
-        raise RuntimeError('AIE simulation requires at least one Dense node to describe IO slicing.')
+    plan = ctx.ir.physical.plan
+    buffers = plan['buffers']
 
-    def _rounding_from_spec(spec_rounding) -> RoundingMode:
-        if isinstance(spec_rounding, RoundingMode):
-            return spec_rounding
-        if isinstance(spec_rounding, str):
-            return RoundingMode[spec_rounding]
-        raise TypeError(f'Unsupported rounding mode representation: {type(spec_rounding)}')
+    inputs: Dict[str, List[IOPortLayout]] = {}
+    outputs: Dict[str, List[IOPortLayout]] = {}
 
-    def _saturation_from_spec(spec_saturation) -> SaturationMode:
-        if isinstance(spec_saturation, SaturationMode):
-            return spec_saturation
-        if isinstance(spec_saturation, str):
-            return SaturationMode[spec_saturation]
-        raise TypeError(f'Unsupported saturation mode representation: {type(spec_saturation)}')
+    for buf in buffers:
+        tensor = buf['tensor']
 
-    def _info(node):
-        inst = ctx.ir.kernels.get(node.name)
-        if inst is None:
-            raise RuntimeError(f'{node.name}: unresolved IR node. Run resolve pass first.')
+        for writer in buf['writers']:
+            if writer['source_type'] != 'plio':
+                continue
+            if writer['source_endpoint']['name'] != 'ifm':
+                continue
+            port = int(writer['source_endpoint']['port'])
 
-        attrs = inst.attributes
-        metadata = node.metadata or {}
-        in_features = int(metadata['n_in'])
-        out_features = int(metadata['n_out'])
-        parallel = attrs.parallelism
-        cas_length = int(parallel['cas_length'])
-        cas_num = int(parallel['cas_num'])
-        slices = attrs.slices
-        raw_in_slice = int(slices['input_raw'])
-        raw_out_slice = int(slices['output_raw'])
-        in_slice = int(slices['input'])
-        out_slice = int(slices['output'])
-        numeric = attrs.numeric
-        input_spec = numeric['input']
-        output_spec = numeric['output']
+            reader = next(r for r in buf['readers'] if r['target_type'] == 'kernel')
+            inst = ctx.ir.kernels.get(reader['target_endpoint']['kernel'])
 
-        input_bw = int(getattr(input_spec, 'width'))
-        output_bw = int(getattr(output_spec, 'width'))
-        input_frac = int(getattr(input_spec, 'frac', getattr(input_spec, 'fractional', 0)) or 0)
-        output_frac = int(getattr(output_spec, 'frac', getattr(output_spec, 'fractional', 0)) or 0)
-
-        rounding_mode = _rounding_from_spec(getattr(input_spec, 'rounding'))
-        saturation_mode = _saturation_from_spec(getattr(input_spec, 'saturation'))
-
-        signed_inputs = bool(getattr(input_spec, 'signed'))
-        signed_outputs = bool(getattr(output_spec, 'signed'))
-
-        scalars = attrs.scalars
-        padded_in_features = int(scalars['padded_in_features'])
-        padded_out_features = int(scalars['padded_out_features'])
-
-        return LayerIOInfo(
-            cas_length=cas_length,
-            cas_num=cas_num,
-            in_features=in_features,
-            out_features=out_features,
-            in_feat_slice=in_slice,
-            out_feat_slice=out_slice,
-            raw_in_feat_slice=raw_in_slice,
-            raw_out_feat_slice=raw_out_slice,
-            padded_in_features=padded_in_features,
-            padded_out_features=padded_out_features,
-            input_bitwidth=input_bw,
-            output_bitwidth=output_bw,
-            input_fractional_bits=input_frac,
-            output_fractional_bits=output_frac,
-            input_rounding_mode=rounding_mode,
-            input_saturation_mode=saturation_mode,
-            input_signed=signed_inputs,
-            output_signed=signed_outputs,
-        )
-
-    return _info(dense_nodes[0]), _info(dense_nodes[-1])
-
-
-def prepare_input_tensor(model, X, io_info, batch_size, iterations, quantize_inputs=True):
-    if X is None:
-        raise ValueError('Input data is required for AIE simulation.')
-
-    input_vars = model.get_input_variables()
-    if len(input_vars) != 1:
-        raise NotImplementedError('AIE simulation currently supports single-input models only.')
-
-    expected_size = input_vars[0].size()
-
-    data = np.asarray(X)
-    if data.ndim == 1:
-        data = data.reshape(1, -1)
-    if data.ndim == 2:
-        if data.shape[0] != batch_size:
-            raise ValueError(
-                f'Input batch dimension ({data.shape[0]}) does not match configured BatchSize ({batch_size}).'
+            st = inst.variant.describe_input_staging(
+                inst.node,
+                inst.attributes,
+                port,
+                None,
+                None,
+                None,
             )
-        if data.shape[1] != expected_size:
-            raise ValueError(
-                f'Input feature dimension ({data.shape[1]}) does not match expected size ({expected_size}).'
-            )
-        data = np.repeat(data[np.newaxis, :, :], iterations, axis=0)
-    elif data.ndim == 3:
-        if data.shape[2] != expected_size:
-            raise ValueError(
-                f'Input feature dimension ({data.shape[2]}) does not match expected size ({expected_size}).'
-            )
-        if data.shape[1] != batch_size:
-            raise ValueError(
-                f'Provided batch dimension ({data.shape[1]}) does not match configured BatchSize ({batch_size}).'
-            )
-        if data.shape[0] != iterations:
-            raise ValueError(
-                f'Input iteration dimension ({data.shape[0]}) does not match configured Iterations ({iterations}).'
-            )
-    else:
-        raise ValueError(
-            'Expected input array with shape [batch_size, features] or [iterations, batch_size, features]; '
-            f'got shape {data.shape}.'
-        )
+            dtype = inst.attributes.numeric['input']
 
-    padded_feat = io_info.cas_length * io_info.in_feat_slice
-    if padded_feat == io_info.in_features:
-        padded = data
-    else:
-        padded = np.zeros((iterations, batch_size, padded_feat), dtype=data.dtype)
-        padded[:, :, : io_info.in_features] = data
-
-    if quantize_inputs:
-        processed = _quantize_inputs_to_int(padded, io_info)
-    else:
-        if not np.issubdtype(padded.dtype, np.integer):
-            raise ValueError(
-                'Non-integer inputs require quantize_inputs=True or manual quantization before prediction.'
+            inputs.setdefault(tensor, []).append(
+                IOPortLayout(
+                    direction='input',
+                    port=port,
+                    tensor=tensor,
+                    descriptor=writer['descriptor'],
+                    staging=st,
+                    dtype=dtype,
+                )
             )
-        target_dtype = dtype_for_precision(io_info.input_bitwidth, io_info.input_signed)
-        processed = padded.astype(target_dtype, copy=False)
 
-    return np.ascontiguousarray(processed)
+        for reader in buf['readers']:
+            if reader.get('target_type') != 'plio':
+                continue
+            if reader['target_endpoint']['name'] != 'ofm':
+                continue
+            port = int(reader['target_endpoint']['port'])
+
+            writer = next(w for w in buf['writers'] if w['source_type'] == 'kernel')
+            inst = ctx.ir.kernels.get(writer['source_endpoint']['kernel'])
+
+            st = inst.variant.describe_output_staging(
+                inst.node,
+                inst.attributes,
+                port,
+                None,
+                None,
+            )
+            dtype = inst.attributes.numeric['output']
+
+            outputs.setdefault(tensor, []).append(
+                IOPortLayout(
+                    direction='output',
+                    port=port,
+                    tensor=tensor,
+                    descriptor=reader['descriptor'],
+                    staging=st,
+                    dtype=dtype,
+                )
+            )
+
+    for t in inputs:
+        inputs[t] = sorted(inputs[t], key=lambda p: p.port)
+    for t in outputs:
+        outputs[t] = sorted(outputs[t], key=lambda p: p.port)
+
+    return IOLayout(inputs=inputs, outputs=outputs)
 
 
-def write_input_files(output_dir, inputs, io_info, vals_per_line):
+def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) -> Dict[str, np.ndarray]:
+    if len(layout.inputs) == 1 and not isinstance(X, dict):
+        tensor = next(iter(layout.inputs.keys()))
+        X = {tensor: X}
+
+    prepared: Dict[str, np.ndarray] = {}
+
+    for tensor, ports in layout.inputs.items():
+        p0 = ports[0]
+        expected = p0.numpy_boundary_shape
+        arr = np.asarray(X[tensor])
+
+        if arr.ndim == len(expected):
+            arr = np.repeat(arr[np.newaxis, ...], iterations, axis=0)
+        else:
+            if arr.shape[0] != iterations:
+                raise ValueError(f'{tensor}: expected iterations={iterations}, got {arr.shape[0]}')
+
+        if tuple(arr.shape[1:]) != expected:
+            raise ValueError(f'{tensor}: expected input shape {expected}, got {tuple(arr.shape[1:])}')
+
+        if quantize:
+            prepared[tensor] = _quantize_to_int(
+                arr,
+                dtype=p0.dtype,
+            )
+        else:
+            if not np.issubdtype(arr.dtype, np.integer):
+                raise ValueError(f'{tensor}: quantize=False requires integer inputs')
+            prepared[tensor] = arr.astype(dtype_for_precision(p0.dtype.width, p0.dtype.signed), copy=False)
+
+    return prepared
+
+
+def write_input_files(output_dir: Path, layout: IOLayout, prepared_inputs: Dict[str, np.ndarray], plio_width_bits: int):
     data_dir = Path(output_dir) / 'data'
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    slice_size = io_info.raw_in_feat_slice
-    for col in range(io_info.cas_length):
-        file_path = data_dir / f'ifm_c{col}.txt'
-        with open(file_path, 'w') as handle:
-            start = col * slice_size
-            values = inputs[:, :, start : start + slice_size]
-            _write_values(handle, values.flatten(order='C'), vals_per_line)
-
-
-def write_numpy_outputs(output_dir, np_outputs, io_info, batch_size, iterations, vals_per_line):
-    """
-    Write NumPy emulation outputs into output_dir/data/y_p{i}.txt, matching the simulator's format.
-    """
-    data_dir = Path(output_dir) / 'data'
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    total_out = io_info.cas_num * io_info.raw_out_feat_slice
-
-    arr = np.asarray(np_outputs)
-    if arr.ndim == 2:
-        if arr.shape[0] != iterations * batch_size or arr.shape[1] < total_out:
-            raise ValueError(
-                f'np_outputs shape {arr.shape} does not match expected '
-                f'[(iterations*batch)={iterations*batch_size}, total_out={total_out}]'
-            )
-        arr = arr[:, :total_out].reshape(iterations, batch_size, total_out)
-    elif arr.ndim == 3:
-        if arr.shape[:2] != (iterations, batch_size) or arr.shape[2] < total_out:
-            raise ValueError(
-                f'np_outputs shape {arr.shape} does not match expected '
-                f'[{iterations}, {batch_size}, total_out>={total_out}]'
-            )
-        arr = arr[:, :, :total_out]
-    else:
-        raise ValueError(f'Unsupported np_outputs ndim {arr.ndim}')
-
-    for i in range(io_info.cas_num):
-        file_path = data_dir / f'y_p{i}.txt'
-        with open(file_path, 'w') as f:
-            out_slice = arr[:, :, i * io_info.raw_out_feat_slice : (i + 1) * io_info.raw_out_feat_slice]
-            _write_values(f, out_slice.flatten(order='C'), vals_per_line)
+    for tensor, ports in layout.inputs.items():
+        data = prepared_inputs[tensor]
+        for p in ports:
+            vals_per_line = max(1, int(plio_width_bits) // int(p.dtype.width))
+            tile = _extract_port_tile(data, p)
+            file_path = data_dir / f'ifm_c{p.port}.txt'
+            with open(file_path, 'w') as handle:
+                _write_values(handle, tile.flatten(order='C'), vals_per_line)
 
 
 def _write_values(stream, values, vals_per_line):
@@ -373,167 +352,109 @@ def _write_values(stream, values, vals_per_line):
     stream.write('\n')
 
 
-def collect_outputs(output_dir, sim_mode, io_info, batch_size, iterations):
+def collect_outputs(output_dir: Path, sim_mode: str, layout: IOLayout) -> Dict[str, np.ndarray]:
     data_dir = Path(output_dir) / f'{sim_mode}simulator_output/data'
-    outputs = np.zeros(
-        (iterations, batch_size, io_info.cas_num * io_info.raw_out_feat_slice),
-        dtype=np.int32,
-    )
+    outputs: Dict[str, np.ndarray] = {}
 
-    expected_values = iterations * batch_size * io_info.raw_out_feat_slice
-    for chain in range(io_info.cas_num):
-        file_path = data_dir / f'y_p{chain}.txt'
-        if not file_path.exists():
-            raise FileNotFoundError(f'Expected simulator output {file_path} not found.')
+    for tensor, ports in layout.outputs.items():
+        first = ports[0]
+        first_tile = _read_output_file(data_dir / f'y_p{first.port}.txt', first)
+        out = np.zeros((first_tile.shape[0], *first.numpy_boundary_shape), dtype=np.int64)
+        _insert_port_tile(out, first_tile, first)
 
-        with open(file_path, 'r') as handle:
-            tokens = handle.read().split()
+        for p in ports[1:]:
+            tile = _read_output_file(data_dir / f'y_p{p.port}.txt', p)
+            _insert_port_tile(out, tile, p)
 
-        if not tokens:
-            raise RuntimeError(f'Output file {file_path} is empty.')
+        outputs[tensor] = out
 
-        # filter out non data markers
-        clean_tokens = []
-        i = 0
-        while i < len(tokens):
-            tok = tokens[i]
-            if tok.upper() == 'TLAST':
-                i += 1
-                continue
-            if tok.upper() == 'T' and i + 2 < len(tokens):
-                i += 3
-                continue
-            clean_tokens.append(tok)
-            i += 1
-        values = np.array([int(t) for t in clean_tokens], dtype=np.int32)
-
-        if values.size < expected_values:
-            raise RuntimeError(
-                f'Output file {file_path} contained {values.size} values; expected at least {expected_values}.'
-            )
-
-        reshaped = values[:expected_values].reshape(iterations, batch_size, io_info.raw_out_feat_slice)
-        start = chain * io_info.raw_out_feat_slice
-        outputs[:, :, start : start + io_info.raw_out_feat_slice] = reshaped
-
-    flattened = outputs.reshape(iterations * batch_size, io_info.cas_num * io_info.raw_out_feat_slice)
-    if flattened.shape[0] == 1:
-        return flattened[0]
-
-    return flattened
+    return outputs
 
 
-def dequantize_outputs(data: np.ndarray, io_info: LayerIOInfo) -> np.ndarray:
-    fractional_bits = max(0, io_info.output_fractional_bits)
-    if fractional_bits == 0:
-        return data.astype(np.float64, copy=False)
-
-    scale = float(1 << fractional_bits)
-    return data.astype(np.float64, copy=False) / scale
-
-
-def numpy_emulate(model, prepared_inputs):
-    """NumPy emulation of AIE Dense nodes using quantized IR artifacts."""
-    ctx = get_backend_context(model)
-    dense_nodes = [node for node in ctx.ir.logical if node.op_type == 'dense']
-    if not dense_nodes:
-        raise RuntimeError('AIE numpy emulation requires at least one Dense node.')
-
-    first_layer, _ = extract_dense_io(model)
-    aie_cfg = model.config.get_config_value('AIEConfig', {}) or {}
-    batch_size = int(aie_cfg.get('BatchSize'))
-    iterations = int(aie_cfg.get('Iterations'))
-
-    # Trim to true feature count and flatten [iters*batch, in_features]
-    X = prepared_inputs[:, :, : first_layer.in_features]
-    X = X.reshape(iterations * batch_size, first_layer.in_features).astype(np.int64, copy=False)
-
-    for node in dense_nodes:
-        inst = ctx.ir.kernels.get(node.name)
-        if inst is None:
-            raise RuntimeError(f'{node.name}: unresolved IR node. Run resolve pass first.')
-
-        attrs = inst.attributes
-        if 'quant' not in node.metadata:
-            raise RuntimeError(f'{node.name}: missing quant metadata; run quantization pass first.')
-        quant_meta = node.metadata['quant']
-        if not isinstance(quant_meta, dict):
-            raise TypeError(f'{node.name}: quant metadata must be a dict, got {type(quant_meta)}')
-
-        W = node.artifacts.get('quant_weights')
-        if W is None:
-            raise RuntimeError(f'{node.name}: quantized weights missing. Run quantization pass first.')
-        W = np.asarray(W, dtype=np.int64)
-
-        b = node.artifacts.get('quant_bias')
-        shift = int(attrs.scalars['shift'])
-        use_bias = bool(node.metadata.get('use_bias')) and b is not None
-        use_relu = bool(attrs.flags.get('use_relu', False))
-
-        output_spec = attrs.numeric.get('output')
-        out_bw = int(getattr(output_spec, 'width', 8) or 8)
-        out_signed = bool(getattr(output_spec, 'signed', True))
-
-        if 'output_precision' not in quant_meta:
-            raise RuntimeError(f'{node.name}: missing quant intent "output_precision"')
-        output_precision = quant_meta['output_precision']
-        out_rounding_mode = output_precision.rounding
-        out_saturation_mode = output_precision.saturation
-
-        acc = X @ W
-        if use_bias:
-            acc += np.asarray(b, dtype=np.int64)
-
-        if shift != 0:
-            acc = _requantize_int(acc, shift, out_rounding_mode)
-
-        acc = handle_overflow(acc, out_bw, out_signed, out_saturation_mode)
-
-        if use_relu:
-            acc = np.maximum(acc, 0)
-
-        out_dtype = dtype_for_precision(out_bw, out_signed)
-        X = acc.astype(out_dtype, copy=False)
-
-    return X
+def dequantize_outputs(layout: IOLayout, outputs: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    out: Dict[str, np.ndarray] = {}
+    for tensor, arr in outputs.items():
+        p0 = layout.outputs[tensor][0]
+        frac = max(0, int(p0.dtype.frac))
+        if frac == 0:
+            out[tensor] = arr.astype(np.float64, copy=False)
+        else:
+            out[tensor] = arr.astype(np.float64, copy=False) / float(1 << frac)
+    return out
 
 
-def _requantize_int(acc: np.ndarray, shift: int, rounding_mode: RoundingMode) -> np.ndarray:
-    """Integer requantization: right shift with symmetric rounding; left shift exact."""
-    acc = acc.astype(np.int64, copy=False)
-    if shift == 0:
-        return acc
-    if shift < 0:
-        return acc << (-shift)
-
-    s = int(shift)
-    if rounding_mode == RoundingMode.RND:
-        bias = 1 << (s - 1)
-        pos = (acc + bias) >> s
-        neg = -(((-acc) + bias) >> s)
-        return np.where(acc >= 0, pos, neg)
-
-    scale = float(1 << s)
-    rounded = apply_rounding(acc.astype(np.float64) / scale, rounding_mode)
-    return rounded.astype(np.int64, copy=False)
-
-
-def _quantize_inputs_to_int(data, io_info):
+def _quantize_to_int(data: np.ndarray, dtype: AIEDataType) -> np.ndarray:
     if np.issubdtype(data.dtype, np.integer):
-        target_dtype = dtype_for_precision(io_info.input_bitwidth, io_info.input_signed)
-        return data.astype(target_dtype, copy=False)
+        return data.astype(dtype_for_precision(dtype.width, dtype.signed), copy=False)
 
-    width = io_info.input_bitwidth
-    fractional_bits = max(0, io_info.input_fractional_bits)
-    scale = 1 << fractional_bits if fractional_bits > 0 else 1
-    scaled = data * scale
+    scale = 1 << max(0, int(dtype.frac))
+    scaled = data * float(scale)
+    rounded = apply_rounding(scaled, dtype.rounding)
+    integers = rounded.astype(np.int64, copy=False)
+    clipped = handle_overflow(integers, int(dtype.width), bool(dtype.signed), dtype.saturation)
+    return clipped.astype(dtype_for_precision(dtype.width, dtype.signed), copy=False)
 
-    rounded = apply_rounding(scaled, io_info.input_rounding_mode)
-    integers = rounded.astype(np.int64)
 
-    processed = handle_overflow(integers, width, io_info.input_signed, io_info.input_saturation_mode)
-    target_dtype = dtype_for_precision(width, io_info.input_signed)
-    return processed.astype(target_dtype, copy=False)
+def _extract_port_tile(data: np.ndarray, port: IOPortLayout) -> np.ndarray:
+    rank = port.rank
+    tile = np.zeros((data.shape[0], *port.numpy_tile_shape), dtype=data.dtype)
+
+    src_slices = [slice(None)] * (rank + 1)
+    dst_slices = [slice(None)] * (rank + 1)
+    for d in range(rank):
+        axis = rank - d
+        start = int(port.offset[d])
+        size = int(port.tiling_dimension[d])
+        bound = int(port.io_boundary_dimension[d])
+        take = min(size, max(0, bound - start))
+
+        src_slices[axis] = slice(start, start + take)
+        dst_slices[axis] = slice(0, take)
+
+    tile[tuple(dst_slices)] = data[tuple(src_slices)]
+    return tile
+
+
+def _insert_port_tile(out: np.ndarray, tile: np.ndarray, port: IOPortLayout) -> None:
+    rank = port.rank
+    dst_slices = [slice(None)] * (rank + 1)
+    src_slices = [slice(None)] * (rank + 1)
+    for d in range(rank):
+        axis = rank - d
+        start = int(port.offset[d])
+        size = int(port.tiling_dimension[d])
+        bound = int(port.io_boundary_dimension[d])
+        take = min(size, max(0, bound - start))
+
+        dst_slices[axis] = slice(start, start + take)
+        src_slices[axis] = slice(0, take)
+
+    out[tuple(dst_slices)] = tile[tuple(src_slices)]
+
+
+def _read_output_file(path: Path, port: IOPortLayout) -> np.ndarray:
+    if not path.exists():
+        raise FileNotFoundError(f'Expected simulator output {path} not found.')
+
+    tokens = path.read_text().split()
+    clean: List[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok.upper() == 'TLAST':
+            i += 1
+            continue
+        if tok.upper() == 'T' and i + 2 < len(tokens):
+            i += 3
+            continue
+        clean.append(tok)
+        i += 1
+
+    values = np.array([int(t) for t in clean], dtype=np.int64)
+    per_iter = int(np.prod(port.numpy_tile_shape, dtype=np.int64))
+    iters = values.size // per_iter
+    values = values[: iters * per_iter]
+    return values.reshape(iters, *port.numpy_tile_shape)
 
 
 def run_simulation_target(output_dir, make_target):

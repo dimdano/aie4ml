@@ -332,6 +332,8 @@ class _CodegenPlanner:
                 buffer['writers'].append(
                     {
                         'source': self._producer_endpoint(entry.producer, entry.producer_group, p),
+                        'source_type': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[0],
+                        'source_endpoint': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[1],
                         'target': f'{name}.in[{slot}]',
                         'descriptor': desc,
                     }
@@ -361,6 +363,13 @@ class _CodegenPlanner:
                         {
                             'source': f'{name}.out[{local_out}]',
                             'target': f'{sanitize_identifier(c.consumer.name)}.{c.consumer_group}[{i}]',
+                            'target_type': 'kernel',
+                            'target_endpoint': {
+                                'kernel': c.consumer.name,
+                                'kernel_id': sanitize_identifier(c.consumer.name),
+                                'group': c.consumer_group,
+                                'port': int(i),
+                            },
                             'descriptor': desc,
                         }
                     )
@@ -378,6 +387,8 @@ class _CodegenPlanner:
                         {
                             'source': f'{name}.out[{slot}]',
                             'target': f'ofm[{port}]',
+                            'target_type': 'plio',
+                            'target_endpoint': {'name': 'ofm', 'port': int(port)},
                             'descriptor': desc,
                         }
                     )
@@ -467,6 +478,26 @@ class _CodegenPlanner:
 
     def _producer_endpoint(self, node, group, port):
         return f'ifm[{port}]' if node is None else f'{sanitize_identifier(node.name)}.{group}[{port}]'
+
+    def _producer_endpoint_meta(self, node, group, port):
+        if node is None:
+            return 'plio', {'name': 'ifm', 'port': int(port)}
+        return 'kernel', {
+            'kernel': node.name,
+            'kernel_id': sanitize_identifier(node.name),
+            'group': group,
+            'port': int(port),
+        }
+
+    def _consumer_endpoint_meta(self, node, group, port):
+        if node is None:
+            return 'plio', {'name': 'ofm', 'port': int(port)}
+        return 'kernel', {
+            'kernel': node.name,
+            'kernel_id': sanitize_identifier(node.name),
+            'group': group,
+            'port': int(port),
+        }
 
     def _buffer_ctype(self, entry):
         if entry.producer is None:
