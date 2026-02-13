@@ -59,7 +59,7 @@ class KernelVariant:
     variant_id: str
     op_type: str
     supported_generations: Tuple[str, ...] = field(default_factory=tuple)
-    supported_precisions: Tuple[int, ...] = field(default_factory=tuple)
+    supported_precisions: Tuple[Dict[str, int], ...] = field(default_factory=tuple)
     supported_input_modes: Tuple[str, ...] = field(default_factory=tuple)
     supported_output_modes: Tuple[str, ...] = field(default_factory=tuple)
     input_ports: Tuple[str, ...] = field(default_factory=tuple)
@@ -90,11 +90,10 @@ class KernelVariant:
                 if isinstance(mode, str) and mode not in self.supported_output_modes:
                     return False
 
+        node_prec = _numeric_precisions(context.attributes)
         if self.supported_precisions:
-            widths = _numeric_widths(context.attributes)
-            for width in widths:
-                if width and width not in self.supported_precisions:
-                    return False
+            if node_prec not in self.supported_precisions:
+                return False
 
         return True
 
@@ -189,14 +188,11 @@ def _select_generation_key(generation: str) -> str:
     return 'AIE'
 
 
-def _numeric_widths(attrs: ResolvedAttributes) -> List[int]:
-    widths: List[int] = []
-    for key in ('input', 'weight', 'bias', 'output'):
-        dtype = attrs.numeric.get(key)
-        if dtype is None:
-            continue
-        widths.append(int(getattr(dtype, 'width', 0) or 0))
-    return widths
+def _numeric_precisions(attrs: ResolvedAttributes) -> Dict[str, int]:
+    out = {}
+    for kind, dtype in attrs.numeric.items():
+        out[kind] = int(dtype.width)
+    return out
 
 
 def _serialize_dtype(dtype) -> Dict[str, Any]:
@@ -402,7 +398,6 @@ class DenseKernelVariant(KernelVariant):
         indep_dim = buffer_order.index(int(view['independent_axes'][-1]))
 
         io_tiling_dimension[feat_dim] = raw_out
-
         tiling_dimension = [1 for _ in buffer_dimension]
         tiling_dimension[feat_dim] = tile_n
         tiling_dimension[indep_dim] = tile_m
@@ -459,7 +454,6 @@ class DenseKernelVariant(KernelVariant):
         indep_dim = buffer_order.index(int(view['independent_axes'][-1]))
 
         io_tiling_dimension[feat_dim] = raw_in
-
         tiling_dimension = [1 for _ in buffer_dimension]
         tiling_dimension[feat_dim] = tile_k
         tiling_dimension[indep_dim] = tile_m
@@ -556,7 +550,15 @@ _GLOBAL_REGISTRY.register(
         variant_id='dense.b.r.v1',
         op_type='dense',
         supported_generations=('AIE-ML', 'AIE-MLV2'),
-        supported_precisions=(8, 16, 32),
+        supported_precisions=(
+            {'input': 8, 'weight': 8, 'output': 8, 'acc': 32, 'bias': 32},
+            {'input': 8, 'weight': 8, 'output': 16, 'acc': 32, 'bias': 32},
+            {'input': 8, 'weight': 8, 'output': 32, 'acc': 32, 'bias': 32},
+            {'input': 16, 'weight': 8, 'output': 8, 'acc': 32, 'bias': 32},
+            {'input': 16, 'weight': 8, 'output': 8, 'acc': 32, 'bias': 32},
+            {'input': 16, 'weight': 16, 'output': 16, 'acc': 64, 'bias': 32},
+            {'input': 16, 'weight': 16, 'output': 32, 'acc': 64, 'bias': 32},
+        ),
         supported_input_modes=('direct', 'memtile', 'plio'),
         supported_output_modes=('direct', 'memtile', 'plio'),
     )
