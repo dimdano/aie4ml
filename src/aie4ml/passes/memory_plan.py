@@ -230,9 +230,9 @@ class _CodegenPlanner:
         # Determine shard stride per port in buffer space (required for sharding/rebasing).
         if entry.producer:
             inst = self._kernel_inst(entry.producer)
-            d0 = inst.variant.describe_output_staging(entry.producer, inst.attributes, 0, None, None)
+            d0 = inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 0, None, None)
             d1 = (
-                inst.variant.describe_output_staging(entry.producer, inst.attributes, 1, None, None)
+                inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 1, None, None)
                 if producer_ports > 1
                 else None
             )
@@ -246,9 +246,9 @@ class _CodegenPlanner:
         else:
             c0 = consumers[0].consumer
             inst = self._kernel_inst(c0)
-            d0 = inst.variant.describe_input_staging(c0, inst.attributes, 0, None, None, None)
+            d0 = inst.variant.describe_input_staging(c0, inst.attributes, entry.tensor, 0, None, None, None)
             d1 = (
-                inst.variant.describe_input_staging(c0, inst.attributes, 1, None, None, None)
+                inst.variant.describe_input_staging(c0, inst.attributes, entry.tensor, 1, None, None, None)
                 if producer_ports > 1
                 else None
             )
@@ -293,7 +293,9 @@ class _CodegenPlanner:
             # base descriptor
             if entry.producer:
                 inst = self._kernel_inst(entry.producer)
-                base = inst.variant.describe_output_staging(entry.producer, inst.attributes, 0, None, None)
+                base = inst.variant.describe_output_staging(
+                    entry.producer, inst.attributes, entry.tensor, 0, None, None
+                )
             else:
                 base = self._graph_input_writer_descriptor(entry)
 
@@ -324,8 +326,10 @@ class _CodegenPlanner:
                     desc['offset'][shard_dim] = (p - base_p) * port_stride0
                 else:
                     inst = self._kernel_inst(entry.producer)
-                    scheme = self._output_scheme(inst, entry.producer, entry.tensor)
-                    desc = inst.variant.describe_output_staging(entry.producer, inst.attributes, p, buf_dims, scheme)
+                    staging = self._output_staging(inst, entry.tensor)
+                    desc = inst.variant.describe_output_staging(
+                        entry.producer, inst.attributes, entry.tensor, p, buf_dims, staging
+                    )
                     desc['buffer_dimension'] = list(buf_dims)
                     desc['offset'][shard_dim] -= unit_base_dim0
 
@@ -349,9 +353,9 @@ class _CodegenPlanner:
                         continue
 
                     inst = self._kernel_inst(c.consumer)
-                    scheme = self._input_scheme(inst, c.consumer, entry.tensor)
+                    staging = self._input_staging(inst, entry.tensor)
                     desc = inst.variant.describe_input_staging(
-                        c.consumer, inst.attributes, i, buf_dims, scheme, entry.producer
+                        c.consumer, inst.attributes, entry.tensor, i, buf_dims, staging, entry.producer
                     )
                     desc['buffer_dimension'] = list(buf_dims)
                     desc['offset'][shard_dim] -= unit_base_dim0
@@ -402,7 +406,7 @@ class _CodegenPlanner:
     def _graph_input_writer_descriptor(self, entry: _EdgeEntry) -> Dict[str, Any]:
         c = entry.consumers[0].consumer
         inst = self._kernel_inst(c)
-        base = inst.variant.describe_input_staging(c, inst.attributes, 0, None, None, None)
+        base = inst.variant.describe_input_staging(c, inst.attributes, entry.tensor, 0, None, None, None)
 
         io_tile = list(base['io_tiling_dimension'])
 
@@ -422,7 +426,7 @@ class _CodegenPlanner:
     ) -> Dict[str, Any]:
         p = entry.producer
         inst = self._kernel_inst(p)
-        base = inst.variant.describe_output_staging(p, inst.attributes, port, buf_dims, None)
+        base = inst.variant.describe_output_staging(p, inst.attributes, entry.tensor, port, buf_dims, None)
         shard_dim = int(base['slice_dimension'])
         io_tile = list(base['io_tiling_dimension'])
         io_boundary = list(base['io_boundary_dimension'])
@@ -443,17 +447,13 @@ class _CodegenPlanner:
     # Utilities
     # ------------------------------------------------------------------
 
-    def _input_scheme(self, inst, node, tensor):
-        st = inst.attributes.staging.get('inputs', {})
-        if tensor in st:
-            return st[tensor][0]['scheme']
-        return inst.variant.default_input_staging(node, tensor)[0]['scheme']
+    def _input_staging(self, inst, tensor):
+        st = inst.attributes.staging['inputs']
+        return st[tensor] if tensor in st else None
 
-    def _output_scheme(self, inst, node, tensor):
-        st = inst.attributes.staging.get('outputs', {})
-        if tensor in st:
-            return st[tensor][0]['scheme']
-        return inst.variant.default_output_staging(node, tensor)[0]['scheme']
+    def _output_staging(self, inst, tensor):
+        st = inst.attributes.staging['outputs']
+        return st[tensor] if tensor in st else None
 
     def _split_ports_serial(self, n, units):
         chunk = (n + units - 1) // units

@@ -111,9 +111,10 @@ class KernelVariant:
         self,
         node: OpNode,
         attrs: ResolvedAttributes,
+        tensor_name: str,
         port: int,
         buf_dims=None,
-        scheme=None,
+        staging=None,
     ) -> Optional[Dict[str, Any]]:
         return None
 
@@ -121,9 +122,10 @@ class KernelVariant:
         self,
         consumer: OpNode,
         attrs: ResolvedAttributes,
+        tensor_name: str,
         port: int,
         buf_dims=None,
-        scheme=None,
+        staging=None,
         producer: Optional[OpNode] = None,
     ) -> Optional[Dict[str, Any]]:
         return None
@@ -213,24 +215,31 @@ class DenseKernelVariant(KernelVariant):
     staging_scheme_in: str = 'dense_staging_ifm'
     staging_scheme_out: str = 'dense_staging_ofm'
 
+    def _io_view(self, node: OpNode, tensor_name: str, direction: str) -> Dict[str, Any]:
+        return node.traits['io_view'].data[direction][tensor_name]
+
+    def _io_shapes(self, attrs: ResolvedAttributes, tensor_name: str, direction: str) -> Dict[str, List[int]]:
+        return attrs.scalars['io_shapes'][direction][tensor_name]
+
     def default_input_staging(self, node, tensor_name):
-        return [{'scheme': self.staging_scheme_in}]
+        return {'scheme': self.staging_scheme_in}
 
     def default_output_staging(self, node, tensor_name):
-        return [{'scheme': self.staging_scheme_out}]
+        return {'scheme': self.staging_scheme_out}
 
     def describe_input_staging(
         self,
         node: OpNode,
         attrs: ResolvedAttributes,
+        tensor_name: str,
         port: int,
         buf_dims=None,
-        scheme=None,
+        staging=None,
         producer=None,
     ) -> Dict[str, Any]:
-        scheme = scheme or self.staging_scheme_in
+        scheme = self.staging_scheme_in if staging is None else staging['scheme']
         if scheme == 'dense_staging_ifm':
-            return self._describe_dense_ifm(node, attrs, port, buf_dims)
+            return self._describe_dense_ifm(node, attrs, tensor_name, port, buf_dims)
 
         raise ValueError(f"{self.variant_id}: unsupported input staging scheme '{scheme}'")
 
@@ -238,13 +247,14 @@ class DenseKernelVariant(KernelVariant):
         self,
         node: OpNode,
         attrs: ResolvedAttributes,
+        tensor_name: str,
         port: int,
         buf_dims=None,
-        scheme=None,
+        staging=None,
     ) -> Dict[str, Any]:
-        scheme = scheme or self.staging_scheme_out
+        scheme = self.staging_scheme_out if staging is None else staging['scheme']
         if scheme == 'dense_staging_ofm':
-            return self._describe_dense_ofm(node, attrs, port, buf_dims)
+            return self._describe_dense_ofm(node, attrs, tensor_name, port, buf_dims)
 
         raise ValueError(f"{self.variant_id}: unsupported output staging scheme '{scheme}'")
 
@@ -300,7 +310,7 @@ class DenseKernelVariant(KernelVariant):
                 'flags': flags,
                 'in_feat_slice': int(slices['input']),
                 'out_feat_slice': int(slices['output']),
-                'padded_batch_size': int(scalars['padded_batch_size']),
+                'padded_independent_extent': int(scalars['padded_independent_extent']),
                 'padded_in_features': int(scalars['padded_in_features']),
                 'padded_out_features': int(scalars['padded_out_features']),
                 'shift': int(scalars['shift']),
@@ -367,6 +377,7 @@ class DenseKernelVariant(KernelVariant):
         self,
         node: OpNode,
         attrs: ResolvedAttributes,
+        tensor_name: str,
         port: int,
         buf_dims=None,
     ) -> Dict[str, Any]:
@@ -378,38 +389,51 @@ class DenseKernelVariant(KernelVariant):
         tile_m = int(attrs.tiling['tile_m'])
         tile_n = int(attrs.tiling['tile_n'])
         out_slice = int(attrs.slices['output'])
-        padded_batch = int(attrs.scalars['padded_batch_size'])
-        real_batch = int(attrs.scalars.get('real_batch_size', padded_batch))
+        raw_out = int(attrs.slices['output_raw'])
+        view = self._io_view(node, tensor_name, 'outputs')
+        shapes = self._io_shapes(attrs, tensor_name, 'outputs')
 
-        if buf_dims is None:
-            buf_dims = [
-                int(attrs.scalars['padded_out_features']),
-                padded_batch,
-            ]
+        buffer_order = list(view['buffer_order'])
+        buffer_dimension = [int(shapes['padded'][i]) for i in buffer_order]
+        io_boundary_dimension = [int(shapes['real'][i]) for i in buffer_order]
+        io_tiling_dimension = list(io_boundary_dimension)
 
-        real_out = int(node.metadata.get('n_out'))
+        feat_dim = buffer_order.index(int(view['feature_axis']))
+        indep_dim = buffer_order.index(int(view['independent_axes'][-1]))
+
+        io_tiling_dimension[feat_dim] = raw_out
+
+        tiling_dimension = [1 for _ in buffer_dimension]
+        tiling_dimension[feat_dim] = tile_n
+        tiling_dimension[indep_dim] = tile_m
+
+        tile_traversal = []
+        tile_traversal.append({'dimension': feat_dim, 'stride': tile_n, 'wrap': out_slice // tile_n})
+        tile_traversal.append({'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m})
+        for dim in range(len(buffer_dimension)):
+            if dim in (feat_dim, indep_dim):
+                continue
+            tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
+
+        offset = [0 for _ in buffer_dimension]
+        offset[feat_dim] = port * out_slice
 
         return {
             'access': 'write',
-            'buffer_dimension': [
-                int(attrs.scalars['padded_out_features']),
-                padded_batch,
-            ],
-            'tiling_dimension': [tile_n, tile_m],
-            'offset': [port * out_slice, 0],
-            'tile_traversal': [
-                {'dimension': 0, 'stride': tile_n, 'wrap': out_slice // tile_n},
-                {'dimension': 1, 'stride': tile_m, 'wrap': padded_batch // tile_m},
-            ],
-            'io_tiling_dimension': [attrs.slices['output_raw'], real_batch],
-            'io_boundary_dimension': [real_out, real_batch],
-            'slice_dimension': 0,
+            'buffer_dimension': buffer_dimension,
+            'tiling_dimension': tiling_dimension,
+            'offset': offset,
+            'tile_traversal': tile_traversal,
+            'io_tiling_dimension': io_tiling_dimension,
+            'io_boundary_dimension': io_boundary_dimension,
+            'slice_dimension': feat_dim,
         }
 
     def _describe_dense_ifm(
         self,
         consumer: OpNode,
         attrs: ResolvedAttributes,
+        tensor_name: str,
         port: int,
         buf_dims=None,
     ) -> Dict[str, Any]:
@@ -421,33 +445,46 @@ class DenseKernelVariant(KernelVariant):
         tile_m = int(attrs.tiling['tile_m'])
         tile_k = int(attrs.tiling['tile_k'])
         in_slice = int(attrs.slices['input'])
-        padded_batch = int(attrs.scalars['padded_batch_size'])
-        real_batch = int(attrs.scalars.get('real_batch_size', padded_batch))
+        raw_in = int(attrs.slices['input_raw'])
+        view = self._io_view(consumer, tensor_name, 'inputs')
+        shapes = self._io_shapes(attrs, tensor_name, 'inputs')
 
-        real_feat = int(consumer.metadata.get('n_in', in_slice))
+        buffer_order = list(view['buffer_order'])
+        buffer_dimension = [int(shapes['padded'][i]) for i in buffer_order]
+        boundary_dimension = [int(shapes['real'][i]) for i in buffer_order]
+        io_boundary_dimension = list(boundary_dimension)
+        io_tiling_dimension = list(io_boundary_dimension)
 
-        if buf_dims is None:
-            buf_dims = [
-                int(attrs.scalars['padded_in_features']),
-                padded_batch,
-            ]
+        feat_dim = buffer_order.index(int(view['feature_axis']))
+        indep_dim = buffer_order.index(int(view['independent_axes'][-1]))
+
+        io_tiling_dimension[feat_dim] = raw_in
+
+        tiling_dimension = [1 for _ in buffer_dimension]
+        tiling_dimension[feat_dim] = tile_k
+        tiling_dimension[indep_dim] = tile_m
+
+        tile_traversal = []
+        tile_traversal.append({'dimension': feat_dim, 'stride': tile_k, 'wrap': in_slice // tile_k})
+        tile_traversal.append({'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m})
+        for dim in range(len(buffer_dimension)):
+            if dim in (feat_dim, indep_dim):
+                continue
+            tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
+
+        offset = [0 for _ in buffer_dimension]
+        offset[feat_dim] = port * in_slice
 
         return {
             'access': 'read',
-            'buffer_dimension': [
-                int(attrs.scalars['padded_in_features']),
-                padded_batch,
-            ],
-            'tiling_dimension': [tile_k, tile_m],
-            'offset': [port * in_slice, 0],
-            'tile_traversal': [
-                {'dimension': 0, 'stride': tile_k, 'wrap': in_slice // tile_k},
-                {'dimension': 1, 'stride': tile_m, 'wrap': padded_batch // tile_m},
-            ],
-            'boundary_dimension': [real_feat, real_batch],
-            'io_tiling_dimension': [attrs.slices['input_raw'], real_batch],
-            'io_boundary_dimension': [real_feat, real_batch],
-            'slice_dimension': 0,
+            'buffer_dimension': buffer_dimension,
+            'tiling_dimension': tiling_dimension,
+            'offset': offset,
+            'tile_traversal': tile_traversal,
+            'boundary_dimension': boundary_dimension,
+            'io_tiling_dimension': io_tiling_dimension,
+            'io_boundary_dimension': io_boundary_dimension,
+            'slice_dimension': feat_dim,
         }
 
     def footprint(self, context: KernelPlacementContext) -> KernelFootprint:

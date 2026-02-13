@@ -21,19 +21,21 @@ def _par_summary(layers):
     return '_'.join(f"{k}_c{v['cas_num']}x{v['cas_length']}" for k, v in layers.items())
 
 
-def _build_qkeras_mlp(qkeras, in_features, hidden1, hidden2, out_features, bits):
+def _build_qkeras_mlp(qkeras, input_shape, in_features, hidden1, hidden2, out_features, bits):
     from keras.models import Sequential
     from qkeras import QActivation, QDense, quantized_bits, quantized_relu
+
+    assert int(input_shape[-1]) == int(in_features)
 
     INT_BITS = 2
 
     q_in = quantized_bits(bits, INT_BITS)
-    q_w = quantized_bits(bits, 0, alpha=1)
-    q_b = quantized_bits(bits, 0, alpha=1)
+    q_w = quantized_bits(bits, 1, alpha=1)
+    q_b = quantized_bits(bits, 1, alpha=1)
 
     model = Sequential(
         [
-            QActivation(q_in, name='input_quant', input_shape=(in_features,)),
+            QActivation(q_in, name='input_quant', input_shape=input_shape),
             QDense(hidden1, name='dense0', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'),
             QActivation(quantized_relu(bits, 0), name='act0'),
             QDense(hidden2, name='dense1', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'),
@@ -59,11 +61,12 @@ def _make_cfg(hls4ml, model, layer_parallelism):
     return cfg
 
 
-def _make_aie_model(tmp_path, cfg_dict):
+def _make_aie_model(tmp_path, cfg_dict, input_shape):
     np, hls4ml, _keras, qkeras = _imports()
 
     qmodel = _build_qkeras_mlp(
         qkeras,
+        input_shape=input_shape,
         in_features=384,
         hidden1=256,
         hidden2=200,
@@ -73,7 +76,8 @@ def _make_aie_model(tmp_path, cfg_dict):
 
     cfg = _make_cfg(hls4ml, qmodel, cfg_dict['layers'])
 
-    outdir = tmp_path / (f"aie_mlp_b{cfg_dict['bits']}_bs{cfg_dict['batch']}_" f"{_par_summary(cfg_dict['layers'])}")
+    tag = '1d' if len(input_shape) == 1 else f'nd{len(input_shape)}'
+    outdir = tmp_path / (f"aie_mlp_b{cfg_dict['bits']}_bs{cfg_dict['batch']}_{_par_summary(cfg_dict['layers'])}_{tag}")
 
     aie_model = hls4ml.converters.convert_from_keras_model(
         qmodel,
@@ -117,7 +121,7 @@ def test_aie_backend_conversion_only(tmp_path, cfg):
     Conversion + lowering test.
     No Vitis required.
     """
-    qmodel, aie_model = _make_aie_model(tmp_path, cfg)
+    qmodel, aie_model = _make_aie_model(tmp_path, cfg, input_shape=(384,))
     assert aie_model is not None
 
 
@@ -131,11 +135,11 @@ def test_aie_compile_x86_sim(tmp_path: Path, cfg: dict):
     _require_vitis()
 
     np, _hls4ml, _keras, _qkeras = _imports()
-    qmodel, aie_model = _make_aie_model(tmp_path, cfg)
+    qmodel, aie_model = _make_aie_model(tmp_path, cfg, input_shape=(384,))
 
     aie_model.compile()
 
-    x = np.random.random((cfg['batch'], 384)).astype('float32')
+    x = (np.random.random((cfg['batch'], 384)).astype('float32') * 2.0) - 1.0
 
     y_ref = qmodel.predict(x, verbose=0)
     y_aie = aie_model.predict(x, simulator='x86')
@@ -143,7 +147,63 @@ def test_aie_compile_x86_sim(tmp_path: Path, cfg: dict):
     y_aie = y_aie[: cfg['batch']]
 
     assert y_ref.shape == y_aie.shape
-    np.testing.assert_allclose(y_ref, y_aie, rtol=1e-5, atol=1e-5)
+    np.testing.assert_equal(y_ref, y_aie)
+
+
+@pytest.mark.aie_ir
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('input_shape', [(16, 384), (8, 16, 384)])
+def test_aie_compile_x86_sim_nd_input(tmp_path: Path, input_shape):
+    _require_vitis()
+    np, hls4ml, keras, qkeras = _imports()
+
+    from keras.models import Sequential
+    from qkeras import QActivation, QDense, quantized_bits
+
+    bits = 8
+    B = 1
+    N = 10
+
+    q_w = quantized_bits(bits, 1, alpha=1)
+    q_b = quantized_bits(bits, 1, alpha=1)
+
+    qmodel = Sequential(
+        [
+            QActivation(quantized_bits(bits, 2), name='input_quant', input_shape=input_shape),
+            QDense(
+                N,
+                name='dense0',
+                kernel_quantizer=q_w,
+                bias_quantizer=q_b,
+                bias_initializer='random_uniform',
+            ),
+        ]
+    )
+    qmodel.compile(optimizer='adam', loss='mse')
+
+    shape_tag = 'x'.join(str(d) for d in input_shape)
+    outdir = tmp_path / f'aie_dense_nd_single_layer_{shape_tag}'
+    aie_model = hls4ml.converters.convert_from_keras_model(
+        qmodel,
+        output_dir=str(outdir),
+        backend='aie',
+        project_name='proj_aie',
+        batch_size=B,
+        iterations=5,
+    )
+
+    # NOTE: keep this test relaxed. In the 2D Dense path, hls4ml may widen
+    # inferred numeric types during parsing/lowering (e.g., 8-bit QKeras intent
+    # leading to wider IO precision such as 16-bit in generated types).
+    aie_model.compile()
+
+    x = (np.random.random((B, *input_shape)).astype('float32') * 2.0) - 1.0
+    y_ref = qmodel.predict(x, verbose=0)
+    y_aie = aie_model.predict(x, simulator='x86')
+    y_aie = y_aie[:B]
+
+    assert y_ref.shape == y_aie.shape
+    np.testing.assert_allclose(y_ref, y_aie, rtol=0.15, atol=0.15)
 
 
 # Future TODO

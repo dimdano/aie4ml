@@ -33,7 +33,7 @@ def read_aie_report(model_or_path: Union[object, str, Path]) -> Dict:
     global_ii = ii_info.get('global', {})
     if global_ii and model is not None:
         ops_per_inf = compute_ops(model)
-        batch_size = model.config.get_config_value('AIEConfig')['BatchSize']
+        batch_size = _infer_batch_size(model)
         total_ops = ops_per_inf * batch_size
         report['throughput'] = {
             'Avg_GOPs': round((total_ops / global_ii['avg_ns']), 3),
@@ -148,6 +148,17 @@ def compute_ops(model):
     return ops
 
 
+def _infer_batch_size(model) -> int:
+    ctx = get_backend_context(model)
+    inputs = ctx.ir.logical.graph_inputs()
+    if not inputs:
+        raise RuntimeError('Cannot infer batch size: logical graph has no inputs.')
+    shape = inputs[0].shape
+    if not shape:
+        raise RuntimeError('Cannot infer batch size: input tensor shape missing.')
+    return int(shape[0])
+
+
 @dataclass
 class IOPortLayout:
     direction: str
@@ -234,6 +245,7 @@ def build_io_layout(model) -> IOLayout:
             st = inst.variant.describe_input_staging(
                 inst.node,
                 inst.attributes,
+                tensor,
                 port,
                 None,
                 None,
@@ -265,6 +277,7 @@ def build_io_layout(model) -> IOLayout:
             st = inst.variant.describe_output_staging(
                 inst.node,
                 inst.attributes,
+                tensor,
                 port,
                 None,
                 None,
@@ -302,11 +315,17 @@ def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) 
         expected = p0.numpy_boundary_shape
         arr = np.asarray(X[tensor])
 
-        if arr.ndim == len(expected):
+        if tuple(arr.shape) == expected:
             arr = np.repeat(arr[np.newaxis, ...], iterations, axis=0)
+        elif arr.ndim == len(expected) + 1 and tuple(arr.shape[1:]) == expected and arr.shape[0] == iterations:
+            pass
+        elif arr.ndim == len(expected) + 1 and tuple(arr.shape[1:]) == expected and arr.shape[0] == 1:
+            arr = np.repeat(arr, iterations, axis=0)
         else:
-            if arr.shape[0] != iterations:
-                raise ValueError(f'{tensor}: expected iterations={iterations}, got {arr.shape[0]}')
+            raise ValueError(
+                f'{tensor}: expected shape {expected}, (1, *{expected}) or ({iterations}, *{expected}); '
+                f'got {tuple(arr.shape)}'
+            )
 
         if tuple(arr.shape[1:]) != expected:
             raise ValueError(f'{tensor}: expected input shape {expected}, got {tuple(arr.shape[1:])}')

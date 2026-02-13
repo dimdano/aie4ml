@@ -18,7 +18,7 @@ public:
   static constexpr unsigned CAS_LENGTH = ConfigT::CAS_LENGTH;
   static constexpr unsigned IN_FEAT_SLICE  = ConfigT::IN_FEAT_SLICE;
   static constexpr unsigned OUT_FEAT_SLICE = ConfigT::OUT_FEAT_SLICE;
-  static constexpr unsigned padded_batch_size = ConfigT::padded_batch_size;
+  static constexpr unsigned padded_independent_extent = ConfigT::padded_independent_extent;
   static constexpr int M  = ConfigT::M;
   static constexpr int K  = ConfigT::K;
   static constexpr int N  = ConfigT::N;
@@ -95,14 +95,14 @@ public:
       for (unsigned ch = 0; ch < CAS_NUM; ++ch) {
         int idx = ch*CAS_LENGTH + col;
         connect<>( in1[col], kk[idx].in[0] );
-        dimensions( kk[idx].in[0] ) = { padded_batch_size * IN_FEAT_SLICE };
+        dimensions( kk[idx].in[0] ) = { padded_independent_extent * IN_FEAT_SLICE };
       }
     }
 
     for (int chain = 0; chain < CAS_NUM; ++chain) {
         const int last_idx = chain * CAS_LENGTH + (CAS_LENGTH - 1);
         connect<>( kk[last_idx].out[0], out1[chain] );
-        dimensions( kk[last_idx].out[0] ) = { padded_batch_size * OUT_FEAT_SLICE };
+        dimensions( kk[last_idx].out[0] ) = { padded_independent_extent * OUT_FEAT_SLICE };
     }
 
     if constexpr (CAS_LENGTH > 1) {

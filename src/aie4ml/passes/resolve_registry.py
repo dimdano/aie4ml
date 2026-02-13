@@ -59,14 +59,6 @@ class LayerResolveContext:
     def parallelism(self) -> Optional['ParallelismResult']:
         return self.state.get('parallelism')
 
-    def batch_size(self) -> int:
-        if 'BatchSize' not in self.global_config:
-            raise KeyError(f'{self.layer_name}: missing required AIEConfig.BatchSize.')
-        value = int(self.global_config['BatchSize'])
-        if value <= 0:
-            raise ValueError(f'{self.layer_name}: BatchSize must be positive, got {value}.')
-        return value
-
 
 @dataclass
 class NumericBundle:
@@ -105,7 +97,8 @@ class ParallelismResult:
     parallel_factor: int = 1
     input_alignment: int = 1
     output_alignment: int = 1
-    padded_batch_size: int = 1
+    padded_independent_extent: int = 1
+    independent_extent: int = 1
     padded_in_features: int = 0
     padded_out_features: int = 0
 
@@ -460,6 +453,66 @@ def _aligned_batch_size(batch: int, tile_m: int) -> int:
     return _align_up(int(batch), two_m)
 
 
+def _independent_extent(ctx: LayerResolveContext) -> Tuple[int, int]:
+    logical = [int(x) for x in ctx.node.inputs[0].shape]
+    if len(logical) < 2:
+        raise ValueError(f'{ctx.layer_name}: tensor rank must be >=2, got {len(logical)}.')
+    independent = logical[:-1]
+    extent = int(math.prod(independent))
+    last_indep = int(independent[-1])
+    return extent, last_indep
+
+
+def _pad_logical_shape(
+    logical: List[int],
+    feature_axis: int,
+    independent_axes: List[int],
+    padded_feat: int,
+    tile_m: int,
+) -> List[int]:
+    padded = list(logical)
+    padded[feature_axis] = int(padded_feat)
+    if independent_axes:
+        last_axis = int(independent_axes[-1])
+        padded[last_axis] = _align_up(int(padded[last_axis]), 2 * max(1, int(tile_m)))
+    return padded
+
+
+def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
+    io_trait = ctx.node.traits.get('io_view')
+    views = io_trait.data if io_trait else {'inputs': {}, 'outputs': {}}
+    tile_m = ctx.attributes.tiling['tile_m']
+    shapes: Dict[str, Dict[str, Dict[str, List[int]]]] = {'inputs': {}, 'outputs': {}}
+
+    for t in ctx.node.inputs:
+        view = views['inputs'][t.name]
+        logical = [int(x) for x in t.shape]
+        real = list(logical)
+        padded = _pad_logical_shape(
+            logical,
+            view['feature_axis'],
+            view['independent_axes'],
+            padded_feat=int(ctx.attributes.scalars['padded_in_features']),
+            tile_m=tile_m,
+        )
+        shapes['inputs'][t.name] = {'logical': logical, 'real': real, 'padded': padded}
+
+    for t in ctx.node.outputs:
+        view = views['outputs'][t.name]
+        logical = [int(x) for x in t.shape]
+        real = list(logical)
+        padded = _pad_logical_shape(
+            logical,
+            view['feature_axis'],
+            view['independent_axes'],
+            padded_feat=int(ctx.attributes.scalars['padded_out_features']),
+            tile_m=tile_m,
+        )
+        shapes['outputs'][t.name] = {'logical': logical, 'real': real, 'padded': padded}
+
+    return shapes
+
+
 def _aligned_input_features(
     in_feat: int,
     cas_length: int,
@@ -691,8 +744,9 @@ def _resolve_parallelism_numeric(
     if out_slice > 0:
         out_slice = _align_up(out_slice, align_n)
 
-    batch_size = ctx.batch_size()
-    padded_batch = _aligned_batch_size(batch_size, tile_m)
+    indep_extent, last_indep = _independent_extent(ctx)
+    padded_last = _aligned_batch_size(last_indep, tile_m)
+    padded_indep = (indep_extent // max(1, last_indep)) * padded_last
     padded_in = _aligned_input_features(in_shape, cas_length, tile_k, ctx.device, input_bytes)
     padded_in = max(padded_in, in_slice * max(1, cas_length))
     padded_out = out_slice * max(1, cas_num)
@@ -708,7 +762,8 @@ def _resolve_parallelism_numeric(
         parallel_factor=int(candidate['parallel_factor']),
         input_alignment=align_k,
         output_alignment=align_n,
-        padded_batch_size=padded_batch,
+        padded_independent_extent=int(padded_indep),
+        independent_extent=int(indep_extent),
         padded_in_features=int(padded_in),
         padded_out_features=int(padded_out),
     )
@@ -779,31 +834,62 @@ def resolve_io_route(ctx: LayerResolveContext) -> None:
             r[d].update(user[d])
 
 
+def resolve_io_view(ctx: LayerResolveContext) -> None:
+    io_trait = ctx.node.traits.get('io_view')
+    if io_trait is None:
+        raise ValueError(f'{ctx.layer_name}: missing io_view trait; lowering must attach it.')
+    data = io_trait.data
+
+    gen = (getattr(ctx.device, 'generation', '') or '').upper()
+    max_rank = 5 if 'AIE-MLV2' in gen else 4
+
+    for t in ctx.node.inputs:
+        if t.name not in data['inputs']:
+            raise ValueError(f'{ctx.layer_name}: missing io_view.inputs entry for tensor {t.name}.')
+        logical = [int(x) for x in t.shape]
+        rank = len(logical)
+        if rank > max_rank:
+            raise ValueError(
+                f'{ctx.layer_name}: tensor rank {rank} exceeds max {max_rank} for {ctx.device.generation}.'
+            )
+
+    for t in ctx.node.outputs:
+        if t.name not in data['outputs']:
+            raise ValueError(f'{ctx.layer_name}: missing io_view.outputs entry for tensor {t.name}.')
+        logical = [int(x) for x in t.shape]
+        rank = len(logical)
+        if rank > max_rank:
+            raise ValueError(
+                f'{ctx.layer_name}: tensor rank {rank} exceeds max {max_rank} for {ctx.device.generation}.'
+            )
+
+
 def resolve_staging(ctx: LayerResolveContext) -> None:
     """
     Attach user-provided staging overrides.
-      staging.inputs.<tensor>  = [ { scheme: ... } ]
-      staging.outputs.<tensor> = [ { scheme: ... } ]
+      staging.inputs.<tensor>  = { scheme: ... }
+      staging.outputs.<tensor> = { scheme: ... }
     """
 
     st = ctx.attributes.staging
-    st.setdefault('inputs', {})
-    st.setdefault('outputs', {})
+    st['inputs'] = {}
+    st['outputs'] = {}
 
     user = ctx.config.get('staging')
     if not isinstance(user, dict):
         return
 
     for direction in ('inputs', 'outputs'):
-        overrides = user.get(direction)
-        if not isinstance(overrides, dict):
+        if direction not in user:
             continue
+        overrides = user[direction]
+        if not isinstance(overrides, dict):
+            raise ValueError(f'{ctx.layer_name}: staging.{direction} must be a dict.')
 
         for tensor_name, value in overrides.items():
-            if isinstance(value, dict):
-                st[direction][tensor_name] = [dict(value)]
-            elif isinstance(value, list):
-                st[direction][tensor_name] = [dict(v) for v in value if isinstance(v, dict)]
+            if not isinstance(value, dict):
+                raise ValueError(f'{ctx.layer_name}: staging.{direction}.{tensor_name} must be a dict.')
+            st[direction][tensor_name] = dict(value)
 
 
 def _stable_pack_key(layer_name: str, resolved: Dict[str, Any]) -> str:
@@ -927,13 +1013,12 @@ def resolve_scalars(ctx: LayerResolveContext) -> None:
         raise RuntimeError(f'{ctx.layer_name}: missing resolved numeric scalar "shift"')
 
     parallelism = ctx.parallelism()
-    if parallelism:
-        scalars['padded_batch_size'] = int(parallelism.padded_batch_size)
-        scalars['padded_in_features'] = int(parallelism.padded_in_features)
-        scalars['padded_out_features'] = int(parallelism.padded_out_features)
-    else:
-        scalars.setdefault('padded_batch_size', ctx.batch_size())
-    scalars['real_batch_size'] = ctx.batch_size()
+    scalars['padded_independent_extent'] = int(parallelism.padded_independent_extent)
+    scalars['real_independent_extent'] = int(parallelism.independent_extent)
+    scalars['padded_in_features'] = int(parallelism.padded_in_features)
+    scalars['padded_out_features'] = int(parallelism.padded_out_features)
+    scalars['batch_size'] = int(ctx.node.inputs[0].shape[0])
+    scalars['io_shapes'] = _resolve_io_shapes(ctx)
 
 
 def merge_config_layers(config: dict, layer_name: str, layer_class: str) -> dict:
@@ -976,6 +1061,7 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
             resolve_parallelism,
             resolve_flags,
             resolve_io_route,
+            resolve_io_view,
             resolve_staging,
             resolve_pack,
             resolve_placement,
@@ -989,6 +1075,7 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
             resolve_numeric,
             resolve_parallelism,
             resolve_flags,
+            resolve_io_view,
             resolve_placement,
             resolve_scalars,
         ),

@@ -7,6 +7,7 @@ class FuseActivationCasts(OptimizerPass):
     """Fuse Dense+Activation pairs (relu or linear) directly in the hls4ml graph."""
 
     _SUPPORTED = {'relu', 'linear'}
+    _FUSABLE = {'Dense', 'Conv1D', 'Conv2D'}
 
     def match(self, node):
         if getattr(node, 'class_name', None) != 'Activation' or len(node.inputs) != 1:
@@ -17,7 +18,7 @@ class FuseActivationCasts(OptimizerPass):
             return False
 
         prev_node = node.get_input_node()
-        if prev_node is None or getattr(prev_node, 'class_name', None) != 'Dense':
+        if prev_node is None or getattr(prev_node, 'class_name', None) not in self._FUSABLE:
             return False
 
         return True

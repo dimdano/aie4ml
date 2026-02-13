@@ -31,7 +31,7 @@ struct graph_plan {
   static void configure(GraphT& self) {
 {% for buf in graph_plan.buffers %}
     self.{{ buf.name }} = adf::shared_buffer<{{ buf.ctype }}>::create(
-      { {{ buf.dimension[0] }}, {{ buf.dimension[1] }} },
+      { {{ buf.dimension|join(', ') }} },
       {{ buf.writers|length if buf.writers|length > 0 else 1 }},
       {{ buf.readers|length if buf.readers|length > 0 else 1 }}
     );

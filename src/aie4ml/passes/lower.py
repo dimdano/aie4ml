@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Dict
+from typing import Any, Dict
 
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
@@ -20,6 +20,7 @@ from ..ir import (
     ensure_backend_context,
 )
 from ..ir.context import AIEBackendContext, DeviceSpec
+from .utils import attach_default_io_view, is_pointwise_dense
 
 
 class LowerToAieIr(ModelOptimizerPass):
@@ -35,11 +36,22 @@ class LowerToAieIr(ModelOptimizerPass):
         graph: LogicalIR = ctx.ir.logical
         layers = list(model.get_layers())
         input_var = model.get_input_variables()[0]
+        batch_size = int(model.config.get_config_value('AIEConfig', {})['BatchSize'])
+        batch_included = bool(ctx.policies.tensors_have_batch)
+
+        def _canon(shape):
+            dims = [int(x) for x in shape]
+            if batch_included:
+                return tuple(dims)
+            return tuple([batch_size] + dims)
+
+        if input_var.name not in graph.tensors:
+            graph.add_tensor(TensorVar(name=input_var.name, shape=input_var.shape))
 
         for layer in layers:
             var = model.output_vars[layer.name]
             if var.name not in graph.tensors:
-                graph.add_tensor(TensorVar(name=var.name, shape=tuple(var.shape)))
+                graph.add_tensor(TensorVar(name=var.name, shape=_canon(var.shape)))
 
         node_map: Dict[str, OpNode] = {}
         created_nodes = set()
@@ -50,7 +62,7 @@ class LowerToAieIr(ModelOptimizerPass):
 
             node = OpNode(
                 name=f'{layer.name}_aie',
-                op_type=layer.class_name.lower(),
+                op_type=self._map_op_type(layer),
                 dialect=ctx.device.dialect,
             )
             self._collect_metadata(layer, node)
@@ -80,7 +92,7 @@ class LowerToAieIr(ModelOptimizerPass):
                 node.inputs.append(tv)
                 tv.consumers.append(node)
 
-            self._attach_traits(node, layer)
+            self._attach_traits(ctx, node, layer)
 
         return True
 
@@ -89,9 +101,17 @@ class LowerToAieIr(ModelOptimizerPass):
 
         meta: Dict[str, Any] = {}
 
-        if layer.class_name == 'Dense':
-            meta['n_in'] = int(layer.get_attr('n_in'))
-            meta['n_out'] = int(layer.get_attr('n_out'))
+        if layer.class_name == 'Dense' or is_pointwise_dense(layer):
+            if layer.class_name == 'Dense':
+                n_in = layer.get_attr('n_in')
+                n_out = layer.get_attr('n_out')
+            else:
+                n_in = layer.get_attr('n_chan')
+                n_out = layer.get_attr('n_filt')
+            if n_in is None or n_out is None:
+                raise ValueError(f'{layer.name}: missing n_in/n_out for {layer.class_name}.')
+            meta['n_in'] = int(n_in)
+            meta['n_out'] = int(n_out)
             meta['use_bias'] = layer.get_attr('bias_data') is not None
 
         if layer.class_name == 'Activation':
@@ -100,6 +120,9 @@ class LowerToAieIr(ModelOptimizerPass):
                 meta['activation'] = act
 
         meta['layer_class'] = layer.class_name
+        if is_pointwise_dense(layer):
+            meta['source_class'] = layer.class_name
+            meta['layer_class'] = 'Dense'
         meta['source_layer'] = layer.name
 
         if meta:
@@ -124,6 +147,9 @@ class LowerToAieIr(ModelOptimizerPass):
             decomposition=config.get_config_value('AIEDecompositionPolicy', {}) or {},
             pack=config.get_config_value('AIEPackPolicy', {}) or {},
             cache=config.get_config_value('AIECachePolicy', {}) or {},
+            tensors_have_batch=bool(
+                (config.get_config_value('AIEFrontendPolicy', {}) or {}).get('TensorsHaveBatch', False)
+            ),
         )
 
         ctx = AIEBackendContext(device=device, policies=policies)
@@ -140,13 +166,29 @@ class LowerToAieIr(ModelOptimizerPass):
                 description='Indicates that an activation has been fused into the producer op.',
             )
         )
+        ctx.traits.register(
+            TraitDefinition(
+                name='io_view',
+                dialects=(ctx.device.dialect,),
+                fields=('inputs', 'outputs'),
+                description='Per-tensor logical-to-physical view mapping for IO/staging.',
+            )
+        )
 
-    def _attach_traits(self, node: OpNode, layer) -> None:
-        if layer.class_name == 'Dense':
+    def _attach_traits(self, ctx: AIEBackendContext, node: OpNode, layer) -> None:
+        if layer.class_name == 'Dense' or is_pointwise_dense(layer):
             fused = (layer.get_attr('aie_fused_activation', '') or '').lower()
             if fused:
                 node.add_trait(TraitInstance('fused_activation', {'activation': fused}))
+        attach_default_io_view(node)
 
     def _is_identity_activation(self, layer) -> bool:
         act = (layer.get_attr('activation', '') or '').lower()
         return act in ('', 'linear', 'identity')
+
+    def _map_op_type(self, layer) -> str:
+        if layer.class_name == 'Dense':
+            return 'dense'
+        if is_pointwise_dense(layer):
+            return 'dense'
+        return layer.class_name.lower()

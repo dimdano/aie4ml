@@ -18,9 +18,9 @@ dense_base<ConfigT>::dense_base() {
   static_assert(
         ConfigT::OUT_FEAT_SLICE % (2 * ConfigT::N) == 0,
         "OUT_FEAT_SLICE must be divisible by 2*N");
-  static_assert(
-        ConfigT::padded_batch_size % (2 * ConfigT::M) == 0,
-        "padded_batch_size must be divisible by 2*M");
+static_assert(
+    ConfigT::padded_independent_extent % (2 * ConfigT::M) == 0,
+    "padded_independent_extent must be divisible by 2*M");
   static_assert(
         ConfigT::padded_IN_FEAT == ConfigT::IN_FEAT_SLICE * ConfigT::CAS_LENGTH,
         "padded_IN_FEAT must equal IN_FEAT_SLICE * CAS_LENGTH");
@@ -61,7 +61,7 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
                                 output_buffer<result_t>& ofm)
 {
 
-  static constexpr int rowA  = ConfigT::padded_batch_size;
+  static constexpr int rowA  = ConfigT::padded_independent_extent;
   static constexpr int colA  = ConfigT::IN_FEAT_SLICE;
   static constexpr int colB  = ConfigT::OUT_FEAT_SLICE;
   static constexpr int M     = ConfigT::M;
@@ -146,7 +146,7 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
                                const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
                                output_cascade<acc_scalar_t>* outCascade)
 {
-  static constexpr int rowA = ConfigT::padded_batch_size;
+  static constexpr int rowA = ConfigT::padded_independent_extent;
   static constexpr int colA = ConfigT::IN_FEAT_SLICE;
   static constexpr int colB = ConfigT::OUT_FEAT_SLICE;
   static constexpr int M    = ConfigT::M;
@@ -204,7 +204,7 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
                                 input_cascade<acc_scalar_t>* inCascade,
                                 output_cascade<acc_scalar_t>* outCascade)
 {
-  static constexpr int rowA = ConfigT::padded_batch_size;
+  static constexpr int rowA = ConfigT::padded_independent_extent;
   static constexpr int colA = ConfigT::IN_FEAT_SLICE;
   static constexpr int colB = ConfigT::OUT_FEAT_SLICE;
   static constexpr int M    = ConfigT::M;
@@ -279,7 +279,7 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
   using result_t     = typename ConfigT::result_t;
   using acc_scalar_t = typename ConfigT::acc_scalar_t;
 
-  static constexpr int rowA  = ConfigT::padded_batch_size;
+  static constexpr int rowA  = ConfigT::padded_independent_extent;
   static constexpr int colA  = ConfigT::IN_FEAT_SLICE;
   static constexpr int colB  = ConfigT::OUT_FEAT_SLICE;
   static constexpr int M     = ConfigT::M;

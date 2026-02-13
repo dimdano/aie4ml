@@ -12,7 +12,7 @@ struct {{L.struct_name}} {
   static constexpr int M = {{P.tiling.tile_m}}, K = {{P.tiling.tile_k}}, N = {{P.tiling.tile_n}};
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};
-  static constexpr int padded_batch_size = {{P.padded_batch_size}};
+  static constexpr int padded_independent_extent = {{P.padded_independent_extent}};
   static constexpr int padded_IN_FEAT = {{P.padded_in_features}};
   static constexpr int padded_OUT_FEAT = {{P.padded_out_features}};
   static constexpr int IN_FEAT_SLICE = {{P.in_feat_slice}};

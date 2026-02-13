@@ -53,6 +53,7 @@ class BackendPolicies:
     decomposition: Dict[str, Any] = field(default_factory=dict)
     pack: Dict[str, Any] = field(default_factory=dict)
     cache: Dict[str, Any] = field(default_factory=dict)
+    tensors_have_batch: bool = False
 
 
 @dataclass

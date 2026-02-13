@@ -141,7 +141,6 @@ class AIEWriter(Writer):
         context = {
             'layers': layers,
             'graph_plan': graph_plan,
-            'batch_size': int(aie_cfg['BatchSize']),
             'plio_bitwidth': int(aie_cfg['PLIOWidthBits']),
             'iterations': int(aie_cfg['Iterations']),
             'pl_freq_mhz': float(aie_cfg['PLClockFreqMHz']),
