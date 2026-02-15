@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..aie_types import AIEDataType, QuantIntent, RoundingMode, SaturationMode
-from ..ir import ResolvedAttributes
+from ..ir import ResolvedAttributes, TraitInstance
 from ..kernel_registry import get_kernel_registry
 
 log = logging.getLogger(__name__)
@@ -837,31 +837,42 @@ def resolve_io_route(ctx: LayerResolveContext) -> None:
 def resolve_io_view(ctx: LayerResolveContext) -> None:
     io_trait = ctx.node.traits.get('io_view')
     if io_trait is None:
-        raise ValueError(f'{ctx.layer_name}: missing io_view trait; lowering must attach it.')
+        io_trait = TraitInstance('io_view', {'inputs': {}, 'outputs': {}})
+        ctx.node.add_trait(io_trait)
     data = io_trait.data
+    data.setdefault('inputs', {})
+    data.setdefault('outputs', {})
 
     gen = (getattr(ctx.device, 'generation', '') or '').upper()
     max_rank = 5 if 'AIE-MLV2' in gen else 4
 
+    def _default_view(rank: int) -> Dict[str, Any]:
+        return {
+            'layout': 'channels_last',
+            'feature_axis': rank - 1,
+            'independent_axes': list(range(rank - 1)),
+            'buffer_order': list(reversed(range(rank))),
+        }
+
     for t in ctx.node.inputs:
-        if t.name not in data['inputs']:
-            raise ValueError(f'{ctx.layer_name}: missing io_view.inputs entry for tensor {t.name}.')
         logical = [int(x) for x in t.shape]
         rank = len(logical)
         if rank > max_rank:
             raise ValueError(
                 f'{ctx.layer_name}: tensor rank {rank} exceeds max {max_rank} for {ctx.device.generation}.'
             )
+        if t.name not in data['inputs']:
+            data['inputs'][t.name] = _default_view(rank)
 
     for t in ctx.node.outputs:
-        if t.name not in data['outputs']:
-            raise ValueError(f'{ctx.layer_name}: missing io_view.outputs entry for tensor {t.name}.')
         logical = [int(x) for x in t.shape]
         rank = len(logical)
         if rank > max_rank:
             raise ValueError(
                 f'{ctx.layer_name}: tensor rank {rank} exceeds max {max_rank} for {ctx.device.generation}.'
             )
+        if t.name not in data['outputs']:
+            data['outputs'][t.name] = _default_view(rank)
 
 
 def resolve_staging(ctx: LayerResolveContext) -> None:

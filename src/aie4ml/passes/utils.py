@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..ir import OpNode, TraitInstance
-
 
 def sanitize_identifier(name: str, prefix: str = 'id') -> str:
     """Return a C/C++ friendly identifier derived from ``name``."""
@@ -29,29 +27,6 @@ def lookup_layer(model: Any, name: str):
             if getattr(layer, 'name', None) == name:
                 return layer
     return None
-
-
-def attach_default_io_view(node: OpNode) -> None:
-    data = {'inputs': {}, 'outputs': {}}
-    for tensor in node.inputs:
-        rank = len([int(x) for x in tensor.shape])
-        data['inputs'][tensor.name] = {
-            'layout': 'channels_last',
-            'feature_axis': rank - 1,
-            'independent_axes': list(range(rank - 1)),
-            'buffer_order': list(reversed(range(rank))),
-        }
-
-    for tensor in node.outputs:
-        rank = len([int(x) for x in tensor.shape])
-        data['outputs'][tensor.name] = {
-            'layout': 'channels_last',
-            'feature_axis': rank - 1,
-            'independent_axes': list(range(rank - 1)),
-            'buffer_order': list(reversed(range(rank))),
-        }
-
-    node.add_trait(TraitInstance('io_view', data))
 
 
 def assert_true_pointwise(layer) -> None:

@@ -1,36 +1,43 @@
-# Dense + Activation fusion pass for the AIE backend.
+"""Dense+activation fusion pass on aie4ml logical IR."""
 
-from hls4ml.model.optimizer import OptimizerPass
+from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
+
+from ..ir import TraitInstance, get_backend_context
 
 
-class FuseActivationCasts(OptimizerPass):
-    """Fuse Dense+Activation pairs (relu or linear) directly in the hls4ml graph."""
-
+class FuseActivationCasts(ModelOptimizerPass):
     _SUPPORTED = {'relu', 'linear'}
-    _FUSABLE = {'Dense', 'Conv1D', 'Conv2D'}
 
-    def match(self, node):
-        if getattr(node, 'class_name', None) != 'Activation' or len(node.inputs) != 1:
-            return False
+    def __init__(self):
+        self.name = 'fuse_activation_casts'
 
-        act = (node.get_attr('activation', '') or '').lower()
-        if act not in self._SUPPORTED:
-            return False
+    def transform(self, model):
+        ctx = get_backend_context(model)
+        graph = ctx.ir.logical
+        changed = False
 
-        prev_node = node.get_input_node()
-        if prev_node is None or getattr(prev_node, 'class_name', None) not in self._FUSABLE:
-            return False
+        for act_node in list(graph.nodes):
+            if act_node.op_type != 'activation' or len(act_node.inputs) != 1 or len(act_node.outputs) != 1:
+                continue
 
-        return True
+            activation = (act_node.metadata.get('activation', '') or '').lower()
+            if activation not in self._SUPPORTED:
+                continue
 
-    def transform(self, model, node):
-        dense = node.get_input_node()
-        activation = (node.get_attr('activation', '') or '').lower()
+            in_tensor = act_node.inputs[0]
+            producer = in_tensor.producer
+            if producer is None or producer.op_type != 'dense' or len(producer.outputs) != 1:
+                continue
 
-        in_var = node.get_input_variable()
-        out_var = node.get_output_variable()
-        in_var.type.precision = out_var.type.precision
+            producer.add_trait(TraitInstance('fused_activation', {'activation': activation}))
 
-        dense.set_attr('aie_fused_activation', activation)
-        model.remove_node(node)
-        return True
+            act_quant = act_node.metadata.get('quant', {})
+            output_precision = act_quant['output_precision']
+            producer_quant = producer.metadata.setdefault('quant', {})
+            producer_quant['output_precision'] = output_precision
+
+            graph.remove_node(act_node, mode='contract')
+
+            changed = True
+
+        return changed

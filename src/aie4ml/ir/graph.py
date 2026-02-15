@@ -131,7 +131,80 @@ class LogicalIR:
     def add_node(self, node: OpNode) -> None:
         self.nodes.append(node)
 
-    # TODO graph inputs wrong
+    def remove_node(self, node: OpNode, mode: str = 'bypass') -> None:
+        if len(node.inputs) == 1 and len(node.outputs) == 1:
+            if mode == 'bypass':
+                self._bypass_node(node)
+            elif mode == 'contract':
+                in_tv = node.inputs[0]
+                if len(in_tv.consumers) == 1:
+                    self._contract_node(node)
+                else:
+                    raise ValueError(
+                        f'Cannot contract node {node.name}: input tensor '
+                        f'{in_tv.name} has {len(in_tv.consumers)} consumers.'
+                    )
+            else:
+                raise ValueError(f'Unknown mode: {mode}')
+        else:
+            self._detach_node(node)
+
+        if node in self.nodes:
+            self.nodes.remove(node)
+        node.inputs.clear()
+        node.outputs.clear()
+
+    def _bypass_node(self, node: OpNode):
+        in_tv, out_tv = node.inputs[0], node.outputs[0]
+
+        for consumer in list(out_tv.consumers):
+            for i, inp in enumerate(consumer.inputs):
+                if inp is out_tv:
+                    consumer.inputs[i] = in_tv
+            if consumer not in in_tv.consumers:
+                in_tv.consumers.append(consumer)
+
+        if node in in_tv.consumers:
+            in_tv.consumers.remove(node)
+
+        out_tv.producer = None
+        out_tv.consumers.clear()
+        self.tensors.pop(out_tv.name, None)
+
+    def _contract_node(self, node: OpNode):
+        in_tv, out_tv = node.inputs[0], node.outputs[0]
+        producer = in_tv.producer
+
+        if producer:
+            for i, outp in enumerate(producer.outputs):
+                if outp is in_tv:
+                    producer.outputs[i] = out_tv
+            out_tv.producer = producer
+        else:
+            out_tv.producer = None
+
+        if node in in_tv.consumers:
+            in_tv.consumers.remove(node)
+
+        in_tv.producer = None
+        if not in_tv.consumers:
+            self.tensors.pop(in_tv.name, None)
+
+    def _detach_node(self, node: OpNode):
+        """Fallback: Just cut the node out without merging tensors."""
+        for t in node.inputs:
+            if node in t.consumers:
+                t.consumers.remove(node)
+
+        for t in node.outputs:
+            if t.producer is node and t.consumers:
+                raise ValueError(f'Cannot detach node {node.name}: output tensor {t.name} still has consumers.')
+            if t.producer is node:
+                t.producer = None
+            if not t.consumers and t.producer is None:
+                self.tensors.pop(t.name, None)
+
+    # TODO be careful with graph inputs/outputs when quant nodes are present
     def graph_inputs(self) -> List[TensorVar]:
         """Tensors with no producer."""
         return [t for t in self.tensors.values() if t.producer is None]

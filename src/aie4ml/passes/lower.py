@@ -20,7 +20,7 @@ from ..ir import (
     ensure_backend_context,
 )
 from ..ir.context import AIEBackendContext, DeviceSpec
-from .utils import attach_default_io_view, is_pointwise_dense
+from .utils import is_pointwise_dense
 
 
 class LowerToAieIr(ModelOptimizerPass):
@@ -180,7 +180,6 @@ class LowerToAieIr(ModelOptimizerPass):
             fused = (layer.get_attr('aie_fused_activation', '') or '').lower()
             if fused:
                 node.add_trait(TraitInstance('fused_activation', {'activation': fused}))
-        attach_default_io_view(node)
 
     def _is_identity_activation(self, layer) -> bool:
         act = (layer.get_attr('activation', '') or '').lower()
