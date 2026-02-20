@@ -71,6 +71,8 @@ class LowerToAieIr(ModelOptimizerPass):
             tv = graph.tensors[var.name]
             tv.producer = node
             node.outputs.append(tv)
+            if node.op_type == 'transpose':
+                self._normalize_transpose_perm(node, tv.shape)
             graph.add_node(node)
             node_map[layer.name] = node
             created_nodes.add(layer.name)
@@ -118,6 +120,12 @@ class LowerToAieIr(ModelOptimizerPass):
             act = (layer.get_attr('activation', '') or '').lower()
             if act:
                 meta['activation'] = act
+        if layer.class_name == 'Transpose':
+            perm = layer.get_attr('perm')
+            if perm is None:
+                raise ValueError(f'{layer.name}: missing Transpose perm attribute.')
+            meta['perm'] = [int(x) for x in perm]
+            meta['data_format'] = layer.get_attr('data_format')
 
         meta['layer_class'] = layer.class_name
         if is_pointwise_dense(layer):
@@ -190,4 +198,12 @@ class LowerToAieIr(ModelOptimizerPass):
             return 'dense'
         if is_pointwise_dense(layer):
             return 'dense'
+        if layer.class_name == 'Transpose':
+            return 'transpose'
         return layer.class_name.lower()
+
+    def _normalize_transpose_perm(self, node: OpNode, output_shape) -> None:
+        perm = node.metadata.get('perm')
+        rank = len([int(x) for x in output_shape])
+        if len(perm) == rank - 1:
+            node.metadata['perm'] = [0] + [int(p) + 1 for p in perm]

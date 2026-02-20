@@ -86,8 +86,17 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
       const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
-      aie::vector<data_t,   MMUL::size_A> A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-      aie::vector<data_t,   MMUL::size_A> A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+      aie::vector<data_t, MMUL::size_A> A0, A1;
+      if constexpr (ConfigT::TRANSPOSE_INPUT) {
+        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+      }else{
+        A0 = aie::load_v<MMUL::size_A>(pA1);
+        A1 = aie::load_v<MMUL::size_A>(pA2);
+      }
+      pA1 += MMUL::size_A;
+      pA2 += MMUL::size_A;
+
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -114,8 +123,15 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-        A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+        if constexpr (ConfigT::TRANSPOSE_INPUT) {
+          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+        } else {
+          A0 = aie::load_v<MMUL::size_A>(pA1);
+          A1 = aie::load_v<MMUL::size_A>(pA2);
+        }
+        pA1 += MMUL::size_A;
+        pA2 += MMUL::size_A;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -165,8 +181,16 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
       const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
-      aie::vector<data_t,   MMUL::size_A> A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-      aie::vector<data_t,   MMUL::size_A> A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+      aie::vector<data_t, MMUL::size_A> A0, A1;
+      if constexpr (ConfigT::TRANSPOSE_INPUT) {
+        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+      } else {
+        A0 = aie::load_v<MMUL::size_A>(pA1);
+        A1 = aie::load_v<MMUL::size_A>(pA2);
+      }
+      pA1 += MMUL::size_A;
+      pA2 += MMUL::size_A;
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -178,8 +202,15 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-        A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+        if constexpr (ConfigT::TRANSPOSE_INPUT) {
+          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+        } else {
+          A0 = aie::load_v<MMUL::size_A>(pA1);
+          A1 = aie::load_v<MMUL::size_A>(pA2);
+        }
+        pA1 += MMUL::size_A;
+        pA2 += MMUL::size_A;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -233,8 +264,16 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
       const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
       const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
-      aie::vector<data_t,   MMUL::size_A> A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-      aie::vector<data_t,   MMUL::size_A> A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+      aie::vector<data_t, MMUL::size_A> A0, A1;
+      if constexpr (ConfigT::TRANSPOSE_INPUT) {
+        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+      } else {
+        A0 = aie::load_v<MMUL::size_A>(pA1);
+        A1 = aie::load_v<MMUL::size_A>(pA2);
+      }
+      pA1 += MMUL::size_A;
+      pA2 += MMUL::size_A;
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -246,8 +285,15 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-        A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+        if constexpr (ConfigT::TRANSPOSE_INPUT) {
+          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+        } else {
+          A0 = aie::load_v<MMUL::size_A>(pA1);
+          A1 = aie::load_v<MMUL::size_A>(pA2);
+        }
+        pA1 += MMUL::size_A;
+        pA2 += MMUL::size_A;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -309,8 +355,16 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
       MMUL C10(readincr_v<MMUL::size_C>(inCascade));
       MMUL C11(readincr_v<MMUL::size_C>(inCascade));
 
-      aie::vector<data_t,   MMUL::size_A> A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-      aie::vector<data_t,   MMUL::size_A> A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+      aie::vector<data_t, MMUL::size_A> A0, A1;
+      if constexpr (ConfigT::TRANSPOSE_INPUT) {
+        A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+        A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+      } else {
+        A0 = aie::load_v<MMUL::size_A>(pA1);
+        A1 = aie::load_v<MMUL::size_A>(pA2);
+      }
+      pA1 += MMUL::size_A;
+      pA2 += MMUL::size_A;
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
@@ -320,8 +374,15 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
       {
-        A0 = aie::load_v<MMUL::size_A>(pA1); pA1 += MMUL::size_A;
-        A1 = aie::load_v<MMUL::size_A>(pA2); pA2 += MMUL::size_A;
+        if constexpr (ConfigT::TRANSPOSE_INPUT) {
+          A0 = aie::transpose(aie::load_v<MMUL::size_A>(pA1), K, M);
+          A1 = aie::transpose(aie::load_v<MMUL::size_A>(pA2), K, M);
+        } else {
+          A0 = aie::load_v<MMUL::size_A>(pA1);
+          A1 = aie::load_v<MMUL::size_A>(pA2);
+        }
+        pA1 += MMUL::size_A;
+        pA2 += MMUL::size_A;
         B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
         B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 

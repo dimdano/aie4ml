@@ -1,5 +1,6 @@
 """Optimizer passes specific to the AIE backend."""
 
+from .fold_transpose import FoldTransposeViews
 from .fuse_activation import FuseActivationCasts
 from .lower import LowerToAieIr
 from .memory_plan import BuildMemoryPlan
@@ -12,6 +13,7 @@ __all__ = [
     'LowerToAieIr',
     'IntegerQuantizer',
     'FuseActivationCasts',
+    'FoldTransposeViews',
     'Resolve',
     'PackKernelArtifacts',
     'PlaceKernels',

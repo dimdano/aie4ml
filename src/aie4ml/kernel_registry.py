@@ -217,6 +217,27 @@ class DenseKernelVariant(KernelVariant):
     def _io_shapes(self, attrs: ResolvedAttributes, tensor_name: str, direction: str) -> Dict[str, List[int]]:
         return attrs.scalars['io_shapes'][direction][tensor_name]
 
+    def _map_view_axis(self, view: Dict[str, Any], axis: int) -> int:
+        perm = view.get('perm')
+        if perm is None:
+            return int(axis)
+        return perm[axis]
+
+    def _canonical_buffer_axes(
+        self,
+        view: Dict[str, Any],
+        rank: int,
+        buffer_order: List[int],
+    ) -> Tuple[int, int, List[int]]:
+        # Canonical space from here: descriptor buffer-dim indices.
+        feat_axis = self._map_view_axis(view, rank - 1)
+        indep_axis = self._map_view_axis(view, rank - 2)
+        feat_dim = buffer_order.index(int(feat_axis))
+        indep_dim = buffer_order.index(int(indep_axis))
+        tail_dims = sorted(dim for dim in range(rank) if dim not in (feat_dim, indep_dim))
+        traversal_dims = [feat_dim, indep_dim] + tail_dims
+        return feat_dim, indep_dim, traversal_dims
+
     def default_input_staging(self, node, tensor_name):
         return {'scheme': self.staging_scheme_in}
 
@@ -278,6 +299,12 @@ class DenseKernelVariant(KernelVariant):
         slices = dict(attrs.slices)
         scalars = dict(attrs.scalars)
         flags = dict(attrs.flags)
+        input_tensor_name = context.node.inputs[0].name
+        input_view = self._io_view(context.node, input_tensor_name, 'inputs')
+        perm = input_view.get('perm')
+        transpose_input = False
+        if perm is not None:
+            transpose_input = perm[-1] != (len(perm) - 1)
         cas = int(parallel['cas_length'])
         chains = int(parallel['cas_num'])
 
@@ -304,6 +331,7 @@ class DenseKernelVariant(KernelVariant):
                 },
                 'tiling': tiling,
                 'flags': flags,
+                'transpose_input': bool(transpose_input),
                 'in_feat_slice': int(slices['input']),
                 'out_feat_slice': int(slices['output']),
                 'padded_independent_extent': int(scalars['padded_independent_extent']),
@@ -390,12 +418,15 @@ class DenseKernelVariant(KernelVariant):
         shapes = self._io_shapes(attrs, tensor_name, 'outputs')
 
         buffer_order = list(view['buffer_order'])
-        buffer_dimension = [int(shapes['padded'][i]) for i in buffer_order]
+        if buf_dims is None:
+            buffer_dimension = [int(shapes['padded'][i]) for i in buffer_order]
+        else:
+            buffer_dimension = [int(x) for x in buf_dims]
         io_boundary_dimension = [int(shapes['real'][i]) for i in buffer_order]
         io_tiling_dimension = list(io_boundary_dimension)
 
-        feat_dim = buffer_order.index(int(view['feature_axis']))
-        indep_dim = buffer_order.index(int(view['independent_axes'][-1]))
+        rank = len(buffer_dimension)
+        feat_dim, indep_dim, traversal_dims = self._canonical_buffer_axes(view, rank, buffer_order)
 
         io_tiling_dimension[feat_dim] = raw_out
         tiling_dimension = [1 for _ in buffer_dimension]
@@ -403,12 +434,15 @@ class DenseKernelVariant(KernelVariant):
         tiling_dimension[indep_dim] = tile_m
 
         tile_traversal = []
-        tile_traversal.append({'dimension': feat_dim, 'stride': tile_n, 'wrap': out_slice // tile_n})
-        tile_traversal.append({'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m})
-        for dim in range(len(buffer_dimension)):
-            if dim in (feat_dim, indep_dim):
-                continue
-            tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
+        for dim in traversal_dims:
+            if dim == feat_dim:
+                tile_traversal.append({'dimension': feat_dim, 'stride': tile_n, 'wrap': out_slice // tile_n})
+            elif dim == indep_dim:
+                tile_traversal.append(
+                    {'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m}
+                )
+            else:
+                tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
 
         offset = [0 for _ in buffer_dimension]
         offset[feat_dim] = port * out_slice
@@ -445,13 +479,16 @@ class DenseKernelVariant(KernelVariant):
         shapes = self._io_shapes(attrs, tensor_name, 'inputs')
 
         buffer_order = list(view['buffer_order'])
-        buffer_dimension = [int(shapes['padded'][i]) for i in buffer_order]
-        boundary_dimension = [int(shapes['real'][i]) for i in buffer_order]
+        if buf_dims is None:
+            buffer_dimension = [int(shapes['padded'][i]) for i in buffer_order]
+        else:
+            buffer_dimension = [int(x) for x in buf_dims]
+        boundary_dimension = [int(shapes['logical'][i]) for i in buffer_order]
         io_boundary_dimension = list(boundary_dimension)
         io_tiling_dimension = list(io_boundary_dimension)
 
-        feat_dim = buffer_order.index(int(view['feature_axis']))
-        indep_dim = buffer_order.index(int(view['independent_axes'][-1]))
+        rank = len(buffer_dimension)
+        feat_dim, indep_dim, traversal_dims = self._canonical_buffer_axes(view, rank, buffer_order)
 
         io_tiling_dimension[feat_dim] = raw_in
         tiling_dimension = [1 for _ in buffer_dimension]
@@ -459,12 +496,15 @@ class DenseKernelVariant(KernelVariant):
         tiling_dimension[indep_dim] = tile_m
 
         tile_traversal = []
-        tile_traversal.append({'dimension': feat_dim, 'stride': tile_k, 'wrap': in_slice // tile_k})
-        tile_traversal.append({'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m})
-        for dim in range(len(buffer_dimension)):
-            if dim in (feat_dim, indep_dim):
-                continue
-            tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
+        for dim in traversal_dims:
+            if dim == feat_dim:
+                tile_traversal.append({'dimension': feat_dim, 'stride': tile_k, 'wrap': in_slice // tile_k})
+            elif dim == indep_dim:
+                tile_traversal.append(
+                    {'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m}
+                )
+            else:
+                tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
 
         offset = [0 for _ in buffer_dimension]
         offset[feat_dim] = port * in_slice
@@ -559,8 +599,8 @@ _GLOBAL_REGISTRY.register(
             {'input': 16, 'weight': 16, 'output': 16, 'acc': 64, 'bias': 32},
             {'input': 16, 'weight': 16, 'output': 32, 'acc': 64, 'bias': 32},
         ),
-        supported_input_modes=('direct', 'memtile', 'plio'),
-        supported_output_modes=('direct', 'memtile', 'plio'),
+        supported_input_modes=('direct', 'memtile', 'plio', 'auto'),
+        supported_output_modes=('direct', 'memtile', 'plio', 'auto'),
     )
 )
 

@@ -8,6 +8,7 @@ struct {{L.struct_name}} {
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
   static constexpr bool USE_BIAS = {{ 'true' if L.use_bias else 'false' }};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
+  static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.transpose_input else 'false' }};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr int M = {{P.tiling.tile_m}}, K = {{P.tiling.tile_k}}, N = {{P.tiling.tile_n}};
   static constexpr int col_placement = {{L.placement.col}};

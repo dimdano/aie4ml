@@ -436,16 +436,22 @@ def _align_up(value: int, multiple: int) -> int:
     return ((int(value) + multiple - 1) // multiple) * multiple
 
 
-def _tensor_feature_dim(tensor, layer_name: str, role: str) -> int:
-    if tensor is None:
-        raise ValueError(f'{layer_name}: missing tensor for {role}.')
-    shape = getattr(tensor, 'shape', None)
-    if not shape:
-        raise ValueError(f'{layer_name}: tensor shape missing for {role}.')
-    dim = int(shape[-1])
-    if dim <= 0:
-        raise ValueError(f'{layer_name}: invalid {role} features {dim}.')
-    return dim
+def _effective_view_shape(
+    ctx: LayerResolveContext,
+    tensor: Any,
+    direction: str,
+) -> List[int]:
+    logical = [int(x) for x in tensor.shape]
+    io_trait = ctx.node.traits.get('io_view')
+    if io_trait is None:
+        raise ValueError(f'{ctx.layer_name}: missing io_view trait.')
+    view = io_trait.data[direction][tensor.name]
+    perm = view.get('perm')
+    if perm is None:
+        return logical
+    if sorted(perm) != list(range(len(logical))):
+        raise ValueError(f'{ctx.layer_name}: invalid io_view perm {perm} for rank {len(logical)}.')
+    return [int(logical[i]) for i in perm]
 
 
 def _aligned_batch_size(batch: int, tile_m: int) -> int:
@@ -454,7 +460,7 @@ def _aligned_batch_size(batch: int, tile_m: int) -> int:
 
 
 def _independent_extent(ctx: LayerResolveContext) -> Tuple[int, int]:
-    logical = [int(x) for x in ctx.node.inputs[0].shape]
+    logical = _effective_view_shape(ctx, ctx.node.inputs[0], 'inputs')
     if len(logical) < 2:
         raise ValueError(f'{ctx.layer_name}: tensor rank must be >=2, got {len(logical)}.')
     independent = logical[:-1]
@@ -465,15 +471,14 @@ def _independent_extent(ctx: LayerResolveContext) -> Tuple[int, int]:
 
 def _pad_logical_shape(
     logical: List[int],
-    feature_axis: int,
-    independent_axes: List[int],
     padded_feat: int,
     tile_m: int,
 ) -> List[int]:
     padded = list(logical)
+    feature_axis = len(logical) - 1
     padded[feature_axis] = int(padded_feat)
-    if independent_axes:
-        last_axis = int(independent_axes[-1])
+    if feature_axis > 0:
+        last_axis = feature_axis - 1
         padded[last_axis] = _align_up(int(padded[last_axis]), 2 * max(1, int(tile_m)))
     return padded
 
@@ -484,14 +489,20 @@ def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str
     tile_m = ctx.attributes.tiling['tile_m']
     shapes: Dict[str, Dict[str, Dict[str, List[int]]]] = {'inputs': {}, 'outputs': {}}
 
+    def _view_shape(logical: List[int], view: Dict[str, Any]) -> List[int]:
+        perm = view.get('perm')
+        if perm is None:
+            return list(logical)
+        if sorted(perm) != list(range(len(logical))):
+            raise ValueError(f'{ctx.layer_name}: invalid io_view perm {perm} for rank {len(logical)}.')
+        return [int(logical[i]) for i in perm]
+
     for t in ctx.node.inputs:
         view = views['inputs'][t.name]
         logical = [int(x) for x in t.shape]
-        real = list(logical)
+        real = _view_shape(logical, view)
         padded = _pad_logical_shape(
-            logical,
-            view['feature_axis'],
-            view['independent_axes'],
+            real,
             padded_feat=int(ctx.attributes.scalars['padded_in_features']),
             tile_m=tile_m,
         )
@@ -500,11 +511,9 @@ def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str
     for t in ctx.node.outputs:
         view = views['outputs'][t.name]
         logical = [int(x) for x in t.shape]
-        real = list(logical)
+        real = _view_shape(logical, view)
         padded = _pad_logical_shape(
-            logical,
-            view['feature_axis'],
-            view['independent_axes'],
+            real,
             padded_feat=int(ctx.attributes.scalars['padded_out_features']),
             tile_m=tile_m,
         )
@@ -584,8 +593,8 @@ def _resolve_parallelism_numeric(
     if not ctx.node.inputs or not ctx.node.outputs:
         raise ValueError(f'{layer_name}: node is missing input or output tensors.')
 
-    in_shape = _tensor_feature_dim(ctx.node.inputs[0], layer_name, 'input')
-    out_shape = _tensor_feature_dim(ctx.node.outputs[0], layer_name, 'output')
+    in_shape = _effective_view_shape(ctx, ctx.node.inputs[0], 'inputs')[-1]
+    out_shape = _effective_view_shape(ctx, ctx.node.outputs[0], 'outputs')[-1]
 
     parallel_cfg = ctx.config.get('parallelism', {}) or {}
     user_num_chains = ctx.config.get('cas_num', parallel_cfg.get('cas_num'))
@@ -823,10 +832,10 @@ def resolve_io_route(ctx: LayerResolveContext) -> None:
     r.setdefault('outputs', {})
 
     for t in ctx.node.inputs:
-        r['inputs'].setdefault(t.name, 'direct')
+        r['inputs'].setdefault(t.name, 'memtile')
 
     for t in ctx.node.outputs:
-        r['outputs'].setdefault(t.name, 'direct')
+        r['outputs'].setdefault(t.name, 'memtile')
 
     user = ctx.config.get('io_route', {})
     for d in ('inputs', 'outputs'):
@@ -849,7 +858,6 @@ def resolve_io_view(ctx: LayerResolveContext) -> None:
     def _default_view(rank: int) -> Dict[str, Any]:
         return {
             'layout': 'channels_last',
-            'feature_axis': rank - 1,
             'independent_axes': list(range(rank - 1)),
             'buffer_order': list(reversed(range(rank))),
         }
@@ -1069,10 +1077,10 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
         resolvers=(
             resolve_numeric,
             resolve_tiling,
+            resolve_io_view,
             resolve_parallelism,
             resolve_flags,
             resolve_io_route,
-            resolve_io_view,
             resolve_staging,
             resolve_pack,
             resolve_placement,
@@ -1084,9 +1092,9 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
         requires_numeric=False,
         resolvers=(
             resolve_numeric,
+            resolve_io_view,
             resolve_parallelism,
             resolve_flags,
-            resolve_io_view,
             resolve_placement,
             resolve_scalars,
         ),

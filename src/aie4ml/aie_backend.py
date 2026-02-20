@@ -55,7 +55,10 @@ class AIEBackend(Backend):
         lower_flow = register_flow('lower', ['aie:lower_to_aie_ir'], requires=[init_flow], backend=self.name)
         quant_flow = register_flow('quantize', ['aie:integer_quantizer'], requires=[lower_flow], backend=self.name)
         fuse_flow = register_flow('fuse', ['aie:fuse_activation_casts'], requires=[quant_flow], backend=self.name)
-        resolve_flow = register_flow('resolve', ['aie:resolve'], requires=[fuse_flow], backend=self.name)
+        fold_views_flow = register_flow(
+            'fold_views', ['aie:fold_transpose_views'], requires=[fuse_flow], backend=self.name
+        )
+        resolve_flow = register_flow('resolve', ['aie:resolve'], requires=[fold_views_flow], backend=self.name)
         pack_flow = register_flow('pack', ['aie:pack_kernel_artifacts'], requires=[resolve_flow], backend=self.name)
         placement_flow = register_flow('placement', ['aie:place_kernels'], requires=[pack_flow], backend=self.name)
         memory_plan_flow = register_flow(
