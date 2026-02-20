@@ -157,19 +157,52 @@ class _CodegenPlanner:
         c = sum(self._consumer_port_count(x.consumer, entry.tensor) for x in entry.consumers)
 
         units = self._required_units(p, c)
-
-        # DIRECT ONLY IF units == 1 and strictly single-port 1:1
-        if (
+        route = self._route_policy(entry)
+        direct_eligible = (
             units == 1
             and entry.producer
             and not entry.graph_output
             and len(entry.consumers) == 1
             and p == 1
             and self._consumer_port_count(entry.consumers[0].consumer, entry.tensor) == 1
-        ):
+            and entry.consumers[0].consumer.traits['io_view'].data['inputs'][entry.tensor].get('perm') is None
+        )
+
+        if route == 'direct':
+            if not direct_eligible:
+                raise RuntimeError(f'{entry.tensor}: io_route=direct requested but direct transport is not legal.')
+            self._emit_direct(entry, p)
+            return
+
+        if direct_eligible and route != 'memtile':
             self._emit_direct(entry, p)
         else:
             self._emit_memtile(entry, p, units)
+
+    def _route_policy(self, entry: _EdgeEntry) -> str:
+        if entry.producer is None or entry.graph_output:
+            return 'memtile'
+
+        modes = set()
+        p_inst = self._kernel_inst(entry.producer)
+        p_mode = p_inst.attributes.io_route.get('outputs', {}).get(entry.tensor)
+        if p_mode:
+            modes.add(str(p_mode))
+
+        for c in entry.consumers:
+            c_inst = self._kernel_inst(c.consumer)
+            c_mode = c_inst.attributes.io_route.get('inputs', {}).get(entry.tensor)
+            if c_mode:
+                modes.add(str(c_mode))
+
+        bad = [m for m in modes if m not in ('direct', 'memtile', 'auto')]
+        if bad:
+            raise ValueError(f'{entry.tensor}: unsupported io_route mode(s) {bad}.')
+        if 'memtile' in modes:
+            return 'memtile'
+        if modes == {'direct'}:
+            return 'direct'
+        return 'auto'
 
     # ------------------------------------------------------------------
     # Direct
