@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+import numpy as np
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
 from ...device_catalog import load_device_catalog
@@ -136,6 +137,11 @@ class LowerToAieIr(ModelOptimizerPass):
             meta['n_in'] = int(n_in)
             meta['n_out'] = int(n_out)
             meta['use_bias'] = layer.get_attr('bias_data') is not None
+
+        if layer.class_name == 'ApplyAlpha':
+            scale = layer.get_attr('scale_data')
+            if scale is not None:
+                meta['scale'] = np.asarray(scale, dtype=np.float64).flatten().tolist()
 
         if layer.class_name == 'Activation':
             act = (layer.get_attr('activation', '') or '').lower()

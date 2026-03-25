@@ -65,7 +65,10 @@ class AIEBackend(Backend):
         initializers = self._get_layer_initializers()
         init_flow = register_flow('init_layers', initializers, requires=['optimize'], backend=self.name)
         lower_flow = register_flow('lower', ['aie:lower_to_aie_ir'], requires=[init_flow], backend=self.name)
-        fuse_flow = register_flow('fuse', ['aie:fuse_activation_casts'], requires=[lower_flow], backend=self.name)
+        fold_alpha_flow = register_flow(
+            'fold_apply_alpha', ['aie:fold_apply_alpha'], requires=[lower_flow], backend=self.name
+        )
+        fuse_flow = register_flow('fuse', ['aie:fuse_activation_casts'], requires=[fold_alpha_flow], backend=self.name)
         fold_views_flow = register_flow(
             'fold_views', ['aie:fold_transpose_views'], requires=[fuse_flow], backend=self.name
         )
