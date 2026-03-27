@@ -9,7 +9,7 @@ from typing import Optional
 
 import numpy as np
 
-from ..aie_types import RoundingMode, SaturationMode
+from ..aie_types import FloatFormat, RoundingMode, SaturationMode
 
 
 def dtype_for_precision(width: Optional[int], signed: bool) -> np.dtype:
@@ -87,6 +87,17 @@ def handle_overflow(
         return np.clip(values, sym_min, info.max)
 
     raise ValueError(f'Unsupported saturation mode {mode}')
+
+
+def _pack_as_float(array: np.ndarray, fmt: FloatFormat) -> np.ndarray:
+    """Cast data to the target float storage format without fixed-point quantization."""
+    if array is None:
+        return None
+    if fmt == FloatFormat.BF16:
+        # Truncate float32 mantissa to bfloat16 by reinterpreting upper 16 bits.
+        f32 = np.asarray(array, dtype=np.float32)
+        return (f32.view(np.uint32) >> 16).astype(np.uint16)
+    return np.asarray(array, dtype=np.float32)
 
 
 def _quantize_to_int(

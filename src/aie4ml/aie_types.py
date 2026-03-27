@@ -3,7 +3,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 
 class RoundingMode(Enum):
@@ -30,6 +30,20 @@ class QuantIntent:
     signed: bool
     rounding: RoundingMode
     saturation: SaturationMode
+
+
+class FloatFormat(Enum):
+    BF16 = 'bfloat16'
+    FP32 = 'float32'
+
+
+@dataclass(frozen=True)
+class FloatIntent:
+    width: int
+    format: FloatFormat
+
+
+PrecisionIntent = Union[QuantIntent, FloatIntent]
 
 
 @dataclass(frozen=True)

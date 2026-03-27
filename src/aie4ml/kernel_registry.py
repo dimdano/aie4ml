@@ -59,7 +59,7 @@ class KernelVariant:
     variant_id: str
     op_type: str
     supported_generations: Tuple[str, ...] = field(default_factory=tuple)
-    supported_precisions: Tuple[Dict[str, int], ...] = field(default_factory=tuple)
+    supported_precisions: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
     supported_input_modes: Tuple[str, ...] = field(default_factory=tuple)
     supported_output_modes: Tuple[str, ...] = field(default_factory=tuple)
     input_ports: Tuple[str, ...] = field(default_factory=tuple)
@@ -92,7 +92,7 @@ class KernelVariant:
 
         node_prec = _numeric_precisions(context.attributes)
         if self.supported_precisions:
-            if node_prec not in self.supported_precisions:
+            if not any(all(node_prec.get(k) == v for k, v in spec.items()) for spec in self.supported_precisions):
                 return False
 
         return True
@@ -151,13 +151,21 @@ class KernelVariant:
         return ports
 
 
-def _np_weight_dtype(bitwidth: int):
-    return np.int8 if int(bitwidth) <= 8 else np.int16
+def _np_dtype_for_spec(spec) -> np.dtype:
+    """Map an AIEDataType to a numpy dtype, handling both integer and float types."""
+    c = getattr(spec, 'c_type', '') or ''
+    if c == 'bfloat16':
+        return np.uint16  # raw BF16 storage as 16-bit words
+    if c in ('float', 'float32'):
+        return np.float32
+    return np.int8 if int(spec.width) <= 8 else np.int16
 
 
-def _np_bias_dtype(bitwidth: int):
-    bw = int(bitwidth)
-    return np.int16 if bw <= 16 else np.int32
+def _np_bias_dtype_for_spec(spec) -> np.dtype:
+    c = getattr(spec, 'c_type', '') or ''
+    if c in ('bfloat16', 'float', 'float32'):
+        return np.float32
+    return np.int16 if int(spec.width) <= 16 else np.int32
 
 
 TILING_OPTIONS: Dict[str, Dict[Tuple[int, int], List[Tuple[int, int, int]]]] = {
@@ -166,18 +174,23 @@ TILING_OPTIONS: Dict[str, Dict[Tuple[int, int], List[Tuple[int, int, int]]]] = {
         (16, 8): [(4, 4, 4), (4, 4, 8), (4, 8, 4), (8, 4, 4)],
         (8, 16): [(4, 4, 8), (4, 4, 4), (8, 8, 1)],
         (16, 16): [(4, 4, 8), (2, 4, 8), (4, 2, 8), (4, 4, 4), (8, 8, 1)],
+        ('float', 'float'): [(2, 4, 4)],
     },
     'AIE-ML': {
         (8, 8): [(4, 8, 8), (2, 8, 8), (2, 16, 8), (4, 8, 4), (4, 16, 4), (4, 16, 8), (8, 8, 4), (8, 8, 8)],
         (16, 8): [(4, 4, 8), (2, 8, 8), (4, 4, 4), (4, 8, 4), (8, 4, 4), (8, 4, 8)],
         (8, 16): [(4, 4, 4), (4, 4, 8)],
         (16, 16): [(4, 4, 4), (2, 4, 8), (4, 2, 8), (4, 4, 8), (8, 1, 8), (8, 2, 8)],
+        ('bfloat16', 'bfloat16'): [(4, 8, 4)],
+        ('float', 'float'): [(4, 8, 4)],
     },
     'AIE-MLV2': {
         (8, 8): [(8, 8, 8), (4, 8, 8)],
         (16, 8): [(4, 4, 8), (8, 2, 8)],
         (8, 16): [(4, 4, 8), (8, 2, 8)],
         (16, 16): [(8, 2, 8)],
+        ('bfloat16', 'bfloat16'): [(4, 8, 8)],
+        ('float', 'float'): [(4, 8, 4)],
     },
 }
 
@@ -190,10 +203,12 @@ def _select_generation_key(generation: str) -> str:
     return 'AIE'
 
 
-def _numeric_precisions(attrs: ResolvedAttributes) -> Dict[str, int]:
-    out = {}
+def _numeric_precisions(attrs: ResolvedAttributes) -> Dict:
+    out: Dict = {}
     for kind, dtype in attrs.numeric.items():
         out[kind] = int(dtype.width)
+    input_dtype = attrs.numeric.get('input')
+    out['input_c_type'] = getattr(input_dtype, 'c_type', '') or ''
     return out
 
 
@@ -285,13 +300,15 @@ class DenseKernelVariant(KernelVariant):
         tile_m = int(attrs.tiling['tile_m'])
         tile_k = int(attrs.tiling['tile_k'])
         tile_n = int(attrs.tiling['tile_n'])
-        input_bits = int(attrs.numeric['input'].width)
-        weight_bits = int(attrs.numeric['weight'].width)
+        from .passes.resolve_registry import _tiling_key
 
-        if not all((tile_m, tile_k, tile_n, input_bits, weight_bits)):
+        input_key = _tiling_key(attrs.numeric['input'])
+        weight_key = _tiling_key(attrs.numeric['weight'])
+
+        if not all((tile_m, tile_k, tile_n, input_key, weight_key)):
             return False
 
-        options = self.tiling_options(context.device_generation, input_bits, weight_bits)
+        options = self.tiling_options(context.device_generation, input_key, weight_key)
         return (tile_m, tile_k, tile_n) in options
 
     def build_config(self, context: KernelSelectionContext) -> KernelConfig:
@@ -346,13 +363,14 @@ class DenseKernelVariant(KernelVariant):
             },
         )
 
-    def tiling_options(self, generation: str, input_bits: int, weight_bits: int) -> List[Tuple[int, int, int]]:
+    def tiling_options(self, generation: str, input_key, weight_key) -> List[Tuple[int, int, int]]:
         gen_key = _select_generation_key(generation)
         bucket = TILING_OPTIONS.get(gen_key, {})
-        return list(bucket.get((int(input_bits), int(weight_bits)), []))
+        return list(bucket.get((input_key, weight_key), []))
 
     def pack(self, inst: KernelInstance) -> Dict[str, Any]:
-        from .passes.quant import _quantize_to_int
+        from .aie_types import FloatFormat, FloatIntent
+        from .passes.quant import _pack_as_float, _quantize_to_int
 
         attrs = inst.attributes
         parallel = attrs.parallelism
@@ -365,28 +383,32 @@ class DenseKernelVariant(KernelVariant):
         bias_tensor = inst.node.inputs[2] if len(inst.node.inputs) > 2 else None
 
         wi = weight_tensor.precision
-        W = _quantize_to_int(
-            weight_tensor.data,
-            wi.frac,
-            wi.width,
-            signed=wi.signed,
-            rounding_mode=wi.rounding,
-            saturation_mode=wi.saturation,
-        )
-
-        if bias_tensor is not None:
-            bi = bias_tensor.precision
-            accum_frac = input_tensor.precision.frac + wi.frac
-            b = _quantize_to_int(
-                bias_tensor.data,
-                accum_frac,
-                32,
-                signed=bi.signed,
-                rounding_mode=bi.rounding,
-                saturation_mode=bi.saturation,
-            )
+        if isinstance(wi, FloatIntent):
+            W = _pack_as_float(weight_tensor.data, wi.format)
+            # Bias is always stored as float32, matching the float32 accumulator.
+            b = np.asarray(bias_tensor.data, dtype=np.float32) if bias_tensor is not None else None
         else:
-            b = None
+            W = _quantize_to_int(
+                weight_tensor.data,
+                wi.frac,
+                wi.width,
+                signed=wi.signed,
+                rounding_mode=wi.rounding,
+                saturation_mode=wi.saturation,
+            )
+            if bias_tensor is not None:
+                bi = bias_tensor.precision
+                accum_frac = input_tensor.precision.frac + wi.frac
+                b = _quantize_to_int(
+                    bias_tensor.data,
+                    accum_frac,
+                    32,
+                    signed=bi.signed,
+                    rounding_mode=bi.rounding,
+                    saturation_mode=bi.saturation,
+                )
+            else:
+                b = None
 
         W = np.asarray(W)
         if W.ndim < 2:
@@ -396,8 +418,8 @@ class DenseKernelVariant(KernelVariant):
 
         weight_spec = attrs.numeric['weight']
         bias_spec = attrs.numeric['bias']
-        weight_dtype = _np_weight_dtype(int(weight_spec.width))
-        bias_dtype = _np_bias_dtype(int(bias_spec.width))
+        weight_dtype = _np_dtype_for_spec(weight_spec)
+        bias_dtype = _np_bias_dtype_for_spec(bias_spec)
 
         from .passes.pack import pack_mmul_rhs_matrix, pack_vector_by_n_slice
 
@@ -413,6 +435,10 @@ class DenseKernelVariant(KernelVariant):
             cas_num=parallel['cas_num'],
             dtype=weight_dtype,
         )
+        # For BF16 weights, pack_mmul_rhs_matrix returns uint16 raw bit-patterns.
+        # Convert to float32 so the C++ header initializer uses float literals:
+        if isinstance(wi, FloatIntent) and wi.format == FloatFormat.BF16:
+            packed_W = (packed_W.astype(np.uint32) << 16).view(np.float32)
         packed_B = (
             pack_vector_by_n_slice(
                 b,
@@ -602,9 +628,7 @@ class KernelRegistry:
                 return variant
         return None
 
-    def supported_tilings(
-        self, op_type: str, generation: str, input_bits: int, weight_bits: int
-    ) -> List[Tuple[int, int, int]]:
+    def supported_tilings(self, op_type: str, generation: str, input_key, weight_key) -> List[Tuple[int, int, int]]:
         candidates = self._variants.get(op_type, [])
         variant = None
         for cand in candidates:
@@ -615,7 +639,7 @@ class KernelRegistry:
             variant = candidates[0]
         if variant is None:
             return []
-        return variant.tiling_options(generation, input_bits, weight_bits)
+        return variant.tiling_options(generation, input_key, weight_key)
 
 
 _GLOBAL_REGISTRY = KernelRegistry()
@@ -632,6 +656,8 @@ _GLOBAL_REGISTRY.register(
             {'input': 16, 'weight': 8, 'output': 8, 'acc': 32, 'bias': 32},
             {'input': 16, 'weight': 16, 'output': 16, 'acc': 64, 'bias': 32},
             {'input': 16, 'weight': 16, 'output': 32, 'acc': 64, 'bias': 32},
+            {'input': 16, 'weight': 16, 'output': 16, 'acc': 32, 'bias': 32, 'input_c_type': 'bfloat16'},
+            {'input': 32, 'weight': 32, 'output': 32, 'acc': 32, 'bias': 32, 'input_c_type': 'float'},
         ),
         supported_input_modes=('direct', 'memtile', 'plio', 'auto'),
         supported_output_modes=('direct', 'memtile', 'plio', 'auto'),

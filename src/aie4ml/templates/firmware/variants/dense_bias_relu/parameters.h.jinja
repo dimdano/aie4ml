@@ -20,7 +20,7 @@ struct {{L.struct_name}} {
   static constexpr int OUT_FEAT_SLICE = {{P.out_feat_slice}};
   static constexpr int RAW_IN_FEAT_SLICE = {{P.parallelism.input_slice_raw}};
   static constexpr int RAW_OUT_FEAT_SLICE = {{P.parallelism.output_slice_raw}};
-  using acc_scalar_t = {{ P.accumulator_tag | default('acc32') }};
+  using acc_scalar_t = {{ P.accumulator_tag }};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
   static constexpr const char* SATURATION_TOKEN = "saturate";
 #if __cplusplus >= 202002L

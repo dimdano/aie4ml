@@ -80,6 +80,10 @@ def serialize_physical_ir(physical_ir) -> Dict[str, Any]:
 def serialize_precision(precision):
     if precision is None:
         return None
+    from .aie_types import FloatIntent
+
+    if isinstance(precision, FloatIntent):
+        return {'width': int(precision.width), 'format': precision.format.value}
     if not isinstance(precision, QuantIntent):
         raise TypeError(f'Unsupported precision type {type(precision)} when serializing backend IR.')
     return {

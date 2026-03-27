@@ -16,6 +16,12 @@ from .passes.quant import apply_rounding, dtype_for_precision, handle_overflow
 
 log = logging.getLogger(__name__)
 
+_FLOAT_C_TYPES = frozenset({'bfloat16', 'float', 'float32'})
+
+
+def _is_float_c_type(c_type: str) -> bool:
+    return (c_type or '') in _FLOAT_C_TYPES
+
 
 def read_aie_report(model_or_path: Union[object, str, Path]) -> Dict:
     model = None
@@ -329,7 +335,9 @@ def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) 
         if tuple(arr.shape[1:]) != expected:
             raise ValueError(f'{tensor}: expected input shape {expected}, got {tuple(arr.shape[1:])}')
 
-        if quantize:
+        if _is_float_c_type(p0.dtype.c_type):
+            prepared[tensor] = np.asarray(arr, dtype=np.float32)
+        elif quantize:
             prepared[tensor] = _quantize_to_int(
                 arr,
                 dtype=p0.dtype,
@@ -360,12 +368,13 @@ def _write_values(stream, values, vals_per_line):
     if vals_per_line <= 0:
         vals_per_line = len(values)
 
+    is_float = np.issubdtype(np.asarray(values).dtype, np.floating)
     for idx, value in enumerate(values):
         if idx and idx % vals_per_line == 0:
             stream.write('\n')
         elif idx:
             stream.write(' ')
-        stream.write(str(int(value)))
+        stream.write(f'{float(value):e}' if is_float else str(int(value)))
 
     stream.write('\n')
 
@@ -377,7 +386,8 @@ def collect_outputs(output_dir: Path, sim_mode: str, layout: IOLayout) -> Dict[s
     for tensor, ports in layout.outputs.items():
         first = ports[0]
         first_tile = _read_output_file(data_dir / f'y_p{first.port}.txt', first)
-        out = np.zeros((first_tile.shape[0], *first.numpy_boundary_shape), dtype=np.int64)
+        buf_dtype = np.float64 if _is_float_c_type(first.dtype.c_type) else np.int64
+        out = np.zeros((first_tile.shape[0], *first.numpy_boundary_shape), dtype=buf_dtype)
         _insert_port_tile(out, first_tile, first)
 
         for p in ports[1:]:
@@ -468,7 +478,10 @@ def _read_output_file(path: Path, port: IOPortLayout) -> np.ndarray:
         clean.append(tok)
         i += 1
 
-    values = np.array([int(t) for t in clean], dtype=np.int64)
+    if _is_float_c_type(port.dtype.c_type):
+        values = np.array([float(t) for t in clean], dtype=np.float64)
+    else:
+        values = np.array([int(t) for t in clean], dtype=np.int64)
     per_iter = int(np.prod(port.numpy_tile_shape, dtype=np.int64))
     iters = values.size // per_iter
     values = values[: iters * per_iter]

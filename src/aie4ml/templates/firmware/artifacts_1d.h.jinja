@@ -13,7 +13,11 @@
 
 AIE_BLOCK_QUAL {{ dtype }} {{ artifact_name }}_{{ inst_name }}_{{ ch }}[{{ row|length }}] = {
   {%- for v in row -%}
-    {{ v|int }}{{ ", " if not loop.last else "" }}
+    {% if dtype in ('float', 'float32', 'bfloat16') -%}
+      {{ "%.8ef"|format(v|float) }}{{ ", " if not loop.last else "" }}
+    {%- else -%}
+      {{ v|int }}{{ ", " if not loop.last else "" }}
+    {%- endif %}
   {%- endfor -%}
 };
 

@@ -65,8 +65,11 @@ class AIEBackend(Backend):
         initializers = self._get_layer_initializers()
         init_flow = register_flow('init_layers', initializers, requires=['optimize'], backend=self.name)
         lower_flow = register_flow('lower', ['aie:lower_to_aie_ir'], requires=[init_flow], backend=self.name)
+        force_float_flow = register_flow(
+            'force_float', ['aie:force_float_mode'], requires=[lower_flow], backend=self.name
+        )
         fold_alpha_flow = register_flow(
-            'fold_apply_alpha', ['aie:fold_apply_alpha'], requires=[lower_flow], backend=self.name
+            'fold_apply_alpha', ['aie:fold_apply_alpha'], requires=[force_float_flow], backend=self.name
         )
         fuse_flow = register_flow('fuse', ['aie:fuse_activation_casts'], requires=[fold_alpha_flow], backend=self.name)
         fold_views_flow = register_flow(
@@ -220,6 +223,7 @@ class AIEBackend(Backend):
         row_start=None,
         namespace=None,
         write_tar=False,
+        compute_dtype=None,
         **_,
     ):
         device_info = copy.deepcopy(self._get_device_info(part))
@@ -252,6 +256,7 @@ class AIEBackend(Backend):
                 'Memory': device_info.get('Memory'),
                 'MaxMemTileInPorts': int(device_info['MaxMemTileInPorts']),
                 'MaxMemTileOutPorts': int(device_info['MaxMemTileOutPorts']),
+                **({'ComputeDtype': compute_dtype} if compute_dtype else {}),
             },
             'HLSConfig': {},
             'WriterConfig': {

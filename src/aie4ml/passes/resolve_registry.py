@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-from ..aie_types import AIEDataType, QuantIntent, RoundingMode, SaturationMode
+from ..aie_types import AIEDataType, FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
 from ..ir import ResolvedAttributes, TraitInstance
 from ..kernel_registry import get_kernel_registry
 
@@ -152,6 +152,19 @@ def _ctype_for_width(width: int, signed: bool) -> str:
     return 'uint64_t'
 
 
+def _ctype_for_float(fmt: FloatFormat) -> str:
+    if fmt == FloatFormat.BF16:
+        return 'bfloat16'
+    return 'float'
+
+
+def _tiling_key(dtype: AIEDataType):
+    c = dtype.c_type or ''
+    if c in ('bfloat16', 'float', 'float32'):
+        return c
+    return int(dtype.width)
+
+
 def _to_quant_intent(precision: Any) -> QuantIntent:
     if isinstance(precision, QuantIntent):
         return precision
@@ -190,8 +203,40 @@ def _resolve_storage_dtype(
     )
 
 
+def _resolve_numeric_float(ctx: LayerResolveContext) -> None:
+    """Float path for resolve_numeric: no shift, no accumulator tag, c_type from FloatFormat."""
+    resolved: Dict[str, AIEDataType] = {}
+    for key in ('input', 'output', 'weight', 'bias'):
+        prec = ctx.quant.get(f'{key}_precision')
+        if prec is None:
+            continue
+        if isinstance(prec, FloatIntent):
+            resolved[key] = AIEDataType(
+                width=prec.width,
+                signed=True,
+                frac=0,
+                c_type=_ctype_for_float(prec.format),
+            )
+    if ctx.policy.requires_numeric:
+        # Bias is always accumulated in float32, regardless of activation/weight format.
+        resolved['bias'] = AIEDataType(width=32, signed=True, frac=0, c_type='float')
+        ctx.attributes.scalars['shift'] = 0
+        ctx.attributes.scalars['accumulator_tag'] = 'accfloat'
+        ctx.attributes.scalars['rounding_mode'] = 'conv_even'
+        resolved.setdefault('acc', AIEDataType(width=32, signed=True, frac=0, c_type='accfloat'))
+    numeric = NumericBundle(resolved)
+    ctx.attributes.numeric.update(numeric.to_attribute_map())
+    ctx.set_numeric(numeric)
+
+
 def resolve_numeric(ctx: LayerResolveContext) -> None:
     """Resolve backend storage types and post-shift from quantization intent."""
+
+    # Float path: any precision that is a FloatIntent takes the float branch.
+    input_prec = ctx.quant.get('input_precision')
+    if isinstance(input_prec, FloatIntent):
+        _resolve_numeric_float(ctx)
+        return
 
     precision_entries: Dict[str, Any] = {}
     for key, value in ctx.quant.items():
@@ -314,8 +359,8 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
     ctx.set_numeric(numeric)
 
 
-def _supported_tile_options(gen: str, in_w: int, w_w: int):
-    return KERNEL_REGISTRY.supported_tilings('dense', gen, int(in_w), int(w_w))
+def _supported_tile_options(gen: str, in_key, w_key):
+    return KERNEL_REGISTRY.supported_tilings('dense', gen, in_key, w_key)
 
 
 def _extract_tile_cfg(user_cfg: Dict[str, Any]) -> Dict[str, int]:
@@ -339,15 +384,15 @@ def _resolve_tile_cfg(
     weight_dtype: Optional[AIEDataType],
 ) -> Dict[str, int]:
     raw = _extract_tile_cfg(user_cfg)
-    input_width = int(getattr(input_dtype, 'width', 0) or 0)
-    weight_width = int(getattr(weight_dtype, 'width', 0) or 0)
+    in_key = _tiling_key(input_dtype) if input_dtype else 0
+    w_key = _tiling_key(weight_dtype) if weight_dtype else 0
     generation = getattr(device, 'generation', '') or ''
 
-    options = _supported_tile_options(generation, input_width, weight_width)
+    options = _supported_tile_options(generation, in_key, w_key)
     if not options:
         raise ValueError(
             f'{layer_name}: no supported tile configs are registered for Generation={generation} and '
-            f'(input={input_width}b, weight={weight_width}b); cannot validate user tiling.'
+            f'(input={in_key!r}, weight={w_key!r}); cannot validate user tiling.'
         )
 
     user_specified = (raw['tile_m'] > 0) and (raw['tile_k'] > 0) and (raw['tile_n'] > 0)
@@ -356,7 +401,7 @@ def _resolve_tile_cfg(
         if candidate not in options:
             raise ValueError(
                 f'{layer_name}: tiling {candidate} not supported for Generation={generation} and '
-                f'(input={input_width}b, weight={weight_width}b). Allowed: {options}'
+                f'(input={in_key!r}, weight={w_key!r}). Allowed: {options}'
             )
         return {'tile_m': candidate[0], 'tile_k': candidate[1], 'tile_n': candidate[2]}
 

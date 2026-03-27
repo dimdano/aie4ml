@@ -6,7 +6,7 @@
 import numpy as np
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
-from ..aie_types import QuantIntent
+from ..aie_types import FloatIntent, QuantIntent
 from ..ir import get_backend_context
 
 
@@ -40,6 +40,8 @@ class FoldApplyAlpha(ModelOptimizerPass):
 
             weight_tv = dense_node.inputs[1]
             old_w = weight_tv.precision
+            if isinstance(old_w, FloatIntent):
+                continue
             weight_tv.precision = QuantIntent(
                 width=old_w.width,
                 frac=old_w.frac + p_min,
