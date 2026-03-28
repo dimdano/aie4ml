@@ -22,7 +22,7 @@ from ...ir import (
 )
 from ...ir.context import AIEBackendContext, DeviceSpec
 from ...passes.utils import is_pointwise_dense
-from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of
+from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
 
 class LowerToAieIr(ModelOptimizerPass):
@@ -84,6 +84,7 @@ class LowerToAieIr(ModelOptimizerPass):
                 dialect=ctx.device.dialect,
             )
             self._collect_metadata(layer, node)
+            node.directives.update(extract_layer_directives(layer, model))
 
             if node.op_type == 'dense':
                 weight_tv, bias_tv = _create_weight_tensors(layer, graph)

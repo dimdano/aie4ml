@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from ..aie_types import AIEDataType, QuantIntent
+from ..aie_types import AIEDataType, PrecisionIntent
 
 if TYPE_CHECKING:  # pragma: no cover - runtime circular import guard
-    from ..kernel_registry import KernelVariant
+    from ..op_impls import OpImplVariant
 
 
 @dataclass
@@ -23,7 +23,7 @@ class TensorVar:
 
     name: str
     shape: Tuple[int, ...]
-    precision: Optional[QuantIntent] = None
+    precision: Optional[PrecisionIntent] = None
     data: Optional[np.ndarray] = None
     producer: Optional['OpNode'] = None
     consumers: List['OpNode'] = field(default_factory=list)
@@ -41,28 +41,23 @@ class ResolvedAttributes:
     slices: Dict[str, int] = field(default_factory=dict)
     numeric: Dict[str, AIEDataType] = field(default_factory=dict)
     parallelism: Dict[str, int] = field(default_factory=dict)
-    placement: Optional[Dict[str, int]] = None
     pack: Dict[str, Any] = field(default_factory=dict)
     flags: Dict[str, Any] = field(default_factory=dict)
     scalars: Dict[str, Any] = field(default_factory=dict)
-    staging: Dict[str, Any] = field(default_factory=dict)
     io_route: Dict[str, Any] = field(default_factory=dict)
     ports: Dict[str, Dict[Tuple[str, int], List[Dict[str, Any]]]] = field(
         default_factory=lambda: {'inputs': {}, 'outputs': {}}
     )
 
     def copy(self) -> 'ResolvedAttributes':
-        placement = None if self.placement is None else dict(self.placement)
         return ResolvedAttributes(
             tiling=dict(self.tiling),
             slices=dict(self.slices),
             numeric=dict(self.numeric),
             parallelism=dict(self.parallelism),
-            placement=placement,
             pack=dict(self.pack),
             flags=dict(self.flags),
             scalars=dict(self.scalars),
-            staging={k: _deep_copy(v) for k, v in self.staging.items()},
             io_route={k: _deep_copy(v) for k, v in self.io_route.items()},
             ports=_copy_ports(self.ports),
         )
@@ -115,6 +110,7 @@ class OpNode:
     artifacts: Dict[str, Any] = field(default_factory=dict)
     traits: Dict[str, TraitInstance] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    directives: Dict[str, Any] = field(default_factory=dict)
 
     def add_trait(self, trait: TraitInstance) -> None:
         self.traits[trait.name] = trait
@@ -230,13 +226,12 @@ class LogicalIR:
 
 
 @dataclass
-class KernelInstance:
-    """Materialized kernel selection for a logical node."""
+class OpImplInstance:
+    """Materialized implementation selection for a logical node."""
 
     node: OpNode
-    variant: 'KernelVariant'
-    attributes: ResolvedAttributes
-    config: Dict[str, Any]
+    variant: 'OpImplVariant'
+    config: Any
     artifacts: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -249,23 +244,22 @@ class KernelInstance:
 
 
 @dataclass
-class KernelIR:
-    """Container for kernel instances derived from logical nodes."""
+class ExecutionIR:
+    """Container for selected implementation instances derived from logical nodes."""
 
-    instances: Dict[str, KernelInstance] = field(default_factory=dict)
+    instances: Dict[str, OpImplInstance] = field(default_factory=dict)
 
     def register(
         self,
         node: OpNode,
-        variant: 'KernelVariant',
-        attributes: ResolvedAttributes,
-        config: Dict[str, Any],
-    ) -> KernelInstance:
-        inst = KernelInstance(node=node, variant=variant, attributes=attributes, config=config)
+        variant: 'OpImplVariant',
+        config: Any,
+    ) -> OpImplInstance:
+        inst = OpImplInstance(node=node, variant=variant, config=config)
         self.instances[node.name] = inst
         return inst
 
-    def get(self, name: str) -> Optional[KernelInstance]:
+    def get(self, name: str) -> Optional[OpImplInstance]:
         return self.instances.get(name)
 
     def clear(self) -> None:
@@ -301,10 +295,10 @@ class AIEPipelineIR:
     """Three-level IR bundle shared across backend passes."""
 
     logical: LogicalIR = field(default_factory=LogicalIR)
-    kernels: KernelIR = field(default_factory=KernelIR)
+    execution: ExecutionIR = field(default_factory=ExecutionIR)
     physical: PhysicalIR = field(default_factory=PhysicalIR)
 
     def reset(self) -> None:
         self.logical = LogicalIR()
-        self.kernels = KernelIR()
+        self.execution = ExecutionIR()
         self.physical = PhysicalIR()

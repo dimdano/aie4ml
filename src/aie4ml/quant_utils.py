@@ -1,7 +1,7 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Integer quantization utilities for AIE Dense layers."""
+"""Generic numeric utilities for quantization arithmetic."""
 
 from __future__ import annotations
 
@@ -9,11 +9,11 @@ from typing import Optional
 
 import numpy as np
 
-from ..aie_types import FloatFormat, RoundingMode, SaturationMode
+from .aie_types import RoundingMode, SaturationMode
 
 
 def dtype_for_precision(width: Optional[int], signed: bool) -> np.dtype:
-    """Map precision metadata to a concrete NumPy dtype."""
+    """Map a bit-width and signedness to the smallest fitting NumPy dtype."""
     if width is None:
         return np.int32
 
@@ -36,7 +36,7 @@ def dtype_for_precision(width: Optional[int], signed: bool) -> np.dtype:
 
 
 def wrap_to_width(values: np.ndarray, width: int, signed: bool) -> np.ndarray:
-    """Wrap integer values to the provided bit width."""
+    """Wrap integer values to the given bit width (modular / two's-complement)."""
     modulus = 1 << width
     wrapped = np.mod(values, modulus)
     if signed:
@@ -46,7 +46,7 @@ def wrap_to_width(values: np.ndarray, width: int, signed: bool) -> np.ndarray:
 
 
 def apply_rounding(values: np.ndarray, mode: RoundingMode) -> np.ndarray:
-    """Apply the requested rounding mode on floating-point values."""
+    """Apply a fixed-point rounding mode to floating-point values."""
     if mode in (RoundingMode.TRN, RoundingMode.RND_MIN_INF):
         return np.floor(values)
     if mode in (RoundingMode.TRN_ZERO, RoundingMode.RND_ZERO):
@@ -67,7 +67,7 @@ def handle_overflow(
     signed: bool,
     mode: SaturationMode,
 ) -> np.ndarray:
-    """Apply overflow handling using the requested saturation mode."""
+    """Apply an overflow/saturation mode to integer values."""
     if mode == SaturationMode.WRAP:
         return wrap_to_width(values, width, signed)
 
@@ -87,33 +87,3 @@ def handle_overflow(
         return np.clip(values, sym_min, info.max)
 
     raise ValueError(f'Unsupported saturation mode {mode}')
-
-
-def _pack_as_float(array: np.ndarray, fmt: FloatFormat) -> np.ndarray:
-    """Cast data to the target float storage format without fixed-point quantization."""
-    if array is None:
-        return None
-    if fmt == FloatFormat.BF16:
-        # Truncate float32 mantissa to bfloat16 by reinterpreting upper 16 bits.
-        f32 = np.asarray(array, dtype=np.float32)
-        return (f32.view(np.uint32) >> 16).astype(np.uint16)
-    return np.asarray(array, dtype=np.float32)
-
-
-def _quantize_to_int(
-    array: np.ndarray,
-    frac_bits: int,
-    target_bits: int,
-    signed: bool = True,
-    rounding_mode=None,
-    saturation_mode=None,
-) -> np.ndarray:
-    if array is None:
-        return None
-    scale = 1 << frac_bits if frac_bits > 0 else 1
-    scaled = np.asarray(array, dtype=np.float64) * scale
-    rounded = apply_rounding(scaled, rounding_mode)
-    integers = rounded.astype(np.int64)
-    processed = handle_overflow(integers, target_bits, signed, saturation_mode)
-    dtype = dtype_for_precision(target_bits, signed)
-    return processed.astype(dtype, copy=False)

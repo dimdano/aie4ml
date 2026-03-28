@@ -10,15 +10,15 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .aie_types import QuantIntent
-from .ir.graph import KernelInstance, OpNode
+from .ir.graph import OpImplInstance, OpNode
 
 
 def dump_pipeline_ir(ctx, destination: Path) -> None:
-    """Serialize logical, kernel, and physical IR into a single JSON file."""
+    """Serialize logical, execution, and physical IR into a single JSON file."""
 
     data = {
         'logical': [serialize_logical_node(node) for node in ctx.ir.logical],
-        'kernels': [serialize_kernel_instance(inst) for inst in ctx.ir.kernels],
+        'execution': [serialize_op_impl_instance(inst) for inst in ctx.ir.execution],
         'physical': serialize_physical_ir(ctx.ir.physical),
     }
 
@@ -59,14 +59,14 @@ def _serialize_quant_metadata(quant_meta: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def serialize_kernel_instance(inst: KernelInstance) -> Dict[str, Any]:
+def serialize_op_impl_instance(inst: OpImplInstance) -> Dict[str, Any]:
     return {
         'node': inst.name,
         'variant_id': inst.variant.variant_id,
-        'kernel_config': inst.config,
+        'op_impl_config': inst.config.to_dict(),
         # "input_staging": inst.variant.describe_input_staging(inst),
         # "output_staging": inst.variant.describe_output_staging(inst),
-        # TODO: serialize kernel artifacts (weights, LUTs, etc.)
+        # TODO: serialize implementation artifacts (weights, LUTs, etc.)
     }
 
 

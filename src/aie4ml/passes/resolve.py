@@ -10,7 +10,7 @@ import logging
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
 from ..ir import ResolvedAttributes, get_backend_context
-from ..kernel_registry import KernelSelectionContext, get_kernel_registry
+from ..op_impls import OpImplSelectionContext, get_op_impl_registry
 from .resolve_registry import LayerResolveContext, get_layer_policy, merge_config_layers
 
 log = logging.getLogger(__name__)
@@ -84,7 +84,7 @@ class Resolve(ModelOptimizerPass):
 
     def __init__(self):
         self.name = 'resolve'
-        self._registry = get_kernel_registry()
+        self._registry = get_op_impl_registry()
 
     def transform(self, model):
         ctx = get_backend_context(model)
@@ -95,34 +95,30 @@ class Resolve(ModelOptimizerPass):
                 continue
 
             resolved = resolve_aie_attributes(model, ctx, node)
-            selection_ctx = KernelSelectionContext(
+            selection_ctx = OpImplSelectionContext(
                 node=node,
                 attributes=resolved,
                 device_generation=ctx.device.generation,
-                quant=_quant_meta(node),
                 metadata=dict(node.metadata),
             )
             variant = self._registry.select(selection_ctx)
             if variant is None:
-                raise RuntimeError(f'{node.name}: no kernel variant satisfies resolved attributes.')
+                raise RuntimeError(f'{node.name}: no implementation variant satisfies resolved attributes.')
 
             kernel_cfg = variant.build_config(selection_ctx)
-            inst = ctx.ir.kernels.get(node.name)
-            cfg_dict = kernel_cfg.to_dict()
-
+            inst = ctx.ir.execution.get(node.name)
             if inst is not None:
                 same_variant = inst.variant.variant_id == variant.variant_id
-                same_attrs = inst.attributes == resolved
-                same_cfg = inst.config == cfg_dict
-                if same_variant and same_attrs and same_cfg:
+                same_cfg = inst.config == kernel_cfg
+                if same_variant and same_cfg:
                     visited.add(node.name)
                     continue
 
-            ctx.ir.kernels.register(node, variant, resolved.copy(), cfg_dict)
+            ctx.ir.execution.register(node, variant, kernel_cfg)
             visited.add(node.name)
             changed = True
 
-        if ctx.ir.kernels.prune(visited):
+        if ctx.ir.execution.prune(visited):
             changed = True
 
         return changed

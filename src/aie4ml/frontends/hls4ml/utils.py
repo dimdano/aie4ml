@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 from hls4ml.model.types import PrecisionType
@@ -44,7 +44,7 @@ def _get_post_activation_precision(layer, model) -> Optional[QuantIntent]:
     if linear_key not in lnp:
         return None
 
-    existing_names = {l.name.lower() for l in model.get_layers()}
+    existing_names = {lr.name.lower() for lr in model.get_layers()}
     keys = list(lnp.keys())
     try:
         start = keys.index(linear_key)
@@ -65,6 +65,52 @@ def _get_post_activation_precision(layer, model) -> Optional[QuantIntent]:
         except Exception:
             return None
     return None
+
+
+def extract_layer_directives(layer, model) -> Dict[str, Any]:
+    """Extract normalized compiler directives from the hls4ml config for one layer."""
+    directives: Dict[str, Any] = {}
+    cfg = model.config.get_layer_config_value
+
+    placement_cfg = cfg(layer, 'placement', {})
+    if isinstance(placement_cfg, dict):
+        placement: Dict[str, int] = {}
+        if 'col' in placement_cfg:
+            placement['col'] = int(placement_cfg['col'])
+        if 'row' in placement_cfg:
+            placement['row'] = int(placement_cfg['row'])
+        if placement:
+            directives['placement'] = placement
+
+    tiling: Dict[str, int] = {}
+    tiling_cfg = cfg(layer, 'tiling', {})
+    for key in ('tile_m', 'tile_k', 'tile_n'):
+        flat = cfg(layer, key)
+        if flat is not None:
+            tiling[key] = int(flat)
+        elif key in tiling_cfg:
+            tiling[key] = int(tiling_cfg[key])
+    if tiling:
+        directives['tiling'] = tiling
+
+    parallelism: Dict[str, Any] = {}
+    parallel_cfg = cfg(layer, 'parallelism', {})
+    for key in ('cas_num', 'cas_length'):
+        flat = cfg(layer, key)
+        if flat is not None:
+            parallelism[key] = int(flat)
+        elif key in parallel_cfg:
+            parallelism[key] = int(parallel_cfg[key])
+    if 'parallel_factor' in parallel_cfg:
+        parallelism['parallel_factor'] = int(parallel_cfg['parallel_factor'])
+    if parallelism:
+        directives['parallelism'] = parallelism
+
+    io_route_cfg = cfg(layer, 'io_route', {})
+    if io_route_cfg:
+        directives['io_route'] = io_route_cfg
+
+    return directives
 
 
 # TODO: _create_weight_tensors works around hls4ml's ReplaceMultidimensionalDenseWithConv,

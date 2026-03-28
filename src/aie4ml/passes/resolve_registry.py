@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 from dataclasses import dataclass, field
@@ -13,7 +12,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..aie_types import AIEDataType, FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
 from ..ir import ResolvedAttributes, TraitInstance
-from ..kernel_registry import get_kernel_registry
+from ..op_impls import get_op_impl_registry
+from ..op_impls.families.matmul import tiling_key
 
 log = logging.getLogger(__name__)
 
@@ -107,7 +107,7 @@ M_GRANULARITY = 2
 K_GRANULARITY = 2
 N_GRANULARITY = 2
 
-KERNEL_REGISTRY = get_kernel_registry()
+OP_IMPL_REGISTRY = get_op_impl_registry()
 
 ACC_TAG_WIDTHS = {
     'acc32': 32,
@@ -156,13 +156,6 @@ def _ctype_for_float(fmt: FloatFormat) -> str:
     if fmt == FloatFormat.BF16:
         return 'bfloat16'
     return 'float'
-
-
-def _tiling_key(dtype: AIEDataType):
-    c = dtype.c_type or ''
-    if c in ('bfloat16', 'float', 'float32'):
-        return c
-    return int(dtype.width)
 
 
 def _to_quant_intent(precision: Any) -> QuantIntent:
@@ -323,8 +316,8 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
         w_width = int(resolved['weight'].width)
         if in_width <= 8 and w_width > 8:
             raise RuntimeError(
-                f'{ctx.layer_name}: unsupported int8 x int16 precision mix for AIE kernels; '
-                'no kernel variant available.'
+                f'{ctx.layer_name}: unsupported int8 x int16 precision mix for AIE implementations; '
+                'no implementation variant available.'
             )
 
         shift = int(intents['input'].frac + intents['weight'].frac - intents['output'].frac)
@@ -360,20 +353,12 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
 
 
 def _supported_tile_options(gen: str, in_key, w_key):
-    return KERNEL_REGISTRY.supported_tilings('dense', gen, in_key, w_key)
+    return OP_IMPL_REGISTRY.supported_tilings('dense', gen, (in_key, w_key))
 
 
-def _extract_tile_cfg(user_cfg: Dict[str, Any]) -> Dict[str, int]:
-    tile_cfg = user_cfg['tiling'] if 'tiling' in user_cfg else {}
-    out: Dict[str, int] = {}
-    for key in ('tile_m', 'tile_n', 'tile_k'):
-        if key in user_cfg:
-            out[key] = int(user_cfg[key])
-        elif key in tile_cfg:
-            out[key] = int(tile_cfg[key])
-        else:
-            out[key] = 0
-    return out
+def _extract_tile_cfg(directives: Dict[str, Any]) -> Dict[str, int]:
+    tiling = directives.get('tiling', {}) or {}
+    return {key: int(tiling[key]) if key in tiling else 0 for key in ('tile_m', 'tile_n', 'tile_k')}
 
 
 def _resolve_tile_cfg(
@@ -384,8 +369,8 @@ def _resolve_tile_cfg(
     weight_dtype: Optional[AIEDataType],
 ) -> Dict[str, int]:
     raw = _extract_tile_cfg(user_cfg)
-    in_key = _tiling_key(input_dtype) if input_dtype else 0
-    w_key = _tiling_key(weight_dtype) if weight_dtype else 0
+    in_key = tiling_key(input_dtype) if input_dtype else 0
+    w_key = tiling_key(weight_dtype) if weight_dtype else 0
     generation = getattr(device, 'generation', '') or ''
 
     options = _supported_tile_options(generation, in_key, w_key)
@@ -418,7 +403,7 @@ def resolve_tiling(ctx: LayerResolveContext) -> None:
     if input_dtype is None or weight_dtype is None:
         return
 
-    tile_cfg = _resolve_tile_cfg(ctx.layer_name, ctx.config, ctx.device, input_dtype, weight_dtype)
+    tile_cfg = _resolve_tile_cfg(ctx.layer_name, ctx.node.directives, ctx.device, input_dtype, weight_dtype)
     ctx.attributes.tiling.update(tile_cfg)
     ctx.state['tile_cfg'] = tile_cfg
 
@@ -641,9 +626,9 @@ def _resolve_parallelism_numeric(
     in_shape = _effective_view_shape(ctx, ctx.node.inputs[0], 'inputs')[-1]
     out_shape = _effective_view_shape(ctx, ctx.node.outputs[0], 'outputs')[-1]
 
-    parallel_cfg = ctx.config.get('parallelism', {}) or {}
-    user_num_chains = ctx.config.get('cas_num', parallel_cfg.get('cas_num'))
-    user_cas_length = ctx.config.get('cas_length', parallel_cfg.get('cas_length'))
+    parallel_cfg = ctx.node.directives.get('parallelism', {}) or {}
+    user_num_chains = parallel_cfg.get('cas_num')
+    user_cas_length = parallel_cfg.get('cas_length')
     user_target = parallel_cfg.get('parallel_factor')
     target_parallel_factor = None if user_target in (None, 0, '') else int(user_target)
 
@@ -852,10 +837,6 @@ def resolve_parallelism(ctx: LayerResolveContext) -> None:
 
 
 def resolve_flags(ctx: LayerResolveContext) -> None:
-    flags_cfg = ctx.config.get('flags', {}) or {}
-    if isinstance(flags_cfg, dict):
-        ctx.attributes.flags.update(flags_cfg)
-
     fused_trait = ctx.node.traits.get('fused_activation')
     activation = (fused_trait.data.get('activation') if fused_trait else '') or ''
     ctx.attributes.flags['use_relu'] = activation.lower() == 'relu'
@@ -882,7 +863,7 @@ def resolve_io_route(ctx: LayerResolveContext) -> None:
     for t in ctx.node.outputs:
         r['outputs'].setdefault(t.name, 'memtile')
 
-    user = ctx.config.get('io_route', {})
+    user = ctx.node.directives.get('io_route', {})
     for d in ('inputs', 'outputs'):
         if isinstance(user.get(d), dict):
             r[d].update(user[d])
@@ -926,82 +907,6 @@ def resolve_io_view(ctx: LayerResolveContext) -> None:
             )
         if t.name not in data['outputs']:
             data['outputs'][t.name] = _default_view(rank)
-
-
-def resolve_staging(ctx: LayerResolveContext) -> None:
-    """
-    Attach user-provided staging overrides.
-      staging.inputs.<tensor>  = { scheme: ... }
-      staging.outputs.<tensor> = { scheme: ... }
-    """
-
-    st = ctx.attributes.staging
-    st['inputs'] = {}
-    st['outputs'] = {}
-
-    user = ctx.config.get('staging')
-    if not isinstance(user, dict):
-        return
-
-    for direction in ('inputs', 'outputs'):
-        if direction not in user:
-            continue
-        overrides = user[direction]
-        if not isinstance(overrides, dict):
-            raise ValueError(f'{ctx.layer_name}: staging.{direction} must be a dict.')
-
-        for tensor_name, value in overrides.items():
-            if not isinstance(value, dict):
-                raise ValueError(f'{ctx.layer_name}: staging.{direction}.{tensor_name} must be a dict.')
-            st[direction][tensor_name] = dict(value)
-
-
-def _stable_pack_key(layer_name: str, resolved: Dict[str, Any]) -> str:
-    digest = hashlib.sha256()
-    digest.update(layer_name.encode('utf-8'))
-    digest.update(b'|AIE|')
-    normalized: List[Tuple[str, Any]] = []
-    for key in sorted(resolved.keys()):
-        value = resolved[key]
-        if isinstance(value, dict):
-            normalized.append((key, tuple(sorted(value.items()))))
-        elif isinstance(value, list):
-            normalized.append((key, tuple(value)))
-        else:
-            normalized.append((key, value))
-    digest.update(repr(tuple(normalized)).encode('utf-8'))
-    return digest.hexdigest()
-
-
-def resolve_pack(ctx: LayerResolveContext) -> None:
-    if not ctx.attributes.tiling or not ctx.attributes.parallelism:
-        return
-
-    numeric = ctx.attributes.numeric
-    pack_input = {
-        'tiling': {k: ctx.attributes.tiling[k] for k in ('tile_k', 'tile_n', 'tile_m') if k in ctx.attributes.tiling},
-        'parallelism': {
-            'cas_num': ctx.attributes.parallelism.get('cas_num'),
-            'cas_length': ctx.attributes.parallelism.get('cas_length'),
-        },
-        'element': {
-            'weight_width': getattr(numeric.get('weight'), 'width', None),
-            'weight_signed': getattr(numeric.get('weight'), 'signed', None),
-        },
-    }
-    ctx.attributes.pack['key'] = _stable_pack_key(ctx.layer_name, pack_input)
-
-
-def resolve_placement(ctx: LayerResolveContext) -> None:
-    placement_cfg = ctx.config.get('placement')
-    if not isinstance(placement_cfg, dict) or not placement_cfg:
-        return
-    placement: Dict[str, int] = {}
-    if 'col' in placement_cfg:
-        placement['col'] = int(placement_cfg['col'])
-    if 'row' in placement_cfg:
-        placement['row'] = int(placement_cfg['row'])
-    ctx.attributes.placement = placement if placement else None
 
 
 def _acc_tag_from_width(width: int) -> Optional[str]:
@@ -1117,7 +1022,7 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
         requires_numeric=False,
     ),
     'Dense': LayerPolicy(
-        namespaces=('numeric', 'tiling', 'parallelism', 'slices', 'flags', 'pack', 'scalars'),
+        namespaces=('numeric', 'tiling', 'parallelism', 'slices', 'flags', 'scalars'),
         requires_numeric=True,
         resolvers=(
             resolve_numeric,
@@ -1126,9 +1031,6 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
             resolve_parallelism,
             resolve_flags,
             resolve_io_route,
-            resolve_staging,
-            resolve_pack,
-            resolve_placement,
             resolve_scalars,
         ),
     ),
@@ -1140,7 +1042,6 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
             resolve_io_view,
             resolve_parallelism,
             resolve_flags,
-            resolve_placement,
             resolve_scalars,
         ),
     ),

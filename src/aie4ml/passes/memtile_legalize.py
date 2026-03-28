@@ -118,8 +118,8 @@ class LegalizeMemtilePortLimits(ModelOptimizerPass):
     def _consumer_ports(entry, producer_ports: int, ctx) -> int:
         if entry.consumers:
             consumer = entry.consumers[0].consumer
-            inst = ctx.ir.kernels.get(consumer.name)
-            return int(inst.config['parameters']['ports']['inputs'][entry.tensor]['count'])
+            inst = ctx.ir.execution.get(consumer.name)
+            return int(inst.config.ports.inputs[entry.tensor].count)
         if entry.graph_output:
             return int(producer_ports)
         raise ValueError(f'{entry.tensor}: entry has neither consumers nor graph_output.')
@@ -141,10 +141,10 @@ class LegalizeMemtilePortLimits(ModelOptimizerPass):
     @staticmethod
     def _shard_params(entry, producer_ports: int, ctx):
         if entry.producer is not None:
-            inst = ctx.ir.kernels.get(entry.producer.name)
-            d0 = inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 0, None, None)
+            inst = ctx.ir.execution.get(entry.producer.name)
+            d0 = inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, 0, None)
             d1 = (
-                inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 1, None, None)
+                inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, 1, None)
                 if producer_ports > 1
                 else None
             )
@@ -152,10 +152,10 @@ class LegalizeMemtilePortLimits(ModelOptimizerPass):
             # TODO: graph-input stride is currently derived from consumer staging; if a repro
             # requires it, derive shard params directly from global graph-input shape/ports.
             consumer = entry.consumers[0].consumer
-            inst = ctx.ir.kernels.get(consumer.name)
-            d0 = inst.variant.describe_input_staging(consumer, inst.attributes, entry.tensor, 0, None, None, None)
+            inst = ctx.ir.execution.get(consumer.name)
+            d0 = inst.variant.describe_input_staging(consumer, inst.config, entry.tensor, 0, None, None)
             d1 = (
-                inst.variant.describe_input_staging(consumer, inst.attributes, entry.tensor, 1, None, None, None)
+                inst.variant.describe_input_staging(consumer, inst.config, entry.tensor, 1, None, None)
                 if producer_ports > 1
                 else None
             )

@@ -136,7 +136,7 @@ class _CodegenPlanner:
                 continue
             for t in getattr(n, 'outputs', []):
                 tname = t.name
-                pg = inst.config['parameters']['ports']['outputs'][tname]['group']
+                pg = inst.config.ports.outputs[tname].group
                 producers[tname] = (n, pg)
 
         connections: List[_Connection] = []
@@ -151,7 +151,7 @@ class _CodegenPlanner:
                 if t.is_parameter:
                     continue
                 tname = t.name
-                cg = inst.config['parameters']['ports']['inputs'][tname]['group']
+                cg = inst.config.ports.inputs[tname].group
                 if tname in producers:
                     p, pg = producers[tname]
                     connections.append(_Connection(p, n, pg, cg, tname))
@@ -167,7 +167,7 @@ class _CodegenPlanner:
             for t in getattr(n, 'outputs', []):
                 tname = t.name
                 if tname not in seen_outputs:
-                    pg = inst.config['parameters']['ports']['outputs'][tname]['group']
+                    pg = inst.config.ports.outputs[tname].group
                     connections.append(_Connection(n, None, pg, 'graph_output', tname, 'output'))
 
         return connections
@@ -248,13 +248,13 @@ class _CodegenPlanner:
 
         modes = set()
         p_inst = self._kernel_inst(entry.producer)
-        p_mode = p_inst.attributes.io_route.get('outputs', {}).get(entry.tensor)
+        p_mode = p_inst.config.io_route.get('outputs', {}).get(entry.tensor)
         if p_mode:
             modes.add(str(p_mode))
 
         for c in entry.consumers:
             c_inst = self._kernel_inst(c.consumer)
-            c_mode = c_inst.attributes.io_route.get('inputs', {}).get(entry.tensor)
+            c_mode = c_inst.config.io_route.get('inputs', {}).get(entry.tensor)
             if c_mode:
                 modes.add(str(c_mode))
 
@@ -291,7 +291,7 @@ class _CodegenPlanner:
     def _emit_memtile(self, entry, p_ports, c_ports):
         if entry.producer:
             inst = self._kernel_inst(entry.producer)
-            base = inst.variant.describe_output_staging(entry.producer, inst.attributes, entry.tensor, 0, None, None)
+            base = inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, 0, None)
         else:
             base = self._graph_input_writer_descriptor(entry)
 
@@ -322,10 +322,7 @@ class _CodegenPlanner:
                 self._max_graph_input_port = max(self._max_graph_input_port, int(p))
             else:
                 inst = self._kernel_inst(entry.producer)
-                staging = self._output_staging(inst, entry.tensor)
-                desc = inst.variant.describe_output_staging(
-                    entry.producer, inst.attributes, entry.tensor, p, buf_dims, staging
-                )
+                desc = inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, p, buf_dims)
                 desc['buffer_dimension'] = list(buf_dims)
                 desc['offset'][shard_dim] -= int(unit_base_dim0)
 
@@ -343,9 +340,8 @@ class _CodegenPlanner:
             consumer_conn = entry.consumers[0]
             for local_out, i in enumerate(c_ports):
                 inst = self._kernel_inst(consumer_conn.consumer)
-                staging = self._input_staging(inst, entry.tensor)
                 desc = inst.variant.describe_input_staging(
-                    consumer_conn.consumer, inst.attributes, entry.tensor, i, buf_dims, staging, entry.producer
+                    consumer_conn.consumer, inst.config, entry.tensor, i, buf_dims, entry.producer
                 )
                 desc['buffer_dimension'] = list(buf_dims)
                 desc['offset'][shard_dim] -= int(unit_base_dim0)
@@ -359,10 +355,10 @@ class _CodegenPlanner:
                             f'{sanitize_identifier(consumer_conn.consumer.name)}.'
                             f'{consumer_conn.consumer_group}[{i}]'
                         ),
-                        'target_type': 'kernel',
+                        'target_type': 'op_impl',
                         'target_endpoint': {
-                            'kernel': consumer_conn.consumer.name,
-                            'kernel_id': sanitize_identifier(consumer_conn.consumer.name),
+                            'op_impl': consumer_conn.consumer.name,
+                            'op_impl_id': sanitize_identifier(consumer_conn.consumer.name),
                             'group': consumer_conn.consumer_group,
                             'port': int(i),
                         },
@@ -381,7 +377,7 @@ class _CodegenPlanner:
                         'source': f'{name}.out[{reader_base + slot}]',
                         'target': f'ofm[{graph_port}]',
                         'target_type': 'plio',
-                        'target_endpoint': {'name': 'ofm', 'port': int(graph_port), 'kernel_port': int(local_port)},
+                        'target_endpoint': {'name': 'ofm', 'port': int(graph_port), 'op_impl_port': int(local_port)},
                         'descriptor': desc,
                     }
                 )
@@ -395,7 +391,7 @@ class _CodegenPlanner:
     def _graph_input_writer_descriptor(self, entry: _EdgeEntry) -> Dict[str, Any]:
         c = entry.consumers[0].consumer
         inst = self._kernel_inst(c)
-        base = inst.variant.describe_input_staging(c, inst.attributes, entry.tensor, 0, None, None, None)
+        base = inst.variant.describe_input_staging(c, inst.config, entry.tensor, 0, None, None)
 
         io_tile = list(base['io_tiling_dimension'])
 
@@ -418,7 +414,7 @@ class _CodegenPlanner:
     ) -> Dict[str, Any]:
         p = entry.producer
         inst = self._kernel_inst(p)
-        base = inst.variant.describe_output_staging(p, inst.attributes, entry.tensor, port, buf_dims, None)
+        base = inst.variant.describe_output_staging(p, inst.config, entry.tensor, port, buf_dims)
         shard_dim = int(base['slice_dimension'])
         io_tile = list(base['io_tiling_dimension'])
         io_boundary = list(base['io_boundary_dimension'])
@@ -442,24 +438,16 @@ class _CodegenPlanner:
     # Utilities
     # ------------------------------------------------------------------
 
-    def _input_staging(self, inst, tensor):
-        st = inst.attributes.staging['inputs']
-        return st[tensor] if tensor in st else None
-
-    def _output_staging(self, inst, tensor):
-        st = inst.attributes.staging['outputs']
-        return st[tensor] if tensor in st else None
-
     def _kernel_inst(self, node):
-        return self.ctx.ir.kernels.get(node.name) if node else None
+        return self.ctx.ir.execution.get(node.name) if node else None
 
     def _producer_port_count(self, node, tensor):
         if node is None:
             return 1
-        return self._kernel_inst(node).config['parameters']['ports']['outputs'][tensor]['count']
+        return self._kernel_inst(node).config.ports.outputs[tensor].count
 
     def _consumer_port_count(self, node, tensor):
-        return self._kernel_inst(node).config['parameters']['ports']['inputs'][tensor]['count']
+        return self._kernel_inst(node).config.ports.inputs[tensor].count
 
     def _producer_endpoint(self, node, group, port):
         return f'ifm[{port}]' if node is None else f'{sanitize_identifier(node.name)}.{group}[{port}]'
@@ -467,9 +455,9 @@ class _CodegenPlanner:
     def _producer_endpoint_meta(self, node, group, port):
         if node is None:
             return 'plio', {'name': 'ifm', 'port': int(port)}
-        return 'kernel', {
-            'kernel': node.name,
-            'kernel_id': sanitize_identifier(node.name),
+        return 'op_impl', {
+            'op_impl': node.name,
+            'op_impl_id': sanitize_identifier(node.name),
             'group': group,
             'port': int(port),
         }
@@ -477,9 +465,9 @@ class _CodegenPlanner:
     def _consumer_endpoint_meta(self, node, group, port):
         if node is None:
             return 'plio', {'name': 'ofm', 'port': int(port)}
-        return 'kernel', {
-            'kernel': node.name,
-            'kernel_id': sanitize_identifier(node.name),
+        return 'op_impl', {
+            'op_impl': node.name,
+            'op_impl_id': sanitize_identifier(node.name),
             'group': group,
             'port': int(port),
         }

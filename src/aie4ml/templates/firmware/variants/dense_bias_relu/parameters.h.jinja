@@ -1,4 +1,4 @@
-{% set P = L.kernel.parameters %}
+{% set P = L.op_impl.parameters %}
 struct {{L.struct_name}} {
   using data_t = {{P.precision.input.c_type}};
   using weight_t = {{P.precision.weight.c_type}};
@@ -6,9 +6,9 @@ struct {{L.struct_name}} {
   using bias_t = {{P.precision.bias.c_type}};
   static constexpr int IN_FEAT = {{L.n_in}}; static constexpr int OUT_FEAT = {{L.n_out}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
-  static constexpr bool USE_BIAS = {{ 'true' if L.use_bias else 'false' }};
+  static constexpr bool USE_BIAS = {{ 'true' if P.flags.use_bias else 'false' }};
   static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
-  static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.transpose_input else 'false' }};
+  static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.flags.transpose_input else 'false' }};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr int M = {{P.tiling.tile_m}}, K = {{P.tiling.tile_k}}, N = {{P.tiling.tile_n}};
   static constexpr int col_placement = {{L.placement.col}};
@@ -18,8 +18,8 @@ struct {{L.struct_name}} {
   static constexpr int padded_OUT_FEAT = {{P.padded_out_features}};
   static constexpr int IN_FEAT_SLICE = {{P.in_feat_slice}};
   static constexpr int OUT_FEAT_SLICE = {{P.out_feat_slice}};
-  static constexpr int RAW_IN_FEAT_SLICE = {{P.parallelism.input_slice_raw}};
-  static constexpr int RAW_OUT_FEAT_SLICE = {{P.parallelism.output_slice_raw}};
+  static constexpr int RAW_IN_FEAT_SLICE = {{P.input_slice_raw}};
+  static constexpr int RAW_OUT_FEAT_SLICE = {{P.output_slice_raw}};
   using acc_scalar_t = {{ P.accumulator_tag }};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
   static constexpr const char* SATURATION_TOKEN = "saturate";

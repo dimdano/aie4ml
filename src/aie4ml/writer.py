@@ -52,11 +52,11 @@ class AIEWriter(Writer):
         placements = ctx.ir.physical.placements or {}
 
         for node in ctx.ir.logical:
-            inst = ctx.ir.kernels.get(node.name)
+            inst = ctx.ir.execution.get(node.name)
             if inst is None:
                 continue
 
-            kernel_cfg = inst.config
+            op_impl_cfg = inst.config
             variant = inst.variant
 
             if node.name not in placements:
@@ -65,21 +65,20 @@ class AIEWriter(Writer):
 
             layer_index += 1
 
-            get_artifacts = getattr(variant, 'get_artifacts', None)
-            artifacts = get_artifacts(inst) if get_artifacts is not None else []
+            artifacts = variant.get_artifacts(inst)
 
             entry = {
                 'index': layer_index,
                 'inst_name': inst.name,
-                'kernel_name': sanitize_identifier(node.name),
+                'op_impl_name': sanitize_identifier(node.name),
                 'struct_name': f'L{layer_index}Cfg',
-                'kernel': kernel_cfg,
+                'op_impl': op_impl_cfg,
                 'placement': placement,
                 'artifacts': artifacts,
             }
 
             # Optional metadata passthrough
-            entry.update({k: node.metadata[k] for k in ('n_in', 'n_out', 'use_bias') if k in node.metadata})
+            entry.update({k: node.metadata[k] for k in ('n_in', 'n_out') if k in node.metadata})
             layers.append(entry)
 
         return layers
@@ -88,6 +87,8 @@ class AIEWriter(Writer):
         weights_dir = output_dir / 'src' / 'weights'
         for L in layers:
             for spec in L.get('artifacts', ()):
+                if 'storage' not in spec:
+                    raise RuntimeError(f"{L['inst_name']}: artifact {spec.get('name')} missing storage metadata.")
                 if spec.get('array') is None:
                     continue
 

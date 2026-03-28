@@ -9,11 +9,23 @@ from .context import (
     ensure_backend_context,
     get_backend_context,
 )
-from .graph import LogicalIR, OpNode, ResolvedAttributes, TensorVar, TraitInstance
+from .graph import (
+    AIEPipelineIR,
+    ExecutionIR,
+    LogicalIR,
+    OpImplInstance,
+    OpNode,
+    ResolvedAttributes,
+    TensorVar,
+    TraitInstance,
+)
 
 __all__ = [
     'AIEBackendContext',
+    'AIEPipelineIR',
+    'ExecutionIR',
     'LogicalIR',
+    'OpImplInstance',
     'OpNode',
     'TensorVar',
     'BackendPolicies',

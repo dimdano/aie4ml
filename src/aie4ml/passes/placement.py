@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
 from ..ir import get_backend_context
-from ..kernel_registry import KernelPlacementContext
+from ..op_impls import OpImplFootprint, OpImplPlacementContext
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class Rect:
     """Rectangular footprint of a node on the AIE grid."""
+
     w: int
     h: int
     in_col_off: int
@@ -32,6 +33,7 @@ class Rect:
 @dataclass
 class NodeAdapter:
     """Thin adapter around an IR node for placement."""
+
     node: Any
     name: str
     rect: Rect
@@ -41,6 +43,7 @@ class NodeAdapter:
 @dataclass
 class Placed:
     """Concrete placement of a node in local grid coordinates."""
+
     name: str
     x: int
     y: int
@@ -283,9 +286,9 @@ class PlaceKernels(ModelOptimizerPass):
     Assign tile coordinates to rectangular compute layers
     using a branch-and-bound placement algorithm.
 
-    - Uses attributes.parallelism['cas_length'] as width and
-      attributes.parallelism['cas_num'] as height.
-    - Honors user placement hints from attributes.placement (col,row):
+    - Uses config.parameters.parallelism.cas_length as width and
+      config.parameters.parallelism.cas_num as height.
+    - Honors user placement hints from node.directives['placement'] (col, row):
       for the first dense layer this becomes the anchor; later layers
       can also be forced to a fixed tile.
     """
@@ -306,7 +309,7 @@ class PlaceKernels(ModelOptimizerPass):
         col_offset = int(device.column_start)
         row_offset = int(device.row_start)
 
-        kernel_nodes = [(node, ctx.ir.kernels.get(node.name)) for node in ctx.ir.logical]
+        kernel_nodes = [(node, ctx.ir.execution.get(node.name)) for node in ctx.ir.logical]
         kernel_nodes = [(node, inst) for node, inst in kernel_nodes if inst]
         if not kernel_nodes:
             return False
@@ -316,7 +319,6 @@ class PlaceKernels(ModelOptimizerPass):
             footprint = self._node_footprint(ctx, node, inst)
             w = footprint.width
             h = footprint.height
-            attrs = inst.attributes
 
             # For now, approximate I/O ports as middle-left and middle-right.
             in_row = max(0, min(h - 1, h // 2))
@@ -331,7 +333,7 @@ class PlaceKernels(ModelOptimizerPass):
 
             # Optional user placement hint (absolute coords)
             anchor = None
-            placement_hint = attrs.placement or {}
+            placement_hint = node.directives.get('placement', {})
             if placement_hint:
                 hint_col = placement_hint.get('col')
                 hint_row = placement_hint.get('row')
@@ -387,13 +389,12 @@ class PlaceKernels(ModelOptimizerPass):
         changed = False
 
         for node in ctx.ir.logical:
-            inst = ctx.ir.kernels.get(node.name)
+            inst = ctx.ir.execution.get(node.name)
             if inst is not None:
-                attrs = inst.attributes
                 footprint = PlaceKernels._footprint_static(ctx, node, inst)
                 width = footprint.width
                 height = footprint.height
-                requested = attrs.placement or {}
+                requested = node.directives.get('placement', {})
                 requested_col = requested.get('col')
                 requested_row = requested.get('row')
                 user_specified = requested_col is not None or requested_row is not None
@@ -427,21 +428,20 @@ class PlaceKernels(ModelOptimizerPass):
         return changed
 
     @staticmethod
-    def _footprint_static(ctx, node, inst=None) -> 'KernelFootprint':
+    def _footprint_static(ctx, node, inst=None) -> 'OpImplFootprint':
         if inst is None:
-            inst = ctx.ir.kernels.get(node.name)
+            inst = ctx.ir.execution.get(node.name)
         if inst is None:
-            raise RuntimeError(f'{node.name}: kernel instance missing; run resolve before placement.')
+            raise RuntimeError(f'{node.name}: op implementation missing; run resolve before placement.')
         config = inst.config
-        placement_ctx = KernelPlacementContext(
+        placement_ctx = OpImplPlacementContext(
             node=node,
-            attributes=inst.attributes,
             metadata=node.metadata,
             config=config,
         )
         footprint = inst.variant.footprint(placement_ctx)
         if footprint is None:
-            raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
+            raise RuntimeError(f'{node.name}: implementation variant did not provide a footprint.')
         return footprint
 
     def _node_footprint(self, ctx, node, inst):

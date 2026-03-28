@@ -12,7 +12,7 @@ import numpy as np
 
 from .aie_types import AIEDataType
 from .ir import get_backend_context
-from .passes.quant import apply_rounding, dtype_for_precision, handle_overflow
+from .quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 
 log = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ def build_io_layout(model) -> IOLayout:
     """
     Build a canonical per-port IO layout strictly from:
       - ctx.ir.physical.plan['buffers'] (external endpoint discovery/mapping: ifm[x]/ofm[x])
-      - ctx.ir.kernels (kernel instances + staging descriptors + numeric specs)
+      - ctx.ir.execution (implementation instances + staging descriptors + numeric specs)
     """
     ctx = get_backend_context(model)
     plan = ctx.ir.physical.plan
@@ -243,19 +243,18 @@ def build_io_layout(model) -> IOLayout:
                 continue
             port = int(writer['source_endpoint']['port'])
 
-            reader = next(r for r in buf['readers'] if r['target_type'] == 'kernel')
-            inst = ctx.ir.kernels.get(reader['target_endpoint']['kernel'])
+            reader = next(r for r in buf['readers'] if r['target_type'] == 'op_impl')
+            inst = ctx.ir.execution.get(reader['target_endpoint']['op_impl'])
 
             st = inst.variant.describe_input_staging(
                 inst.node,
-                inst.attributes,
+                inst.config,
                 tensor,
                 port,
                 None,
                 None,
-                None,
             )
-            dtype = inst.attributes.numeric['input']
+            dtype = inst.config.parameters.precision['input']
 
             inputs.setdefault(tensor, []).append(
                 IOPortLayout(
@@ -274,20 +273,19 @@ def build_io_layout(model) -> IOLayout:
             if reader['target_endpoint']['name'] != 'ofm':
                 continue
             port = int(reader['target_endpoint']['port'])
-            kernel_port = int(reader['target_endpoint']['kernel_port'])
+            kernel_port = int(reader['target_endpoint']['op_impl_port'])
 
-            writer = next(w for w in buf['writers'] if w['source_type'] == 'kernel')
-            inst = ctx.ir.kernels.get(writer['source_endpoint']['kernel'])
+            writer = next(w for w in buf['writers'] if w['source_type'] == 'op_impl')
+            inst = ctx.ir.execution.get(writer['source_endpoint']['op_impl'])
 
             st = inst.variant.describe_output_staging(
                 inst.node,
-                inst.attributes,
+                inst.config,
                 tensor,
                 kernel_port,
                 None,
-                None,
             )
-            dtype = inst.attributes.numeric['output']
+            dtype = inst.config.parameters.precision['output']
 
             outputs.setdefault(tensor, []).append(
                 IOPortLayout(

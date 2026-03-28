@@ -5,9 +5,9 @@
 
 {% set ns = namespace(headers=[]) %}
 {% for L in layers %}
-{% if L.kernel.graph_header not in ns.headers %}
-{% set ns.headers = ns.headers + [L.kernel.graph_header] %}
-#include "{{ L.kernel.graph_header }}"
+{% if L.op_impl.graph_header not in ns.headers %}
+{% set ns.headers = ns.headers + [L.op_impl.graph_header] %}
+#include "{{ L.op_impl.graph_header }}"
 {% endif %}
 {% endfor %}
 
@@ -47,8 +47,8 @@ public:
 
 private:
 {% for L in layers %}
-  {{ L.kernel.graph_name }}<Cfg{{ loop.index }}>
-    {{ L.kernel_name }};
+  {{ L.op_impl.graph_name }}<Cfg{{ loop.index }}>
+    {{ L.op_impl_name }};
 {% endfor %}
 
 {% for buf in graph_plan.buffers %}
@@ -79,7 +79,7 @@ public:
         {% if spec.kind == "2d" %}
         connect<>(
           {{ spec.port }}{{ Lidx }}[idx],
-          {{ L.kernel_name }}.{{ spec.port }}[idx]
+          {{ L.op_impl_name }}.{{ spec.port }}[idx]
         );
         {% endif %}
         {% endfor %}
@@ -89,7 +89,7 @@ public:
       {% if spec.kind == "1d" %}
       connect<>(
         {{ spec.port }}{{ Lidx }}[ch],
-        {{ L.kernel_name }}.{{ spec.port }}[ch]
+        {{ L.op_impl_name }}.{{ spec.port }}[ch]
       );
       {% endif %}
       {% endfor %}
@@ -97,7 +97,7 @@ public:
 {% endfor %}
 
 {% for L in layers %}
-    {{ L.kernel_name }}.place_graph(
+    {{ L.op_impl_name }}.place_graph(
       Cfg{{ loop.index }}::col_placement,
       Cfg{{ loop.index }}::row_placement
     );
