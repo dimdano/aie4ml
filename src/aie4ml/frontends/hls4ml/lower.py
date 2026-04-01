@@ -17,7 +17,6 @@ from ...ir import (
     LogicalIR,
     OpNode,
     TensorVar,
-    TraitInstance,
     ensure_backend_context,
 )
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
@@ -121,8 +120,6 @@ class LowerToAieIr(ModelOptimizerPass):
                 if bias_tv is not None:
                     node.inputs.append(bias_tv)
 
-            self._attach_traits(ctx, node, layer)
-
         for out_var in model.get_output_variables():
             graph.mark_graph_output(out_var.name)
 
@@ -201,12 +198,6 @@ class LowerToAieIr(ModelOptimizerPass):
         ctx = AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
         register_default_traits(ctx)
         return ctx
-
-    def _attach_traits(self, ctx: AIEBackendContext, node: OpNode, layer) -> None:
-        if layer.class_name == 'Dense' or is_pointwise_dense(layer):
-            fused = (layer.get_attr('aie_fused_activation', '') or '').lower()
-            if fused:
-                node.add_trait(TraitInstance('fused_activation', {'activation': fused}))
 
     def _map_op_type(self, layer) -> str:
         if layer.class_name in ('Dense',) or is_pointwise_dense(layer):
