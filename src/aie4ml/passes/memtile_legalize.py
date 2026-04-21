@@ -145,17 +145,20 @@ class LegalizeMemtilePortLimits(AIEPass):
                             f'one-stage sharding cannot realize producer_ports={p} -> consumer_ports={c} '
                             f'under memtile out-port limit {max_out}.'
                         )
-                c_chunks = []
-                start = 0
-                for p_ports in p_chunks:
-                    size = len(p_ports) * c_per_p
-                    c_chunks.append(list(range(start, start + size)))
-                    start += size
-                if start != c:
-                    raise RuntimeError(
-                        f'{entry.tensor}: shard transport internal error; '
-                        f'consumer chunking mismatch ({start} != {c}).'
-                    )
+                if entry.producer is not None:
+                    c_chunks = self._consumer_chunks_for_internal_shard(entry, p, c, p_chunks, c_per_p, ctx)
+                else:
+                    c_chunks = []
+                    start = 0
+                    for p_ports in p_chunks:
+                        size = len(p_ports) * c_per_p
+                        c_chunks.append(list(range(start, start + size)))
+                        start += size
+                    if start != c:
+                        raise RuntimeError(
+                            f'{entry.tensor}: shard transport internal error; '
+                            f'consumer chunking mismatch ({start} != {c}).'
+                        )
             else:
                 c_chunks = [[] for _ in range(units)]
 
@@ -207,11 +210,64 @@ class LegalizeMemtilePortLimits(AIEPass):
         return out
 
     @staticmethod
+    def _consumer_chunks_for_internal_shard(
+        entry, producer_ports: int, consumer_ports: int, p_chunks, c_per_p: int, ctx
+    ):
+        consumer = entry.consumers[0].consumer
+        inst = ctx.ir.execution.get(consumer.name)
+        shard_dim, port_stride, full_dim = LegalizeMemtilePortLimits._shard_params(entry, producer_ports, ctx)
+
+        port_groups = {}
+        for c_port in range(int(consumer_ports)):
+            desc = inst.variant.describe_input_staging(
+                consumer, inst.config, entry.tensor, c_port, None, entry.producer
+            )
+            offset = int(desc['offset'][int(shard_dim)])
+            extent = int(desc['io_tiling_dimension'][int(shard_dim)])
+            if offset < 0 or extent <= 0 or offset + extent > int(full_dim):
+                raise NotImplementedError(
+                    f'{entry.tensor}: shard transport requires relay; '
+                    f'consumer port {c_port} range [{offset}, {offset + extent}) is invalid '
+                    f'for producer shard dim{shard_dim} extent {full_dim}.'
+                )
+            group = offset // int(port_stride)
+            group_limit = (group + 1) * int(port_stride)
+            if group < 0 or group >= int(producer_ports) or offset + extent > group_limit:
+                raise NotImplementedError(
+                    f'{entry.tensor}: shard transport requires relay; '
+                    f'consumer port {c_port} range [{offset}, {offset + extent}) crosses producer '
+                    f'shard boundary for slice {group} on dim{shard_dim}.'
+                )
+            port_groups.setdefault(int(group), []).append(int(c_port))
+
+        chunks = []
+        for p_ports in p_chunks:
+            chunk = []
+            for p_port in p_ports:
+                chunk.extend(port_groups.get(int(p_port), []))
+            chunk = sorted(chunk)
+            expected = len(p_ports) * int(c_per_p)
+            if len(chunk) != expected:
+                raise NotImplementedError(
+                    f'{entry.tensor}: shard transport requires relay; '
+                    f'expected {expected} consumer ports for producer slice set {p_ports}, got {len(chunk)}.'
+                )
+            chunks.append(chunk)
+
+        assigned = sorted(port for chunk in chunks for port in chunk)
+        if assigned != list(range(int(consumer_ports))):
+            raise RuntimeError(
+                f'{entry.tensor}: shard transport internal error; '
+                f'consumer shard assignment mismatch ({assigned} != {list(range(int(consumer_ports)))}).'
+            )
+        return chunks
+
+    @staticmethod
     def _consumer_ports(entry, producer_ports: int, ctx) -> int:
         if entry.consumers:
             consumer = entry.consumers[0].consumer
             inst = ctx.ir.execution.get(consumer.name)
-            return int(inst.config.ports.inputs[entry.tensor].count)
+            return int(inst.ports.inputs[entry.tensor].count)
         if entry.graph_output:
             return int(producer_ports)
         raise ValueError(f'{entry.tensor}: entry has neither consumers nor graph_output.')

@@ -1,5 +1,7 @@
+from . import resolver  # noqa: F401
 from .common import (
-    TILING_OPTIONS,
+    MICROTILE_OPTIONS,
+    microtile_key,
     np_bias_dtype_for_spec,
     np_dtype_for_spec,
     pack_as_float,
@@ -7,22 +9,21 @@ from .common import (
     pack_vector_by_n_slice,
     quantize_to_int,
     select_generation_key,
-    tiling_key,
 )
-from .dense import DenseFlags, DenseOpImplParameters, DenseOpImplVariant
-from .matmul import MatmulFlags, MatmulOpImplParameters, MatmulOpImplVariant
-from .types import MatmulParallelismConfig, MatmulTilingConfig
+from .config import DenseConfig, DenseFlags, MatmulConfig, MatmulFlags, MatmulMicrotileConfig, MatmulParallelismConfig
+from .dense import DenseOpImplVariant
+from .matmul import MatmulOpImplVariant
 
 __all__ = [
+    'DenseConfig',
     'DenseFlags',
-    'DenseOpImplParameters',
     'DenseOpImplVariant',
+    'MatmulConfig',
     'MatmulFlags',
-    'MatmulOpImplParameters',
     'MatmulOpImplVariant',
+    'MatmulMicrotileConfig',
     'MatmulParallelismConfig',
-    'MatmulTilingConfig',
-    'TILING_OPTIONS',
+    'MICROTILE_OPTIONS',
     'np_bias_dtype_for_spec',
     'np_dtype_for_spec',
     'pack_as_float',
@@ -30,5 +31,5 @@ __all__ = [
     'pack_vector_by_n_slice',
     'quantize_to_int',
     'select_generation_key',
-    'tiling_key',
+    'microtile_key',
 ]

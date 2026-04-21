@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, Any]]:
     consumer = entry.consumers[0].consumer
     inst = ctx.ir.execution.get(consumer.name)
-    count = int(inst.config.ports.inputs[entry.tensor].count)
+    count = int(inst.ports.inputs[entry.tensor].count)
     if count != int(entry.producer_ports):
         raise ValueError(
             f'{entry.tensor}: graph-input producer_ports must match consumer port count '
@@ -34,8 +34,8 @@ def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
         'io_boundary_dimension': list(base['io_boundary_dimension']),
         'offset': [0 for _ in io_tile],
         'slice_dimension': int(base['slice_dimension']),
-        'feature_dimension': int(base['feature_dimension']),
-        'independent_dimension': int(base['independent_dimension']),
+        'inner_dimension': int(base['inner_dimension']),
+        'outer_dimension': int(base['outer_dimension']),
     }
 
 
@@ -51,8 +51,8 @@ def graph_input_writer_port_descs(read_descs: Dict[int, Dict[str, Any]]) -> Dict
             'io_boundary_dimension': list(base['io_boundary_dimension']),
             'offset': list(base['offset']),
             'slice_dimension': int(base['slice_dimension']),
-            'feature_dimension': int(base['feature_dimension']),
-            'independent_dimension': int(base['independent_dimension']),
+            'inner_dimension': int(base['inner_dimension']),
+            'outer_dimension': int(base['outer_dimension']),
         }
     return out
 

@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from ...aie_types import QuantIntent
+from ...aie_types import FloatFormat, FloatIntent, QuantIntent
 from ...ir import LogicalIR, OpNode, TensorVar
 from ...ir.context import AIEBackendContext
 from ...model import AIEModel
@@ -115,6 +115,21 @@ def lower_onnx_model(
             return value_tensors[name]
         if name in initializers:
             return _parameter_source_for(name, node_name)
+        # Direct float graph input (bfloat16 / float32) — no QDQ wrapper.
+        if name in raw_input_shapes:
+            dtype = raw_input_dtypes[name]
+            if dtype == np.float32:
+                intent = FloatIntent(width=32, format=FloatFormat.FP32)
+            elif str(dtype) in ('bfloat16', 'float16'):
+                intent = FloatIntent(width=16, format=FloatFormat.BF16)
+            else:
+                raise ValueError(
+                    f'{node_name}: graph input "{name}" has unsupported dtype {dtype}. '
+                    'Use QDQ wrapping for integer inputs.'
+                )
+            tensor = _graph_tensor(name, raw_input_shapes[name], intent)
+            value_tensors[name] = tensor
+            return tensor
         raise ValueError(f'{node_name}: unsupported input {name}.')
 
     for index, node in enumerate(graph_proto.node):
@@ -450,7 +465,38 @@ def lower_onnx_model(
             elif rhs.producer is not None and rhs.producer.op_type == 'dense' and lhs.is_parameter:
                 dense_tensor, bias_tensor = rhs, lhs
             else:
-                raise ValueError(f'{node_name}: generic Add is not supported; only fused dense bias is supported.')
+                lhs_shape = tuple(int(x) for x in shape_of[lhs_name])
+                rhs_shape = tuple(int(x) for x in shape_of[rhs_name])
+                if lhs_shape != rhs_shape:
+                    raise ValueError(
+                        f'{node_name}: generic Add only supports exact-shape elementwise inputs; '
+                        f'got {lhs_shape} and {rhs_shape}.'
+                    )
+                op = OpNode(name=f'{node_name}_aie', op_type='add', dialect=ctx.device.dialect)
+                op.metadata.update(
+                    attach_quant_role_bindings(
+                        {
+                            'layer_class': 'Add',
+                            'source_class': 'Add',
+                            'source_layer': node_name,
+                            'input_roles': ['lhs', 'rhs'],
+                        }
+                    )
+                )
+                op.directives.update(directives)
+                lhs.consumers.append(op)
+                rhs.consumers.append(op)
+                op.inputs.extend([lhs, rhs])
+
+                # For float (bfloat16/float32) graphs, propagate precision from lhs.
+                out_precision = lhs.precision if isinstance(lhs.precision, FloatIntent) else None
+                out_tensor = TensorVar(name=node.output[0], shape=lhs_shape, precision=out_precision, producer=op)
+                graph.add_tensor(out_tensor)
+                op.outputs.append(out_tensor)
+                graph.add_node(op)
+                value_tensors[node.output[0]] = out_tensor
+                shape_of[node.output[0]] = lhs_shape
+                continue
 
             dense_node = dense_tensor.producer
             if dense_node.metadata.get('use_bias'):

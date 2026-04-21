@@ -36,11 +36,6 @@ public:
   {%- endfor -%}
   > dut;
 
-  static_assert(
-    (L1Cfg::IN_FEAT * sizeof(typename L1Cfg::data_t)) % 4 == 0,
-    "PLIO input word size must be multiple of 32 bits"
-  );
-
   dut_graph() {
     for (int col = 0; col < {{ graph_plan.graph_input_count }}; ++col) {
       plio_data[col] = input_plio::create(

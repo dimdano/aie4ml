@@ -12,7 +12,6 @@ from statistics import median
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..ir import get_backend_context
-from ..op_impls import OpImplPlacementContext
 from .base import AIEPass
 
 log = logging.getLogger(__name__)
@@ -479,12 +478,7 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         if inst is None:
             continue
 
-        placement_ctx = OpImplPlacementContext(
-            node=node,
-            metadata=node.metadata,
-            config=inst.config,
-        )
-        footprint = inst.variant.footprint(placement_ctx)
+        footprint = inst.variant.footprint(node, inst.config)
         if footprint is None:
             raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
 

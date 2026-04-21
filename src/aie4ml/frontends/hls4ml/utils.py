@@ -83,15 +83,15 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
             directives['placement'] = placement
 
     tiling: Dict[str, int] = {}
-    tiling_cfg = cfg(layer, 'tiling', {})
-    for key in ('tile_m', 'tile_k', 'tile_n'):
+    tiling_cfg = cfg(layer, 'microtiling', {})
+    for key in ('microtile_m', 'microtile_k', 'microtile_n'):
         flat = cfg(layer, key)
         if flat is not None:
             tiling[key] = int(flat)
         elif key in tiling_cfg:
             tiling[key] = int(tiling_cfg[key])
     if tiling:
-        directives['tiling'] = tiling
+        directives['microtiling'] = tiling
 
     parallelism: Dict[str, Any] = {}
     parallel_cfg = cfg(layer, 'parallelism', {})

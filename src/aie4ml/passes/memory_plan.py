@@ -151,7 +151,7 @@ class _CodegenPlanner:
                 continue
             for t in getattr(n, 'outputs', []):
                 tname = t.name
-                pg = inst.config.ports.outputs[tname].group
+                pg = inst.ports.outputs[tname].group
                 producers[tname] = (n, pg)
 
         connections: List[_Connection] = []
@@ -167,7 +167,7 @@ class _CodegenPlanner:
                 if t.is_parameter:
                     continue
                 tname = t.name
-                cg = inst.config.ports.inputs[tname].group
+                cg = inst.ports.inputs[tname].group
                 if tname in producers:
                     p, pg = producers[tname]
                     connections.append(_Connection(p, n, pg, cg, tname))
@@ -184,7 +184,7 @@ class _CodegenPlanner:
                 tname = t.name
                 if tname not in graph_output_names and tname in seen_outputs:
                     continue
-                pg = inst.config.ports.outputs[tname].group
+                pg = inst.ports.outputs[tname].group
                 connections.append(_Connection(n, None, pg, 'graph_output', tname, 'output'))
 
         return connections
@@ -440,8 +440,8 @@ class _CodegenPlanner:
             'io_boundary_dimension': list(base['io_boundary_dimension']),
             'offset': [0 for _ in io_tile],
             'slice_dimension': int(base['slice_dimension']),
-            'feature_dimension': int(base['feature_dimension']),
-            'independent_dimension': int(base['independent_dimension']),
+            'inner_dimension': int(base['inner_dimension']),
+            'outer_dimension': int(base['outer_dimension']),
         }
 
     def _graph_output_reader_descriptor(
@@ -471,8 +471,8 @@ class _CodegenPlanner:
             'offset': offset,
             'boundary_dimension': boundary,
             'slice_dimension': int(base['slice_dimension']),
-            'feature_dimension': int(base['feature_dimension']),
-            'independent_dimension': int(base['independent_dimension']),
+            'inner_dimension': int(base['inner_dimension']),
+            'outer_dimension': int(base['outer_dimension']),
         }
 
     # ------------------------------------------------------------------
@@ -485,10 +485,10 @@ class _CodegenPlanner:
     def _producer_port_count(self, node, tensor):
         if node is None:
             return 1
-        return self._kernel_inst(node).config.ports.outputs[tensor].count
+        return self._kernel_inst(node).ports.outputs[tensor].count
 
     def _consumer_port_count(self, node, tensor):
-        return self._kernel_inst(node).config.ports.inputs[tensor].count
+        return self._kernel_inst(node).ports.inputs[tensor].count
 
     def _producer_endpoint(self, node, group, port):
         return f'ifm[{port}]' if node is None else f'{sanitize_identifier(node.name)}.{group}[{port}]'
@@ -520,17 +520,16 @@ class _CodegenPlanner:
 
     def _buffer_ctype(self, entry):
         if entry.producer is None:
-            c = entry.consumers[0].consumer
-            role = self._graph_input_role(entry)
-            suffix = 'rhs_t' if role == 'rhs' else 'data_t'
-            return f'typename Cfg{self.layer_indices[c.name]}::{suffix}'
-        return f'typename Cfg{self.layer_indices[entry.producer.name]}::result_t'
+            dtype = self._graph_input_dtype(entry)
+        else:
+            dtype = self._graph_output_dtype(entry)
+        return dtype.c_type
 
     def _graph_input_dtype(self, entry: _EdgeEntry) -> AIEDataType:
         consumer = entry.consumers[0].consumer
         inst = self._kernel_inst(consumer)
         role = self._graph_input_role(entry)
-        return inst.config.parameters.precision[role]
+        return inst.variant.input_precision(inst.config, role)
 
     def _graph_input_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
         if entry.graph_input_port_descs:
@@ -545,12 +544,13 @@ class _CodegenPlanner:
     def _graph_output_dtype(self, entry: _EdgeEntry) -> AIEDataType:
         producer = entry.producer
         inst = self._kernel_inst(producer)
-        return inst.config.parameters.precision['output']
+        return inst.variant.output_precision(inst.config)
 
     def _graph_output_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
         producer = entry.producer
         inst = self._kernel_inst(producer)
-        return inst.variant.describe_output_staging(producer, inst.config, entry.tensor, port, None)
+        base = inst.variant.describe_output_staging(producer, inst.config, entry.tensor, port, None)
+        return _host_visible_output_staging(base)
 
     def _next_buffer_name(self, entry: _EdgeEntry):
         base = sanitize_identifier(entry.tensor)
@@ -582,3 +582,46 @@ def _legalize_collected_entries(ctx, state):
     PlaceKernels().transform(ctx)
     LegalizeMemtilePortLimits().transform(ctx)
     return ctx.ir.physical.plan['_memory_plan_state']
+
+
+def _host_visible_output_staging(base: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Rewrite a producer output descriptor for host-visible graph output.
+
+    Producer staging is expressed in padded kernel-buffer coordinates. Host-visible
+    output uses IO boundary/tiling extents, so this helper swaps in
+    io_boundary_dimension/io_tiling_dimension and rebases whole-slice offsets into
+    IO-tile coordinates.
+    """
+
+    desc = dict(base)
+    offsets = [int(x) for x in base['offset']]
+    io_tile = [int(x) for x in base['io_tiling_dimension']]
+    io_boundary = [int(x) for x in base['io_boundary_dimension']]
+    traversal = list(base.get('tile_traversal', ()))
+
+    host_offsets: List[int] = []
+    for dim, offset in enumerate(offsets):
+        if offset == 0:
+            host_offsets.append(0)
+            continue
+
+        slice_extent = None
+        for item in traversal:
+            if int(item.get('dimension', -1)) != dim:
+                continue
+            stride = int(item.get('stride', 0))
+            wrap = int(item.get('wrap', 0))
+            if stride > 0 and wrap > 0:
+                slice_extent = stride * wrap
+                break
+
+        if slice_extent and offset % slice_extent == 0:
+            host_offsets.append((offset // slice_extent) * int(io_tile[dim]))
+        else:
+            host_offsets.append(offset)
+
+    desc['buffer_dimension'] = list(io_boundary)
+    desc['offset'] = host_offsets
+    desc['tiling_dimension'] = list(io_tile)
+    return desc

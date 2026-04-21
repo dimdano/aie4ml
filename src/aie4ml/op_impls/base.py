@@ -1,84 +1,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, ClassVar, Dict, Mapping, Optional, Tuple
 
-from ..ir.graph import OpNode, ResolvedAttributes
-from .common_types import PortBinding, PortMap, to_plain
-
-
-@dataclass(frozen=True)
-class OpImplConfig:
-    """Frozen per-node implementation config produced during execution lowering.
-
-    Built by `OpImplVariant.build_config()` and stored in `ExecutionIR`.
-    `parameters` holds variant-specific typed compile-time config.
-    `ports` holds the generic op-implementation port contract.
-    """
-
-    variant_id: str
-    param_template: str
-    graph_header: str
-    graph_name: str
-    parameters: Any
-    ports: PortMap
-    io_route: Dict[str, Any]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            'variant_id': self.variant_id,
-            'param_template': self.param_template,
-            'graph_header': self.graph_header,
-            'graph_name': self.graph_name,
-            'parameters': to_plain(self.parameters),
-        }
-
-
-@dataclass(frozen=True)
-class OpImplSelectionContext:
-    """Inputs used to test and build an op implementation for a node."""
-
-    node: OpNode
-    attributes: ResolvedAttributes
-    device_generation: str
-    metadata: Dict[str, Any]
-
-
-@dataclass(frozen=True)
-class OpImplPlacementContext:
-    """Inputs used to compute an implementation's placement requirements."""
-
-    node: OpNode
-    metadata: Dict[str, Any]
-    config: OpImplConfig
+from ..ir.graph import OpNode
+from .common_types import PortBinding, PortMap
 
 
 @dataclass(frozen=True)
 class OpImplFootprint:
-    """Rectangular tile footprint required by an op implementation.
-
-    Returned by `OpImplVariant.footprint()` and consumed by placement.
-    """
+    """Rectangular tile footprint required by an op implementation."""
 
     width: int
     height: int
     extras: Dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
 class OpImplVariant:
-    """Reusable implementation descriptor for one op type.
+    """Reusable implementation descriptor for one op type."""
 
-    Registered in `OpImplRegistry` and selected at compile time.
-    Subclasses define support checks, config construction, packing, and footprint logic.
-    """
-
-    variant_id: str
-    op_type: str
-    supported_generations: Tuple[str, ...] = field(default_factory=tuple)
-    supported_precisions: Tuple[Dict[str, Any], ...] = field(default_factory=tuple)
-    supported_input_modes: Tuple[str, ...] = field(default_factory=tuple)
-    supported_output_modes: Tuple[str, ...] = field(default_factory=tuple)
+    variant_id: ClassVar[str] = ''
+    op_type: ClassVar[str] = ''
+    graph_header: ClassVar[str] = ''
+    graph_name: ClassVar[str] = ''
+    param_template: ClassVar[str] = ''
+    supported_generations: ClassVar[Tuple[str, ...]] = ()
+    supported_precisions: ClassVar[Tuple[Dict[str, Any], ...]] = ()
+    supported_input_modes: ClassVar[Tuple[str, ...]] = ()
+    supported_output_modes: ClassVar[Tuple[str, ...]] = ()
 
     def supports_generation(self, generation: str) -> bool:
         if not self.supported_generations:
@@ -89,34 +38,45 @@ class OpImplVariant:
                 return True
         return False
 
-    def supports(self, context: OpImplSelectionContext) -> bool:
-        if not self.supports_generation(context.device_generation):
-            return False
-
+    def supports_io_route(self, io_route: Dict[str, Any]) -> bool:
         if self.supported_input_modes:
-            for mode in context.attributes.io_route.get('inputs', {}).values():
+            for mode in io_route.get('inputs', {}).values():
                 if isinstance(mode, str) and mode not in self.supported_input_modes:
                     return False
 
         if self.supported_output_modes:
-            for mode in context.attributes.io_route.get('outputs', {}).values():
+            for mode in io_route.get('outputs', {}).values():
                 if isinstance(mode, str) and mode not in self.supported_output_modes:
                     return False
 
-        node_prec = _numeric_precisions(context.attributes)
-        if self.supported_precisions:
-            if not any(all(node_prec.get(k) == v for k, v in spec.items()) for spec in self.supported_precisions):
-                return False
-
         return True
 
-    def build_config(self, context: OpImplSelectionContext) -> OpImplConfig:
-        raise NotImplementedError
+    def supports_precisions(self, precision: Dict[str, Any]) -> bool:
+        if not self.supported_precisions:
+            return True
+        return any(all(precision.get(k) == v for k, v in spec.items()) for spec in self.supported_precisions)
 
-    def validate_config(self, context: OpImplSelectionContext, config: OpImplConfig) -> None:
+    def build_template_params(self, node: OpNode, config: Any) -> Any:
+        """Return the parameters object passed as ``P`` to the Jinja parameter template.
+
+        Subclasses override this to attach derived shape fields.
+        """
+        return config
+
+    def output_staging_contract(self, node: OpNode, config: Any, tensor_name: str) -> Optional[str]:
         return None
 
-    def tiling_options(self, generation: str, query: Any):
+    def output_port_count(self, node: OpNode, config: Any) -> Optional[int]:
+        """Number of ports that partition each output tensor of this variant.
+
+        Default: config.parallelism.cas_num by hardware design convention.
+        """
+        return int(config.parallelism.cas_num)
+
+    def validate_config(self, node: OpNode, config: Any, device) -> None:
+        return None
+
+    def microtiling_options(self, generation: str, query: Any):
         raise NotImplementedError
 
     def pack(self, inst):
@@ -125,10 +85,16 @@ class OpImplVariant:
     def get_artifacts(self, inst):
         return []
 
+    def input_precision(self, config: Any, role: str):
+        return config.precision[role]
+
+    def output_precision(self, config: Any):
+        return config.precision['output']
+
     def describe_output_staging(
         self,
         node: OpNode,
-        config: 'OpImplConfig',
+        config: Any,
         tensor_name: str,
         port: int,
         buf_dims=None,
@@ -138,7 +104,7 @@ class OpImplVariant:
     def describe_input_staging(
         self,
         consumer: OpNode,
-        config: 'OpImplConfig',
+        config: Any,
         tensor_name: str,
         port: int,
         buf_dims=None,
@@ -146,12 +112,12 @@ class OpImplVariant:
     ):
         return None
 
-    def footprint(self, context: OpImplPlacementContext) -> OpImplFootprint:
+    def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
         raise NotImplementedError
 
-    def _build_port_map(
+    def build_ports(
         self,
-        context: OpImplSelectionContext,
+        node: OpNode,
         input_port_count: int | Mapping[str, int],
         output_port_count: int | Mapping[str, int],
     ) -> PortMap:
@@ -165,22 +131,11 @@ class OpImplVariant:
                 return int(spec[tensor_name])
             return int(spec)
 
-        data_inputs = [tensor for tensor in context.node.inputs if not tensor.is_parameter]
+        data_inputs = [tensor for tensor in node.inputs if not tensor.is_parameter]
         for index, tensor in enumerate(data_inputs):
             inputs[tensor.name] = PortBinding(group=f'in{index+1}', count=_count(input_port_count, tensor.name))
 
-        for index, tensor in enumerate(context.node.outputs):
+        for index, tensor in enumerate(node.outputs):
             outputs[tensor.name] = PortBinding(group=f'out{index+1}', count=_count(output_port_count, tensor.name))
 
         return PortMap(inputs=inputs, outputs=outputs)
-
-
-def _numeric_precisions(attrs: ResolvedAttributes) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for kind, dtype in attrs.numeric.items():
-        out[kind] = int(dtype.width)
-    lhs_dtype = attrs.numeric.get('lhs')
-    rhs_dtype = attrs.numeric.get('rhs')
-    out['lhs_c_type'] = getattr(lhs_dtype, 'c_type', '') or ''
-    out['rhs_c_type'] = getattr(rhs_dtype, 'c_type', '') or ''
-    return out

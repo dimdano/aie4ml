@@ -58,16 +58,16 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
         if placement:
             directives['placement'] = placement
 
-    if 'tiling' in raw:
-        tiling_cfg = raw['tiling']
+    if 'microtiling' in raw:
+        tiling_cfg = raw['microtiling']
         if not isinstance(tiling_cfg, dict):
             raise TypeError(f'{name}: tiling override must be a dict.')
         tiling: Dict[str, int] = {}
-        for key in ('tile_m', 'tile_k', 'tile_n'):
+        for key in ('microtile_m', 'microtile_k', 'microtile_n'):
             if key in tiling_cfg:
                 tiling[key] = int(tiling_cfg[key])
         if tiling:
-            directives['tiling'] = tiling
+            directives['microtiling'] = tiling
 
     if 'parallelism' in raw:
         parallel_cfg = raw['parallelism']

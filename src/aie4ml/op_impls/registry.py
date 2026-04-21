@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Tuple
 
-from .base import OpImplSelectionContext, OpImplVariant
-from .builtins import register_builtin_op_impls
+from .base import OpImplVariant
 
 
 class OpImplRegistry:
@@ -16,13 +15,7 @@ class OpImplRegistry:
     def variants(self, op_type: str) -> Iterable[OpImplVariant]:
         return self._variants.get(op_type, [])
 
-    def select(self, context: OpImplSelectionContext) -> Optional[OpImplVariant]:
-        for variant in self._variants.get(context.node.op_type, []):
-            if variant.supports(context):
-                return variant
-        return None
-
-    def supported_tilings(self, op_type: str, generation: str, query) -> List[Tuple[int, int, int]]:
+    def supported_microtilings(self, op_type: str, generation: str, query) -> List[Tuple[int, int, int]]:
         candidates = self._variants.get(op_type, [])
         variant = None
         for cand in candidates:
@@ -33,12 +26,36 @@ class OpImplRegistry:
             variant = candidates[0]
         if variant is None:
             return []
-        return variant.tiling_options(generation, query)
+        return variant.microtiling_options(generation, query)
 
 
 _GLOBAL_OP_IMPL_REGISTRY = OpImplRegistry()
-register_builtin_op_impls(_GLOBAL_OP_IMPL_REGISTRY)
 
 
 def get_op_impl_registry() -> OpImplRegistry:
     return _GLOBAL_OP_IMPL_REGISTRY
+
+
+def register_variant(cls):
+    _GLOBAL_OP_IMPL_REGISTRY.register(cls())
+    return cls
+
+
+def select_variant(op_type: str, config, generation: str) -> OpImplVariant:
+    precision_query: Dict[str, object] = {key: int(dtype.width) for key, dtype in config.precision.items()}
+    for key in ('lhs', 'rhs'):
+        c_type = getattr(config.precision.get(key), 'c_type', '') or ''
+        if c_type:
+            precision_query[f'{key}_c_type'] = c_type
+
+    for variant in _GLOBAL_OP_IMPL_REGISTRY.variants(op_type):
+        if not variant.supports_generation(generation):
+            continue
+        if not variant.supports_io_route(config.io_route):
+            continue
+        if variant.supports_precisions(precision_query):
+            return variant
+    raise RuntimeError(f'No implementation variant satisfies resolved {op_type} config.')
+
+
+from . import families  # noqa: E402,F401

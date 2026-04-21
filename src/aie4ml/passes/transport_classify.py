@@ -49,6 +49,29 @@ class ClassifyTransportEntries(AIEPass):
 
         producer_ports = max(1, int(entry.producer_ports))
         consumer_ports = self._consumer_ports(entry, producer_ports, ctx)
+        consumer = entry.consumers[0].consumer
+
+        # Direct AIE-to-AIE transport bypasses memtile entirely and is not
+        # constrained by max_mem_in_ports / max_mem_out_ports.
+        if self._has_consumer_perm(entry):
+            return 'direct', False
+        if producer_ports == consumer_ports:
+            # Classification runs before memtile port-limit legalization, so the
+            # default direct check uses canonical tensor-local ports 0..N-1. If a
+            # caller has already populated explicit port IDs, preserve them.
+            producer_port_ids = entry.producer_port_ids or list(range(producer_ports))
+            consumer_port_ids = entry.consumer_port_ids or list(range(consumer_ports))
+            if direct_transport_supported(
+                ctx,
+                entry.producer,
+                consumer,
+                entry.tensor,
+                producer_port_ids,
+                consumer_port_ids,
+            ):
+                return 'direct', True
+
+        # Direct transport not feasible; classify using memtile port-limit constraints.
         units = max(
             (producer_ports + max_in - 1) // max_in,
             (consumer_ports + max_out - 1) // max_out,
@@ -63,27 +86,6 @@ class ClassifyTransportEntries(AIEPass):
                     f'-> consumer_ports={consumer_ports}.'
                 )
             return 'shard', None
-
-        consumer = entry.consumers[0].consumer
-        if self._has_consumer_perm(entry):
-            return 'direct', False
-        if producer_ports != consumer_ports:
-            return 'direct', False
-        # Classification runs before memtile port-limit legalization, so the default
-        # direct check uses canonical tensor-local ports 0..N-1. If a caller has
-        # already populated explicit port IDs, preserve them instead of re-inventing
-        # numbering here.
-        producer_port_ids = entry.producer_port_ids or list(range(producer_ports))
-        consumer_port_ids = entry.consumer_port_ids or list(range(consumer_ports))
-        if direct_transport_supported(
-            ctx,
-            entry.producer,
-            consumer,
-            entry.tensor,
-            producer_port_ids,
-            consumer_port_ids,
-        ):
-            return 'direct', True
         return 'direct', False
 
     def _realization_kind(self, entry, topology: str, staging_compatible: bool | None, ctx) -> str:
@@ -111,13 +113,13 @@ class ClassifyTransportEntries(AIEPass):
 
         modes = set()
         producer_inst = ctx.ir.execution.get(entry.producer.name)
-        producer_mode = producer_inst.config.io_route.get('outputs', {}).get(entry.tensor)
+        producer_mode = producer_inst.io_route.get('outputs', {}).get(entry.tensor)
         if producer_mode:
             modes.add(str(producer_mode))
 
         for consumer_conn in entry.consumers:
             consumer_inst = ctx.ir.execution.get(consumer_conn.consumer.name)
-            consumer_mode = consumer_inst.config.io_route.get('inputs', {}).get(entry.tensor)
+            consumer_mode = consumer_inst.io_route.get('inputs', {}).get(entry.tensor)
             if consumer_mode:
                 modes.add(str(consumer_mode))
 
@@ -135,7 +137,7 @@ class ClassifyTransportEntries(AIEPass):
         if entry.consumers:
             consumer = entry.consumers[0].consumer
             inst = ctx.ir.execution.get(consumer.name)
-            return int(inst.config.ports.inputs[entry.tensor].count)
+            return int(inst.ports.inputs[entry.tensor].count)
         if entry.graph_output:
             return int(producer_ports)
         raise ValueError(f'{entry.tensor}: entry has neither consumers nor graph_output.')

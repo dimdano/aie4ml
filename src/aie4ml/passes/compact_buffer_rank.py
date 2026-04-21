@@ -41,15 +41,15 @@ class CompactBufferRank(AIEPass):
                 continue
 
             if not self._is_legal_to_collapse(desc_entries, drop_axes):
-                self._warn_skip(buf, 'descriptor offsets/tiling/traversal prevent legal rank compaction')
+                self._warn_skip(buf, 'descriptor prevent legal rank compaction')
                 continue
 
             old_buf_dim = [int(x) for x in buf['dimension']]
             factor = int(prod(old_buf_dim[a] for a in drop_axes))
 
-            indep_dims = {indep for _feat, indep in axis_pairs}
-            if len(indep_dims) == 1:
-                merge_axis = next(iter(indep_dims))
+            outer_dims = {indep for _feat, indep in axis_pairs}
+            if len(outer_dims) == 1:
+                merge_axis = next(iter(outer_dims))
             elif factor == 1:
                 merge_axis = 1
             else:
@@ -74,19 +74,21 @@ class CompactBufferRank(AIEPass):
     def _axis_pairs(self, descriptors, rank: int):
         pairs = []
         for desc in descriptors:
-            if 'feature_dimension' not in desc or 'independent_dimension' not in desc:
+            if 'inner_dimension' not in desc or 'outer_dimension' not in desc:
                 return None
 
-            feat_dim = int(desc['feature_dimension'])
-            indep_dim = int(desc['independent_dimension'])
+            inner_dim = int(desc['inner_dimension'])
+            outer_dim = int(desc['outer_dimension'])
 
-            if feat_dim >= rank or indep_dim >= rank or feat_dim == indep_dim:
-                raise ValueError(f'Invalid axes for collapse: feat={feat_dim}, indep={indep_dim}, rank={rank}')
+            if inner_dim >= rank or outer_dim >= rank or inner_dim == outer_dim:
+                raise ValueError(
+                    f'Invalid axes for collapse: inner_dim={inner_dim}, outer_dim={outer_dim}, rank={rank}'
+                )
 
-            if {feat_dim, indep_dim} != {0, 1}:
+            if {inner_dim, outer_dim} != {0, 1}:
                 return None
 
-            pairs.append((feat_dim, indep_dim))
+            pairs.append((inner_dim, outer_dim))
 
         return pairs
 

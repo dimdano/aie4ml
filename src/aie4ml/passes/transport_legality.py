@@ -1,15 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Sequence
+from typing import Sequence
 
-
-def normalized_direct_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
-    if desc is None:
-        return None
-    data = {k: v for k, v in desc.items() if k not in ('access', 'boundary_dimension')}
-    if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
-        data['boundary_dimension'] = data['io_boundary_dimension']
-    return data
+from ..op_impls.utils.io import normalized_staging
 
 
 def direct_transport_supported(
@@ -23,6 +16,13 @@ def direct_transport_supported(
     if src_inst is None or dst_inst is None:
         raise RuntimeError(f'{tensor_name}: direct transport legality requires resolved execution instances.')
 
+    tc = ctx.ir.execution.tensor_contracts.get(tensor_name)
+    if tc is not None:
+        if len(producer_ports) != len(tc.port_staging) or len(consumer_ports) != len(tc.port_staging):
+            return False
+        if src_inst.io_views.get(tensor_name) is None or dst_inst.io_views.get(tensor_name) is None:
+            return False
+
     for p_port, c_port in zip(producer_ports, consumer_ports):
         src_desc = src_inst.variant.describe_output_staging(producer, src_inst.config, tensor_name, int(p_port), None)
         dst_desc = dst_inst.variant.describe_input_staging(
@@ -33,6 +33,6 @@ def direct_transport_supported(
             None,
             producer,
         )
-        if normalized_direct_staging(src_desc) != normalized_direct_staging(dst_desc):
+        if normalized_staging(src_desc) != normalized_staging(dst_desc):
             return False
     return True

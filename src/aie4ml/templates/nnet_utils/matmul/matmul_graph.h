@@ -58,21 +58,21 @@ public:
 
       adf::location<adf::buffer>(kk[idx].in[0]) = {
         adf::bank(memCol, memRow, 0),
-        adf::bank(memCol, memRow, 2)
-      };
-
-      adf::location<adf::buffer>(kk[idx].in[1]) = {
-        adf::bank(memCol, memRow, 1),
         adf::bank(memCol, memRow, 3)
       };
 
+      adf::location<adf::buffer>(kk[idx].in[1]) = {
+        adf::bank(tileCol, memRow, 1),
+        adf::bank(tileCol, memRow, 2)
+      };
+
       // Stack shares one B bank, but let compiler choose the offset.
-      adf::location<adf::stack>(kk[idx]) = adf::bank(memCol, memRow, 1);
+      adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, memRow, 1);
 
       if (is_last) {
         adf::location<adf::buffer>(kk[idx].out[0]) = {
           adf::bank(tileCol, tileRow, 0),
-          adf::bank(tileCol, tileRow, 2)
+          adf::bank(tileCol, tileRow, 3)
         };
       }
     }

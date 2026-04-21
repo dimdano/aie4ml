@@ -63,7 +63,7 @@ class AIEBackend(Backend):
         custom_dense_attrs = [
             ConfigurableAttribute('cas_num', default=-1),
             ConfigurableAttribute('cas_length', default=-1),
-            ConfigurableAttribute('tiling', value_type=dict, default={}),
+            ConfigurableAttribute('microtiling', value_type=dict, default={}),
             Attribute('placement', value_type=dict, default={}, configurable=True),
         ]
         for attr in custom_dense_attrs:
@@ -122,8 +122,8 @@ class AIEBackend(Backend):
 
     @layer_optimizer(Dense)
     def init_dense_defaults(self, layer):
-        if layer.get_attr('tiling', None) is None:
-            layer.set_attr('tiling', {})
+        if layer.get_attr('microtiling', None) is None:
+            layer.set_attr('microtiling', {})
         if layer.get_attr('placement', None) is None:
             layer.set_attr('placement', {})
 

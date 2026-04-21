@@ -1,21 +1,15 @@
-from .base import (
-    OpImplConfig,
-    OpImplFootprint,
-    OpImplPlacementContext,
-    OpImplSelectionContext,
-    OpImplVariant,
-)
+from .base import OpImplFootprint, OpImplVariant
 from .common_types import PortBinding, PortMap
+from .family_registry import FamilyResolverRegistry, get_family_resolver_registry
 from .registry import OpImplRegistry, get_op_impl_registry
 
 __all__ = [
-    'OpImplConfig',
+    'FamilyResolverRegistry',
     'OpImplFootprint',
-    'OpImplPlacementContext',
     'OpImplRegistry',
-    'OpImplSelectionContext',
     'OpImplVariant',
     'PortBinding',
     'PortMap',
+    'get_family_resolver_registry',
     'get_op_impl_registry',
 ]

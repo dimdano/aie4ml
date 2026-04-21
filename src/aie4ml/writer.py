@@ -51,7 +51,6 @@ class AIEProjectEmitter:
             if inst is None:
                 continue
 
-            op_impl_cfg = inst.config
             variant = inst.variant
 
             if node.name not in placements:
@@ -67,7 +66,13 @@ class AIEProjectEmitter:
                 'inst_name': sanitized_name,
                 'op_impl_name': sanitized_name,
                 'struct_name': f'L{layer_index}Cfg',
-                'op_impl': op_impl_cfg,
+                'op_impl': {
+                    'graph_header': inst.graph_header,
+                    'graph_name': inst.graph_name,
+                    'param_template': inst.param_template,
+                    'parameters': variant.build_template_params(node, inst.config),
+                },
+                'io_views': inst.io_views,
                 'placement': placement,
                 'artifacts': artifacts,
             }

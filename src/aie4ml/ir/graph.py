@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 
-from ..aie_types import AIEDataType, PrecisionIntent
+from ..aie_types import PrecisionIntent
 
 if TYPE_CHECKING:  # pragma: no cover - runtime circular import guard
     from ..op_impls import OpImplVariant
@@ -33,57 +33,12 @@ class TensorVar:
         return self.data is not None
 
 
-@dataclass
-class ResolvedAttributes:
-    """Bundle of fully resolved attributes consumed by downstream passes."""
-
-    tiling: Dict[str, int] = field(default_factory=dict)
-    slices: Dict[str, int] = field(default_factory=dict)
-    numeric: Dict[str, AIEDataType] = field(default_factory=dict)
-    parallelism: Dict[str, int] = field(default_factory=dict)
-    pack: Dict[str, Any] = field(default_factory=dict)
-    flags: Dict[str, Any] = field(default_factory=dict)
-    scalars: Dict[str, Any] = field(default_factory=dict)
-    io_route: Dict[str, Any] = field(default_factory=dict)
-    ports: Dict[str, Dict[Tuple[str, int], List[Dict[str, Any]]]] = field(
-        default_factory=lambda: {'inputs': {}, 'outputs': {}}
-    )
-
-    def copy(self) -> 'ResolvedAttributes':
-        return ResolvedAttributes(
-            tiling=dict(self.tiling),
-            slices=dict(self.slices),
-            numeric=dict(self.numeric),
-            parallelism=dict(self.parallelism),
-            pack=dict(self.pack),
-            flags=dict(self.flags),
-            scalars=dict(self.scalars),
-            io_route={k: _deep_copy(v) for k, v in self.io_route.items()},
-            ports=_copy_ports(self.ports),
-        )
-
-    def ensure_keys(self, keys: Iterable[str], namespace: str) -> None:
-        for key in keys:
-            if key not in self.__dict__ or self.__dict__[key] in (None, {}):
-                raise RuntimeError(f'Missing required {namespace} attribute "{key}" for resolved IR node.')
-
-
 def _deep_copy(value: Any) -> Any:
     if isinstance(value, dict):
         return {k: _deep_copy(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_deep_copy(v) for v in value]
     return value
-
-
-def _copy_ports(
-    ports: Dict[str, Dict[Tuple[str, int], List[Dict[str, Any]]]],
-) -> Dict[str, Dict[Tuple[str, int], List[Dict[str, Any]]]]:
-    copied: Dict[str, Dict[Tuple[str, int], List[Dict[str, Any]]]] = {'inputs': {}, 'outputs': {}}
-    for direction in ('inputs', 'outputs'):
-        for key, desc_list in ports.get(direction, {}).items():
-            copied[direction][key] = [_deep_copy(desc) for desc in desc_list]
-    return copied
 
 
 @dataclass
@@ -259,13 +214,34 @@ class LogicalIR:
         return len(self.nodes)
 
 
+STAGING_CONTRACTS: frozenset = frozenset({'outer', 'inner'})
+"""Compiler-wide vocabulary of valid 2D execution partition-axis contracts."""
+
+
+@dataclass(frozen=True)
+class TensorContract:
+    """Resolved execution contract for a single tensor edge.
+
+    Used by downstream resolvers to inherit compatible partitioning and staging.
+    """
+
+    contract: str  # 'outer' | 'inner'
+    port_staging: Tuple[Dict[str, Any], ...]
+
+
 @dataclass
-class OpImplInstance:
-    """Materialized implementation selection for a logical node."""
+class ExecutionEntry:
+    """Materialized execution selection for a logical node."""
 
     node: OpNode
     variant: 'OpImplVariant'
+    ports: Any
+    io_route: Dict[str, Any]
+    io_views: Dict[str, Any]
     config: Any
+    graph_header: str
+    graph_name: str
+    param_template: str
     artifacts: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -277,27 +253,48 @@ class OpImplInstance:
         return self.node.op_type
 
 
+OpImplInstance = ExecutionEntry
+
+
 @dataclass
 class ExecutionIR:
     """Container for selected implementation instances derived from logical nodes."""
 
-    instances: Dict[str, OpImplInstance] = field(default_factory=dict)
+    instances: Dict[str, ExecutionEntry] = field(default_factory=dict)
+    tensor_contracts: Dict[str, TensorContract] = field(default_factory=dict)
 
     def register(
         self,
         node: OpNode,
         variant: 'OpImplVariant',
+        ports: Any,
+        io_route: Dict[str, Any],
+        io_views: Dict[str, Any],
         config: Any,
-    ) -> OpImplInstance:
-        inst = OpImplInstance(node=node, variant=variant, config=config)
+        graph_header: str,
+        graph_name: str,
+        param_template: str,
+    ) -> ExecutionEntry:
+        inst = ExecutionEntry(
+            node=node,
+            variant=variant,
+            ports=ports,
+            io_route=io_route,
+            io_views=io_views,
+            config=config,
+            graph_header=graph_header,
+            graph_name=graph_name,
+            param_template=param_template,
+        )
         self.instances[node.name] = inst
         return inst
 
-    def get(self, name: str) -> Optional[OpImplInstance]:
+    def get(self, name: str) -> Optional[ExecutionEntry]:
         return self.instances.get(name)
 
     def clear(self) -> None:
         self.instances.clear()
+        self.tensor_contracts.clear()
 
     def prune(self, active_names: Iterable[str]) -> bool:
         keep = set(active_names)

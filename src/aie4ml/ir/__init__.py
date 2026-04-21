@@ -11,12 +11,12 @@ from .context import (
 )
 from .graph import (
     AIEPipelineIR,
+    ExecutionEntry,
     ExecutionIR,
     LogicalIR,
     OpImplInstance,
     OpNode,
     PhysicalIR,
-    ResolvedAttributes,
     TensorVar,
     TraitInstance,
     input_role,
@@ -27,6 +27,7 @@ from .graph import (
 __all__ = [
     'AIEBackendContext',
     'AIEPipelineIR',
+    'ExecutionEntry',
     'ExecutionIR',
     'input_role',
     'input_role_map',
@@ -38,7 +39,6 @@ __all__ = [
     'TensorVar',
     'BackendPolicies',
     'DeviceSpec',
-    'ResolvedAttributes',
     'TraitDefinition',
     'TraitInstance',
     'TraitRegistry',

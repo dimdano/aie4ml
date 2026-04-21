@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .aie_types import QuantIntent
-from .ir.graph import OpImplInstance, OpNode
+from .ir.graph import ExecutionEntry, OpNode
+from .op_impls.common_types import to_plain
 
 
 def dump_pipeline_ir(ctx, destination: Path) -> None:
@@ -59,11 +60,17 @@ def _serialize_quant_metadata(quant_meta: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def serialize_op_impl_instance(inst: OpImplInstance) -> Dict[str, Any]:
+def serialize_op_impl_instance(inst: ExecutionEntry) -> Dict[str, Any]:
     return {
         'node': inst.name,
         'variant_id': inst.variant.variant_id,
-        'op_impl_config': inst.config.to_dict(),
+        'ports': to_plain(inst.ports),
+        'io_route': to_plain(inst.io_route),
+        'io_views': to_plain(inst.io_views),
+        'graph_header': inst.graph_header,
+        'graph_name': inst.graph_name,
+        'param_template': inst.param_template,
+        'config': to_plain(inst.config),
         # "input_staging": inst.variant.describe_input_staging(inst),
         # "output_staging": inst.variant.describe_output_staging(inst),
         # TODO: serialize implementation artifacts (weights, LUTs, etc.)

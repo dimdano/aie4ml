@@ -1,130 +1,100 @@
-# Copyright 2025 D. Danopoulos, aie4ml
-# SPDX-License-Identifier: Apache-2.0
-
-"""Resolve per-layer AIE attributes using policy-driven resolver pipelines."""
-
 from __future__ import annotations
 
-import logging
-
-from ..ir import ResolvedAttributes, get_backend_context
-from ..op_impls import OpImplSelectionContext, get_op_impl_registry
+from ..ir import get_backend_context
+from ..ir.graph import TensorContract
+from ..op_impls import get_family_resolver_registry
+from ..op_impls.utils.io import ensure_io_view, normalized_staging, resolve_io_route
 from .base import AIEPass
-from .resolve_registry import LayerResolveContext, get_layer_policy
-
-log = logging.getLogger(__name__)
 
 
-def _quant_meta(node) -> dict:
-    """Collect resolver quant metadata from lowering-provided quant bindings."""
-    bindings = node.metadata.get('quant_bindings')
-    if not isinstance(bindings, dict):
-        raise RuntimeError(f'{node.name}: missing quant_bindings metadata.')
-
-    meta: dict = {}
-
-    output_index = bindings.get('output')
-    if output_index is not None:
-        if not isinstance(output_index, int) or output_index < 0 or output_index >= len(node.outputs):
-            raise RuntimeError(f'{node.name}: invalid quant output binding {output_index}.')
-        meta['output_precision'] = node.outputs[output_index].precision
-
-    input_bindings = bindings.get('inputs', {})
-    if not isinstance(input_bindings, dict):
-        raise RuntimeError(f'{node.name}: invalid quant input bindings metadata.')
-
-    for role, index in input_bindings.items():
-        if not isinstance(role, str):
-            raise RuntimeError(f'{node.name}: invalid quant input role {role!r}.')
-        if not isinstance(index, int) or index < 0 or index >= len(node.inputs):
-            raise RuntimeError(f'{node.name}: invalid quant binding for role {role}: {index}.')
-        meta[f'{role}_precision'] = node.inputs[index].precision
-
-    return meta
+def _propagate_contracts(ctx, node, inst, config) -> None:
+    """
+    Propagates TensorContracts from producer outputs to consumer inputs based on the resolved execution entry.
+    Requires LogicalIR.nodes to be in producer-before-consumer (topological) order.
+    """
+    for tensor in node.outputs:
+        contract = inst.variant.output_staging_contract(node, config, tensor.name)
+        if contract is None:
+            continue
+        port_count = inst.variant.output_port_count(node, config)
+        ctx.ir.execution.tensor_contracts[tensor.name] = TensorContract(
+            contract=contract,
+            port_staging=tuple(
+                normalized_staging(inst.variant.describe_output_staging(node, config, tensor.name, port, None))
+                for port in range(int(port_count))
+            ),
+        )
 
 
-def resolve_aie_attributes(ctx, node) -> ResolvedAttributes:
-    """Run the registered resolver pipeline for the given IR node."""
+def _resolved_input_contracts(ctx, node) -> dict[str, TensorContract]:
+    return {
+        tensor.name: ctx.ir.execution.tensor_contracts[tensor.name]
+        for tensor in node.inputs
+        if tensor.name in ctx.ir.execution.tensor_contracts
+    }
 
-    layer_class = node.metadata.get('layer_class')
-    policy = get_layer_policy(layer_class)
-    layer_name = node.metadata['source_layer']
-    attributes = ResolvedAttributes()
 
-    context = LayerResolveContext(
-        backend_ctx=ctx,
-        node=node,
-        layer_name=layer_name,
-        layer_class=layer_class,
-        policy=policy,
-        quant=_quant_meta(node),
-        device=ctx.device,
-        attributes=attributes,
+def _same_execution_entry(inst, variant, ports, config) -> bool:
+    return (
+        inst.variant.variant_id == variant.variant_id
+        and inst.ports == ports
+        and inst.io_route == config.io_route
+        and inst.io_views == config.io_views
+        and inst.config == config
+        and inst.graph_header == variant.graph_header
+        and inst.graph_name == variant.graph_name
+        and inst.param_template == variant.param_template
     )
-
-    for resolver in policy.resolvers:
-        resolver(context)
-
-    if ctx.policies.pack:
-        pack_policy = ctx.policies.pack
-        attributes.pack.setdefault(
-            'policy',
-            dict(pack_policy) if isinstance(pack_policy, dict) else pack_policy,
-        )
-    if ctx.policies.cache:
-        cache_policy = ctx.policies.cache
-        attributes.pack.setdefault(
-            'cache',
-            dict(cache_policy) if isinstance(cache_policy, dict) else cache_policy,
-        )
-
-    for namespace in policy.namespaces:
-        attr_value = getattr(attributes, namespace, None)
-        if attr_value is None or (isinstance(attr_value, dict) and not attr_value):
-            raise RuntimeError(
-                f'{layer_name}: resolver pipeline did not populate required attribute namespace "{namespace}".'
-            )
-
-    return attributes
 
 
 class Resolve(AIEPass):
-    """Derive per-layer resolved attributes via the registered resolver pipeline."""
+    """Resolve logical nodes into family-owned execution entries."""
 
     def __init__(self):
         self.name = 'resolve'
-        self._registry = get_op_impl_registry()
+        self._registry = get_family_resolver_registry()
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         changed = False
         visited = set()
+
+        ctx.ir.execution.tensor_contracts.clear()
+
         for node in ctx.ir.logical:
             if node.metadata['layer_class'] == 'Input':
                 continue
 
-            resolved = resolve_aie_attributes(ctx, node)
-            selection_ctx = OpImplSelectionContext(
-                node=node,
-                attributes=resolved,
-                device_generation=ctx.device.generation,
-                metadata=dict(node.metadata),
-            )
-            variant = self._registry.select(selection_ctx)
-            if variant is None:
-                raise RuntimeError(f'{node.name}: no implementation variant satisfies resolved attributes.')
+            resolver = self._registry.get(node.op_type)
+            ensure_io_view(node, ctx.device.generation)
 
-            kernel_cfg = variant.build_config(selection_ctx)
-            variant.validate_config(selection_ctx, kernel_cfg)
+            resolved_directives = dict(node.directives or {})
+            resolved_directives['io_route'] = resolve_io_route(node)  # user intents
+            resolved_directives['input_contracts'] = _resolved_input_contracts(ctx, node)
+
+            config = resolver.resolve(node, ctx.device, resolved_directives)
+            variant = resolver.select_variant(config, ctx.device.generation)
+            variant.validate_config(node, config, ctx.device)
+            ports = variant.build_ports(node, config)
+
             inst = ctx.ir.execution.get(node.name)
-            if inst is not None:
-                same_variant = inst.variant.variant_id == variant.variant_id
-                same_cfg = inst.config == kernel_cfg
-                if same_variant and same_cfg:
-                    visited.add(node.name)
-                    continue
+            if inst is not None and _same_execution_entry(inst, variant, ports, config):
+                _propagate_contracts(ctx, node, inst, inst.config)
+                visited.add(node.name)
+                continue
 
-            ctx.ir.execution.register(node, variant, kernel_cfg)
+            inst = ctx.ir.execution.register(
+                node=node,
+                variant=variant,
+                ports=ports,
+                io_route=dict(config.io_route),
+                io_views=config.io_views,
+                config=config,
+                graph_header=variant.graph_header,
+                graph_name=variant.graph_name,
+                param_template=variant.param_template,
+            )
+            _propagate_contracts(ctx, node, inst, config)
             visited.add(node.name)
             changed = True
 
