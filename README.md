@@ -11,7 +11,14 @@
 
 - Current hardware targets: AIE-ML and AIE-MLv2 devices.
 - Current frontend paths: ONNX for explicit operator graphs, and an optional [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) frontend path.
-- Current operator support: Dense/Linear, ReLU, Matrix Multiplication, Elementwise Add, quantized LayerNorm, Permute, graph branch/fanout, and quantized Softmax.
+
+## Current Support
+
+aie4ml currently supports Dense/GEMM, dynamic MatMul, Elementwise Add, quantized LayerNorm, HCCS Softmax, final-two-axis
+Permute, Split/Slice, Concat, fanout, and fused ReLU across AIE-ML and AIE-MLv2 devices.
+
+See the [operator and feature support matrix](docs/support.md) for supported precisions, frontend coverage, tensor and
+transport contracts, and current limitations.
 
 ## Prerequisites
 
