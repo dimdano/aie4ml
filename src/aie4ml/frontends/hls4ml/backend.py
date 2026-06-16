@@ -181,8 +181,13 @@ class AIEBackend(Backend):
         namespace=None,
         write_tar=False,
         compute_dtype=None,
+        target='aie',
         **_,
     ):
+        if str(target).lower() not in ('aie', 'hardware'):
+            raise ValueError(f"target must be 'aie' or 'hardware', got {target!r}.")
+        target = str(target).lower()
+
         device_info = copy.deepcopy(self._get_device_info(part))
 
         def _require(key):
@@ -210,6 +215,7 @@ class AIEBackend(Backend):
                 'PLClockFreqMHz': pl_freq,
                 'BatchSize': batch_size,
                 'Iterations': iterations,
+                'Target': target,
                 'Memory': device_info.get('Memory'),
                 'MaxMemTileInPorts': int(device_info['MaxMemTileInPorts']),
                 'MaxMemTileOutPorts': int(device_info['MaxMemTileOutPorts']),

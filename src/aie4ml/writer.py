@@ -35,6 +35,13 @@ class AIEProjectEmitter:
         self._copy_kernel_sources(output_dir, ctx.project_config.custom_sources)
         self._render_templates(output_dir, ctx, layers, graph_plan, env)
 
+        # PL data mover + XRT host are emitted only for target='hardware' (default 'aie' is
+        # AIE-only). Gated so the existing AIE/sim flow is completely unaffected.
+        from .system_plan import emits_system
+
+        if emits_system(ctx):
+            self._render_system_templates(output_dir, ctx, env)
+
     def _prepare_directories(self, output_dir: Path):
         (output_dir / 'src').mkdir(parents=True, exist_ok=True)
         (output_dir / 'src' / 'kernels').mkdir(exist_ok=True)
@@ -134,6 +141,8 @@ class AIEProjectEmitter:
             path.unlink()
 
     def _render_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment):
+        from .system_plan import emits_system
+
         context = {
             'layers': layers,
             'graph_plan': graph_plan,
@@ -142,6 +151,10 @@ class AIEProjectEmitter:
             'pl_freq_mhz': float(ctx.aie_config['PLClockFreqMHz']),
             'stamp': ctx.project_config.stamp,
             'platform': ctx.device.platform,
+            # The unified Makefile adds PL/host/package targets when this project was
+            # emitted for hardware; aie-only projects render just the AIE/sim flow.
+            'is_hardware': emits_system(ctx),
+            'project_name': ctx.project_config.project_name,
         }
 
         self._render_template(env, 'Makefile.jinja', output_dir / 'Makefile', context)
@@ -150,6 +163,33 @@ class AIEProjectEmitter:
         self._render_template(env, 'parameters.h.jinja', output_dir / 'src' / 'parameters.h', context)
         self._render_template(env, 'top_graph.h.jinja', output_dir / 'src' / 'top_graph.h', context)
         self._render_template(env, 'app.cpp.jinja', output_dir / 'app.cpp', context)
+
+    def _render_system_templates(self, output_dir: Path, ctx, env: Environment):
+        """Render the PL data mover + v++ connectivity + XRT host (target='hardware').
+
+        Templates live under templates/firmware/ (pl/, host/, system.cfg.jinja) and are
+        rendered with the shared firmware Jinja environment.
+        """
+        from .system_plan import build_system_io
+
+        system_io = build_system_io(ctx)
+
+        (output_dir / 'pl').mkdir(parents=True, exist_ok=True)
+        (output_dir / 'host').mkdir(parents=True, exist_ok=True)
+
+        self._render_template(
+            env, 'pl/ddr_pl_aie_datamover.cpp.jinja', output_dir / 'pl' / 'ddr_pl_aie_datamover.cpp', system_io
+        )
+        self._render_template(
+            env, 'pl/ddr_pl_aie_datamover.cfg.jinja', output_dir / 'pl' / 'ddr_pl_aie_datamover.cfg', system_io
+        )
+        self._render_template(env, 'system.cfg.jinja', output_dir / 'system.cfg', system_io)
+        self._render_template(env, 'host/host.cpp.jinja', output_dir / 'host' / 'host.cpp', system_io)
+
+        # DDR-packed input header (data.h) consumed by host.cpp.
+        from .system_plan import write_host_data_header
+
+        write_host_data_header(ctx, output_dir)
 
     def _render_template(self, env: Environment, template_name: str, destination: Path, context: dict):
         template = env.get_template(template_name)

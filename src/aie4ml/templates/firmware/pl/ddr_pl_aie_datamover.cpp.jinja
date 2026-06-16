@@ -1,0 +1,362 @@
+/*
+Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
+SPDX-License-Identifier: X11
+
+Three-phase ddr_pl_aie_datamover (v3) -- preload + AIE compute + postwrite.
+GENERATED from templates/ddr_pl_aie_datamover.cpp.j2 -- do not edit by hand.
+
+Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }},
+        {{ n_ifm }} IFM PLIO + {{ n_ofm }} OFM PLIO).
+
+Top-level HLS DATAFLOW has only THREE processes:
+   tick_gen
+   preload_and_send_proc    -- preload all IFM to URAM, then drain to PLIO
+   recv_and_postwrite_proc  -- receive all OFM from PLIO to URAM, then store
+
+Each merged function owns its own LOCAL URAM buffers; nothing crosses the
+DATAFLOW boundary except the PLIO streams + trigger streams. Contiguous 512-bit
+DDR words are striped round-robin across the N per-direction buffers (word i ->
+stream i % N, row i / N); with N=1 this collapses to a plain contiguous copy.
+
+Within each merged function the phases are sequential by C++ semantics:
+   preload_and_send_proc:
+       preload_phase()    -- DRAM read into big_in_{0..N_IFM-1}
+       trig_preload_done.write(true)
+       send_phase()       -- big_in -> {{ n_ifm }} PLIO_ifm stream(s)
+   recv_and_postwrite_proc:
+       recv_phase()       -- {{ n_ofm }} PLIO_ofm stream(s) -> big_out_{0..N_OFM-1}
+       trig_compute_done.write(true)
+       postwrite_phase()  -- big_out -> DRAM write
+
+The AIE+PLIO compute pipeline overlaps naturally between the send phase of
+the first function and the recv phase of the second function.
+*/
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+
+static const int N_IFM_STREAMS      = {{ n_ifm }};
+static const int N_OFM_STREAMS      = {{ n_ofm }};
+static const int MAX_512_PER_STREAM = {{ max_512_per_stream }};
+// Compile-time cap on n_iter -- sizes the local URAM buffers. This design
+// preloads ALL n_iter iters on-chip; MAX_N_ITER bounds the URAM footprint.
+static const int MAX_N_ITER         = {{ max_n_iter }};
+static const int MAX_BIG_IN         = MAX_512_PER_STREAM * MAX_N_ITER;
+static const int MAX_BIG_OUT        = MAX_512_PER_STREAM * MAX_N_ITER;
+
+// ---------------------------------------------------------------------------
+// Free-running PL-clock counter -- parallel dataflow process.
+//
+// Owns one free-running cycle counter `t` (incremented once per PL clock at
+// II=1). Each input is a one-shot event FIFO written by one of the two worker
+// processes; on the FIRST token seen, tick_gen latches the current `t` into the
+// matching cycles_* output. stop_sig ends the loop. All cycles_* are s_axilite
+// registers read back by the host. Every timestamp is relative to the common
+// DATAFLOW start (cycle 0 = ap_start), so differences give phase durations.
+// ---------------------------------------------------------------------------
+static void tick_gen(
+        // ---- event triggers IN (depth-2 bool FIFOs, one-shot) ----
+        hls::stream<bool>& trig_preload_done, // Phase 1 done -- all iters loaded DDR->URAM
+        hls::stream<bool>& trig_first_send,   // first PLIO_ifm beat issued (iter0) = start of compute
+        hls::stream<bool>& trig_last_send,    // last PLIO_ifm beat of iter0 issued
+        hls::stream<bool>& trig_first_recv,   // first PLIO_ofm beat received (iter0)
+        hls::stream<bool>& trig_last_recv,    // last PLIO_ofm beat of iter0 received
+        hls::stream<bool>& trig_compute_done, // Phase 2b done -- all iters drained PLIO_ofm->URAM
+        hls::stream<bool>& stop_sig,          // Phase 3 done -- all iters URAM->DDR; STOPS the counter
+        // ---- latched timestamps OUT (s_axilite regs, read by host) ----
+        ap_uint<64>* cycles_preload_done,     // t @ preload_done  -- end of preload
+        ap_uint<64>* cycles_first_send,       // t @ first_send    -- preload->compute boundary (host partitions here)
+        ap_uint<64>* cycles_last_send,        // t @ last_send     -- iter0 input fully streamed out
+        ap_uint<64>* cycles_first_recv,       // t @ first_recv    -- iter0 first AIE output returned
+        ap_uint<64>* cycles_last_recv,        // t @ last_recv     -- iter0 last AIE output returned
+        ap_uint<64>* cycles_compute_done,     // t @ compute_done  -- compute->postwrite boundary
+        ap_uint<64>* cycles_total) {          // final t @ stop    -- datamover total wall cycles
+    ap_uint<64> t = 0;
+    ap_uint<64> pd_t = 0, fs_t = 0, ls_t = 0, fr_t = 0, lr_t = 0, cd_t = 0;
+    bool pd_cap = false, fs_cap = false, ls_cap = false,
+         fr_cap = false, lr_cap = false, cd_cap = false;
+    bool stop = false;
+
+    while (!stop) {
+    #pragma HLS PIPELINE II=1
+        bool req;
+        if (!pd_cap && trig_preload_done.read_nb(req)) { pd_t = t; pd_cap = true; }
+        if (!fs_cap && trig_first_send.read_nb(req))   { fs_t = t; fs_cap = true; }
+        if (!ls_cap && trig_last_send.read_nb(req))    { ls_t = t; ls_cap = true; }
+        if (!fr_cap && trig_first_recv.read_nb(req))   { fr_t = t; fr_cap = true; }
+        if (!lr_cap && trig_last_recv.read_nb(req))    { lr_t = t; lr_cap = true; }
+        if (!cd_cap && trig_compute_done.read_nb(req)) { cd_t = t; cd_cap = true; }
+        if (stop_sig.read_nb(req)) {
+            stop = true;
+        }
+        t++;
+    }
+    *cycles_preload_done = pd_t;
+    *cycles_first_send   = fs_t;
+    *cycles_last_send    = ls_t;
+    *cycles_first_recv   = fr_t;
+    *cycles_last_recv    = lr_t;
+    *cycles_compute_done = cd_t;
+    *cycles_total        = t;
+}
+
+// ---------------------------------------------------------------------------
+// preload_and_send_proc: merged process owning {{ n_ifm }} local URAM IFM buffer(s).
+//   Phase 1: read all n_iter iters of IFM from DRAM into big_in_{0..{{ n_ifm - 1 }}}
+//   trig_preload_done
+//   Phase 2: drain big_in to {{ n_ifm }} PLIO_ifm stream(s) (all n_iter iters)
+// ---------------------------------------------------------------------------
+static void preload_and_send_proc(ap_uint<512>* mem_in,
+{% for s in range(n_ifm) %}
+                                  hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
+{% endfor %}
+                                  int size_in, int n_iter,
+                                  hls::stream<bool>& trig_preload_done,
+                                  hls::stream<bool>& trig_first_send,
+                                  hls::stream<bool>& trig_last_send) {
+    // Local URAM buffers -- never leave this function.
+{% for s in range(n_ifm) %}
+    ap_uint<512> big_in_{{ s }}[MAX_BIG_IN];
+{% endfor %}
+{% for s in range(n_ifm) %}
+    #pragma HLS bind_storage variable=big_in_{{ s }} type=RAM_2P impl=URAM
+{% endfor %}
+
+    const int n_in_total_512      = size_in / 16;
+    const int n_in_512_per_stream = n_in_total_512 / N_IFM_STREAMS;
+
+    // Scheduling anchor for the preload-done marker (see the write below).
+    ap_uint<512> preload_anchor = 0;
+
+    // ---- Phase 1: preload from DDR into the URAM buffer(s) ----
+    // Contiguous 512-bit words are striped round-robin: word i -> stream
+    // i % N_IFM_STREAMS, row i / N_IFM_STREAMS. So each big_in is written once in
+    // preload and read once in send -- a simple single-port RAM, no ping-pong.
+    for (int iter = 0; iter < n_iter; iter++) {
+        int dram_base = iter * n_in_total_512;
+        int bram_base = iter * n_in_512_per_stream;
+        for (int i = 0; i < n_in_total_512; i++) {
+        #pragma HLS PIPELINE II=1
+            ap_uint<512> w = mem_in[dram_base + i];
+            int row_slot   = bram_base + (i / N_IFM_STREAMS);
+            int stream_sel = i % N_IFM_STREAMS;
+{% for s in range(n_ifm) %}
+            {{ "if" if loop.first else "} else if" }} (stream_sel == {{ s }}) {
+                big_in_{{ s }}[row_slot] = w;
+{% endfor %}
+            }
+            // Fold every loaded word into a running token. This is purely a
+            // scheduling anchor: it gives the trig_preload_done.write() below a
+            // real data dependence on the last mem_in read, so HLS cannot hoist
+            // the marker to ~cycle 1. tick_gen ignores the value -- it only
+            // timestamps the trigger's arrival.
+            preload_anchor ^= w;
+        }
+    }
+    // Fires only after the preload loop has truly drained (depends on
+    // preload_anchor). The boolean value itself is irrelevant to tick_gen.
+    trig_preload_done.write(preload_anchor != 0);
+
+    // ---- Phase 2a: send from URAM to PLIO_ifm ----
+    for (int iter = 0; iter < n_iter; iter++) {
+        bool is_iter0 = (iter == 0);
+        if (is_iter0) {
+            trig_first_send.write(true);
+        }
+
+        int base = iter * n_in_512_per_stream;
+        for (int row_slot = 0; row_slot < n_in_512_per_stream; row_slot++) {
+{% for s in range(n_ifm) %}
+            ap_uint<512> w{{ s }} = big_in_{{ s }}[base + row_slot];
+{% endfor %}
+
+            for (int j = 0; j < 4; j++) {
+            #pragma HLS PIPELINE II=1
+{% for s in range(n_ifm) %}
+                ap_axis<128, 0, 0, 0> x{{ s }};
+                x{{ s }}.data = w{{ s }}.range((j+1)*128 - 1, j*128);
+                x{{ s }}.keep = -1;
+{% endfor %}
+                ap_uint<1> tlast = (row_slot == n_in_512_per_stream - 1 && j == 3) ? 1 : 0;
+{% for s in range(n_ifm) %}
+                x{{ s }}.last = tlast;
+                s_out_{{ s }}.write(x{{ s }});
+{% endfor %}
+            }
+        }
+
+        if (is_iter0) {
+            trig_last_send.write(true);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// recv_and_postwrite_proc: merged process owning {{ n_ofm }} local URAM OFM buffer(s).
+//   Phase 2b: drain {{ n_ofm }} PLIO_ofm stream(s) into big_out_{0..{{ n_ofm - 1 }}} (all n_iter iters)
+//   trig_compute_done
+//   Phase 3: write big_out to DDR
+// ---------------------------------------------------------------------------
+static void recv_and_postwrite_proc(
+{% for s in range(n_ofm) %}
+                                    hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
+{% endfor %}
+                                    ap_uint<512>* mem_out,
+                                    int size_out, int n_iter,
+                                    hls::stream<bool>& trig_first_recv,
+                                    hls::stream<bool>& trig_last_recv,
+                                    hls::stream<bool>& trig_compute_done,
+                                    hls::stream<bool>& stop_sig) {
+{% for s in range(n_ofm) %}
+    ap_uint<512> big_out_{{ s }}[MAX_BIG_OUT];
+{% endfor %}
+{% for s in range(n_ofm) %}
+    #pragma HLS bind_storage variable=big_out_{{ s }} type=RAM_2P impl=URAM
+{% endfor %}
+
+    const int n_out_total_512      = size_out / 16;
+    const int n_out_512_per_stream = n_out_total_512 / N_OFM_STREAMS;
+
+    // ---- Phase 2b: recv from PLIO_ofm into URAM ----
+    for (int iter = 0; iter < n_iter; iter++) {
+        bool is_iter0 = (iter == 0);
+        int base = iter * n_out_512_per_stream;
+
+        for (int row_slot = 0; row_slot < n_out_512_per_stream; row_slot++) {
+{% for s in range(n_ofm) %}
+            ap_uint<128> slc_{{ s }}[4];
+{% endfor %}
+{% for s in range(n_ofm) %}
+            #pragma HLS ARRAY_PARTITION variable=slc_{{ s }} complete dim=1
+{% endfor %}
+
+            for (int j = 0; j < 4; j++) {
+            #pragma HLS PIPELINE II=1
+{% for s in range(n_ofm) %}
+                ap_axis<128, 0, 0, 0> x{{ s }} = s_in_{{ s }}.read();
+                slc_{{ s }}[j] = x{{ s }}.data;
+{% endfor %}
+                if (is_iter0 && row_slot == 0 && j == 0) {
+                    trig_first_recv.write(true);
+                }
+            }
+
+{% for s in range(n_ofm) %}
+            ap_uint<512> w{{ s }};
+            w{{ s }}.range(127,   0) = slc_{{ s }}[0];
+            w{{ s }}.range(255, 128) = slc_{{ s }}[1];
+            w{{ s }}.range(383, 256) = slc_{{ s }}[2];
+            w{{ s }}.range(511, 384) = slc_{{ s }}[3];
+            big_out_{{ s }}[base + row_slot] = w{{ s }};
+{% endfor %}
+        }
+
+        if (is_iter0) {
+            trig_last_recv.write(true);
+        }
+    }
+    // All iters' outputs have been packed into the URAM buffer(s).
+    trig_compute_done.write(true);
+
+    // ---- Phase 3: postwrite from URAM to DDR ----
+    // Outputs are de-striped back to contiguous DDR: word i <- stream
+    // i % N_OFM_STREAMS, row i / N_OFM_STREAMS.
+    for (int iter = 0; iter < n_iter; iter++) {
+        int dram_base = iter * n_out_total_512;
+        int bram_base = iter * n_out_512_per_stream;
+        for (int i = 0; i < n_out_total_512; i++) {
+        #pragma HLS PIPELINE II=1
+            int row_slot   = bram_base + (i / N_OFM_STREAMS);
+            int stream_sel = i % N_OFM_STREAMS;
+            ap_uint<512> w;
+{% for s in range(n_ofm) %}
+            {{ "if" if loop.first else "} else if" }} (stream_sel == {{ s }}) {
+                w = big_out_{{ s }}[row_slot];
+{% endfor %}
+            }
+            mem_out[dram_base + i] = w;
+        }
+    }
+    stop_sig.write(true);
+}
+
+extern "C" {
+
+void ddr_pl_aie_datamover(ap_uint<512>* mem_in,
+           ap_uint<512>* mem_out,
+{% for s in range(n_ifm) %}
+           hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
+{% endfor %}
+{% for s in range(n_ofm) %}
+           hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
+{% endfor %}
+           int size_in, int size_out, int n_iter,
+           ap_uint<64>* cycles_preload_done,
+           ap_uint<64>* cycles_first_send,
+           ap_uint<64>* cycles_last_send,
+           ap_uint<64>* cycles_first_recv,
+           ap_uint<64>* cycles_last_recv,
+           ap_uint<64>* cycles_compute_done,
+           ap_uint<64>* cycles_total) {
+#pragma HLS INTERFACE m_axi port=mem_in  offset=slave bundle=gmem_in \
+    max_read_burst_length=16 num_read_outstanding=16
+#pragma HLS INTERFACE m_axi port=mem_out offset=slave bundle=gmem_out \
+    max_write_burst_length=16 num_write_outstanding=16
+{% for s in range(n_ifm) %}
+#pragma HLS INTERFACE axis port=s_out_{{ s }}
+{% endfor %}
+{% for s in range(n_ofm) %}
+#pragma HLS INTERFACE axis port=s_in_{{ s }}
+{% endfor %}
+#pragma HLS INTERFACE s_axilite port=mem_in              bundle=control
+#pragma HLS INTERFACE s_axilite port=mem_out             bundle=control
+#pragma HLS INTERFACE s_axilite port=size_in             bundle=control
+#pragma HLS INTERFACE s_axilite port=size_out            bundle=control
+#pragma HLS INTERFACE s_axilite port=n_iter              bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_preload_done bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_first_send   bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_last_send    bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_first_recv   bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_last_recv    bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_compute_done bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_total        bundle=control
+#pragma HLS INTERFACE s_axilite port=return              bundle=control
+
+#pragma HLS DATAFLOW
+
+    // Trigger / stop streams.
+    hls::stream<bool, 2> trig_preload_done;
+    hls::stream<bool, 2> trig_first_send;
+    hls::stream<bool, 2> trig_last_send;
+    hls::stream<bool, 2> trig_first_recv;
+    hls::stream<bool, 2> trig_last_recv;
+    hls::stream<bool, 2> trig_compute_done;
+    hls::stream<bool, 2> stop_sig;
+
+    tick_gen(trig_preload_done, trig_first_send, trig_last_send,
+             trig_first_recv, trig_last_recv, trig_compute_done, stop_sig,
+             cycles_preload_done,
+             cycles_first_send, cycles_last_send,
+             cycles_first_recv, cycles_last_recv,
+             cycles_compute_done,
+             cycles_total);
+
+    preload_and_send_proc(mem_in,
+{% for s in range(n_ifm) %}
+                          s_out_{{ s }},
+{% endfor %}
+                          size_in, n_iter,
+                          trig_preload_done, trig_first_send, trig_last_send);
+
+    recv_and_postwrite_proc(
+{% for s in range(n_ofm) %}
+                            s_in_{{ s }},
+{% endfor %}
+                            mem_out,
+                            size_out, n_iter,
+                            trig_first_recv, trig_last_recv, trig_compute_done,
+                            stop_sig);
+}
+
+}
