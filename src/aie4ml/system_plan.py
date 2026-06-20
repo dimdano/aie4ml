@@ -101,27 +101,28 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
             continue
         layer_index += 1
         artifacts = inst.variant.get_artifacts(inst)
-        weights = next((a for a in artifacts if a.get('name') == 'weights'), None)
-        if weights is None:
-            continue  # param-less op (no kernel-resident RTP weights)
-        bias = next((a for a in artifacts if a.get('name') == 'bias'), None)
+        if not artifacts:
+            continue  # param-less op (e.g. activation) -- no kernel-resident RTP
         parallelism = getattr(inst.config, 'parallelism', None)
         if parallelism is None:
-            raise RuntimeError(f'{node.name}: weight-bearing layer has no parallelism config.')
+            raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
         inst_name = sanitize_identifier(node.name)
-        layers.append(
-            {
-                'inst_name': inst_name,
-                'weights_header': weights['filename'],
-                'bias_header': bias['filename'] if bias else None,
-                'weights_prefix': f"{weights['name']}_{inst_name}",
-                'bias_prefix': f"{bias['name']}_{inst_name}" if bias else None,
-                'wts_port': f"{weights['port']}{layer_index}",
-                'bias_port': f"{bias['port']}{layer_index}" if bias else None,
-                'cas_num': int(parallelism.cas_num),
-                'cas_length': int(parallelism.cas_length),
-            }
-        )
+        layers.append({
+            'inst_name': inst_name,
+            'cas_num': int(parallelism.cas_num),
+            'cas_length': int(parallelism.cas_length),
+            'artifacts': [
+                {
+                    'name': a['name'],
+                    'kind': a['kind'],                     # '1d' | '2d' -> RTP loop shape
+                    'header': a['filename'],               # generated header to #include
+                    'prefix': f"{a['name']}_{inst_name}",  # C symbol base (matches header)
+                    'port': f"{a['port']}{layer_index}",   # ADF RTP port (name + layer idx, == app.cpp Lidx)
+                }
+                for a in artifacts
+            ],
+        })
+
 
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1

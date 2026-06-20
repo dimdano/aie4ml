@@ -24,20 +24,17 @@
 // <cstdint> must come first so int8_t/int32_t are defined before the weight arrays.
 #include <cstdint>
 #define __X86SIM__
-{% if layers %}
 {% for L in layers %}
-#include "../src/weights/{{ L.weights_header }}"
-#include "../src/weights/{{ L.bias_header }}"
+{% for spec in L.artifacts %}
+#include "../src/weights/{{ spec.header }}"
 {% endfor %}
-{% else %}
-#include "../src/weights/weights_dense_0_aie.h"
-#include "../src/weights/bias_dense_0_aie.h"
-{% endif %}
+{% endfor %}
 #undef __X86SIM__
 
 #include <fstream>
 #include <iostream>
 #include <cstring>
+#include <string>
 #include <chrono>
 
 #include "experimental/xrt_kernel.h"
@@ -144,30 +141,25 @@ int main(int argc, char* argv[])
                                       xrt::kernel::cu_access_mode::exclusive);
     auto cghdl      = xrt::graph(device, xclbin_uuid, "dut");
 
-    // Step 1: Reset graph and load weights/biases for all {{ cas_num * cas_length }} tile(s) + {{ cas_num }} chain(s).
-    // wts1[chain * CAS_LENGTH + col] = weights_dense_0_aie_{chain}_{col}.
+    // Step 1: Reset graph and load every layer's RTP artifacts (weights/bias/gamma/...),
+    // generically over L.artifacts: 2d -> CAS_NUM x CAS_LENGTH tiles, 1d -> CAS_NUM chains.
     cghdl.reset();
-{% if layers %}
 {% for L in layers %}
-{% for chain in range(L.cas_num) %}
-{%- for col in range(L.cas_length) %}
-    cghdl.update("dut.{{ L.wts_port }}[{{ chain * L.cas_length + col }}]", {{ L.weights_prefix }}_{{ chain }}_{{ col }});
-{% endfor %}
-{%- endfor %}
-{%- for chain in range(L.cas_num) %}
-    cghdl.update("dut.{{ L.bias_port }}[{{ chain }}]", {{ L.bias_prefix }}_{{ chain }});
-{% endfor %}
-{% endfor %}
+{% for spec in L.artifacts %}
+{% if spec.kind == '2d' %}
+    for (int chain = 0; chain < {{ L.cas_num }}; ++chain) {
+        for (int col = 0; col < {{ L.cas_length }}; ++col) {
+            cghdl.update("dut.{{ spec.port }}[" + std::to_string(chain * {{ L.cas_length }} + col) + "]",
+                         {{ spec.prefix }}[chain][col]);
+        }
+    }
 {% else %}
-{% for chain in range(cas_num) %}
-{%- for col in range(cas_length) %}
-    cghdl.update("dut.wts1[{{ chain * cas_length + col }}]", weights_dense_0_aie_{{ chain }}_{{ col }});
-{% endfor %}
-{%- endfor %}
-{%- for chain in range(cas_num) %}
-    cghdl.update("dut.bias1[{{ chain }}]", bias_dense_0_aie_{{ chain }});
-{% endfor %}
+    for (int chain = 0; chain < {{ L.cas_num }}; ++chain) {
+        cghdl.update("dut.{{ spec.port }}[" + std::to_string(chain) + "]", {{ spec.prefix }}[chain]);
+    }
 {% endif %}
+{% endfor %}
+{% endfor %}
     printf("weights loaded\n");
     printf("run ddr_pl_aie_datamover (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
     printf("graph run together\n");
