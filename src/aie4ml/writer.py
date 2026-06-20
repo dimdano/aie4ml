@@ -187,9 +187,9 @@ class AIEProjectEmitter:
         self._render_template(env, 'host/host.cpp.jinja', output_dir / 'host' / 'host.cpp', system_io)
 
         # DDR-packed input header (data.h) consumed by host.cpp.
-        from .system_plan import write_host_data_header
+        from .system_plan import host_data_context
 
-        write_host_data_header(ctx, output_dir)
+        self._render_template(env, 'host/data.h.jinja', output_dir / 'host' / 'data.h', host_data_context(ctx))
 
     def _render_template(self, env: Environment, template_name: str, destination: Path, context: dict):
         template = env.get_template(template_name)

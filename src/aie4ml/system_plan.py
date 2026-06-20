@@ -12,7 +12,6 @@ the XRT host program so the design can run on a board (not just simulate the arr
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import Any, Dict, List
 
 import numpy as np
@@ -20,7 +19,10 @@ import numpy as np
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
 
-# A 512-bit DDR word carries 64 bytes; the PL data mover moves whole 512-bit words.
+# Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
+# This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
+# independent of the element dtype (int8/int16/int32 just change how many elements fit
+# per word, not the word size).
 _DDR_WORD_BYTES = 64
 
 # Compile-time cap on iterations the data mover preloads into PL URAM. Should ultimately be
@@ -182,29 +184,55 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
 
 
 def _pack_ports_to_ddr(port_tiles: List[np.ndarray], n_streams: int) -> np.ndarray:
-    """Round-robin pack per-stream int8 tiles into the data mover's 512-bit DDR layout.
+    """Round-robin pack per-stream tiles into the data mover's 512-bit DDR layout.
 
-    Returns a little-endian uint32 array (the host buffer element type). Mirrors the data
-    mover: contiguous DDR word i is owned by stream i % n_streams.
+    Packs each tile's RAW STORAGE BYTES (dtype-agnostic -- the PL data mover moves whole
+    512-bit words and is type-agnostic; int8/int16/int32 just change how many elements fit
+    per word). Returns a little-endian uint32 array (the host buffer element type), with
+    contiguous DDR word i owned by stream i % n_streams. Assumes little-endian byte order
+    (native on x86/Versal), consistent with the kernel's word reads.
     """
     word_blocks = []
     for tile in port_tiles:
-        flat = np.ascontiguousarray(tile).astype(np.int8).reshape(-1)
-        if flat.size % _DDR_WORD_BYTES != 0:
+        raw = np.frombuffer(np.ascontiguousarray(tile).tobytes(), dtype=np.uint8)
+        if raw.size % _DDR_WORD_BYTES != 0:
             raise NotImplementedError(
-                f'stream tile of {flat.size} B is not a multiple of {_DDR_WORD_BYTES} B; 512-bit padding is not yet supported.'
+                f'stream tile of {raw.size} B is not a multiple of {_DDR_WORD_BYTES} B; '
+                f'512-bit padding is not yet supported.'
             )
-        word_blocks.append(flat.reshape(-1, _DDR_WORD_BYTES))
+        word_blocks.append(raw.reshape(-1, _DDR_WORD_BYTES))
     if len(word_blocks) != int(n_streams):
         raise RuntimeError(f'expected {n_streams} stream tiles, got {len(word_blocks)}.')
     words = word_blocks[0].shape[0]
     if any(block.shape[0] != words for block in word_blocks):
         raise NotImplementedError('uneven per-stream word counts; relay/padding is not yet supported.')
 
-    mem = np.empty((words * int(n_streams), _DDR_WORD_BYTES), dtype=np.int8)
+    mem = np.empty((words * int(n_streams), _DDR_WORD_BYTES), dtype=np.uint8)
     for stream, block in enumerate(word_blocks):
         mem[stream :: int(n_streams)] = block
-    return np.frombuffer(mem.reshape(-1).tobytes(), dtype='<u4')
+    return np.frombuffer(mem.tobytes(), dtype='<u4')
+
+
+def _check_storage_width(port, tile) -> None:
+    """Fail hard if the prepared element width doesn't match the port's byte-aligned dtype.
+
+    The packing is dtype-aware via raw bytes, but only for byte-aligned formats whose
+    prepared NumPy dtype matches the boundary width (int8/int16/int32). Sub-byte widths or
+    formats whose storage differs (e.g. bfloat16 prepared as float32) are rejected rather
+    than silently corrupted.
+    """
+    if int(port.dtype.width) % 8 != 0:
+        raise NotImplementedError(
+            f'graph IO dtype {port.dtype.format!r} ({port.dtype.width}-bit) is not byte-aligned; '
+            f'sub-byte PLIO packing is not supported.'
+        )
+    want = int(port.dtype.width) // 8
+    got = int(tile.dtype.itemsize)
+    if got != want:
+        raise NotImplementedError(
+            f'graph input {port.tensor!r} port {port.port}: prepared element is {got} B but boundary '
+            f'dtype {port.dtype.format!r} is {want} B; dtype-exact packing for this format is unsupported.'
+        )
 
 
 def pack_host_data(model_or_ctx, X=None):
@@ -213,6 +241,11 @@ def pack_host_data(model_or_ctx, X=None):
     Packs the quantized graph input into the DDR layout the host replays, and reports the
     output size (in 32-bit words) the host needs to size its output buffer. Both are
     graph-agnostic (no forward pass). X defaults to a deterministic pseudo-random input.
+
+    dtype-aware: ``prepare_inputs`` quantizes X to the port's storage NumPy dtype
+    (``dtype_for_precision(width, signed)`` for ints, float32 for floats) and the raw bytes
+    of that are packed -- the same storage-dtype contract the weights path uses. n-D
+    boundaries are handled via the full ``numpy_boundary_shape``.
     """
     from .simulation import _extract_port_tile, build_io_layout, prepare_inputs
 
@@ -223,39 +256,40 @@ def pack_host_data(model_or_ctx, X=None):
 
     in_tensor = next(iter(layout.inputs))
     in_ports = layout.inputs[in_tensor]
-    out_ports = layout.outputs[next(iter(layout.outputs))]
-    batch, in_feat = in_ports[0].numpy_boundary_shape
+    out_port0 = layout.outputs[next(iter(layout.outputs))][0]
+
+    boundary = in_ports[0].numpy_boundary_shape  # full n-D shape; no (batch, feat) assumption
 
     if X is None:
-        X = np.random.default_rng(0).random((int(batch), int(in_feat)), dtype=np.float64) * 2.0 - 1.0
+        X = np.random.default_rng(0).random(boundary, dtype=np.float64) * 2.0 - 1.0
 
-    prepared = prepare_inputs(layout, X, iterations=1, quantize=True)[in_tensor]  # (1, *boundary) int
-    in_tiles = [_extract_port_tile(prepared, p)[0].reshape(-1) for p in in_ports]
+    prepared = prepare_inputs(layout, X, iterations=1, quantize=True)[in_tensor]  # (1, *boundary)
+    in_tiles = []
+    for p in in_ports:
+        tile = _extract_port_tile(prepared, p)[0]  # this port's slice, storage dtype, n-D
+        _check_storage_width(p, tile)
+        in_tiles.append(tile)
     ifm_packed = _pack_ports_to_ddr(in_tiles, len(in_ports))
 
-    out_total_bytes = int(np.prod(out_ports[0].numpy_boundary_shape)) * (int(out_ports[0].dtype.width) // 8)
+    out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
+    if out_total_bytes % 4 != 0:
+        raise NotImplementedError(
+            f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).'
+        )
     ofm_size_words = out_total_bytes // 4
     return ifm_packed, ofm_size_words
 
 
-def _emit_uint32_array(name: str, size_macro: str, values: np.ndarray) -> str:
-    body = ', '.join(str(int(v) & 0xFFFFFFFF) for v in values)
-    return f'static const uint32_t {name}[{size_macro}] = {{ {body} }};\n'
+def host_data_context(model_or_ctx, X=None) -> Dict[str, Any]:
+    """Prepare the ``host/data.h`` template context: the DDR-packed graph input and
+    the IO word sizes the host needs.
 
-# Direct method to write host/data.h TODO: Should be moved to jinja template
-def write_host_data_header(model_or_ctx, output_dir, X=None) -> Path:
-    """Write ``host/data.h`` (ifm_packed + IO word sizes) consumed by host.cpp."""
+    Python only prepares the values (masked to uint32); the writer renders
+    ``templates/firmware/host/data.h.jinja``.
+    """
     ifm_packed, ofm_size_words = pack_host_data(model_or_ctx, X)
-    host_dir = Path(output_dir) / 'host'
-    host_dir.mkdir(parents=True, exist_ok=True)
-    dest = host_dir / 'data.h'
-    text = (
-        '#pragma once\n'
-        '// GENERATED by aie4ml (DDR-packed input). Do not edit by hand.\n'
-        '#include <cstdint>\n\n'
-        f'static const int IFM_SIZE_WORDS = {len(ifm_packed)};\n'
-        f'static const int OFM_SIZE_WORDS = {ofm_size_words};\n\n'
-        + _emit_uint32_array('ifm_packed', 'IFM_SIZE_WORDS', ifm_packed)
-    )
-    dest.write_text(text)
-    return dest
+    return {
+        'ifm_packed': [int(v) & 0xFFFFFFFF for v in ifm_packed],
+        'ifm_size_words': int(len(ifm_packed)),
+        'ofm_size_words': int(ofm_size_words),
+    }
