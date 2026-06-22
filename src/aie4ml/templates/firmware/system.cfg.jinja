@@ -1,0 +1,32 @@
+# =============================================================
+# system.cfg — v++ linker connectivity for {{ project_name }}
+# GENERATED from templates/system.cfg.j2 -- do not edit by hand.
+#
+# Data flow:
+#   Host DDR
+#     -> ddr_pl_aie_datamover (m_axi gmem_in) -> s_out_* stream(s)
+#        -> ai_engine_0.PLIO_ifm_*  [128-bit PLIO, 4 x int8 per beat]
+#           ... Dense AIE graph (dut) ...
+#        -> ai_engine_0.PLIO_ofm_*
+#     -> s_in_* stream(s) -> ddr_pl_aie_datamover (m_axi gmem_out)
+#   Host DDR
+#
+# PLIO port names must exactly match the strings in
+# input_plio::create() / output_plio::create() in app.cpp.
+# =============================================================
+
+[connectivity]
+# Combined PL datamover (single CU) — see pl/ddr_pl_aie_datamover.cpp.
+# This design has {{ n_ifm }} input PLIO(s) and {{ n_ofm }} output PLIO(s).
+nk=ddr_pl_aie_datamover:1:ddr_pl_aie_datamover
+
+# stream connections: PL <-> AIE shim
+{% for s in range(n_ifm) -%}
+sc=ddr_pl_aie_datamover.s_out_{{ s }}:ai_engine_0.PLIO_ifm_{{ s }}
+{% endfor -%}
+{% for s in range(n_ofm) -%}
+sc=ai_engine_0.PLIO_ofm_{{ s }}:ddr_pl_aie_datamover.s_in_{{ s }}
+{% endfor %}
+[clock]
+# Match pl-freq in aie.cfg ({{ "%.1f"|format(pl_freq_hz / 1e6) }} MHz)
+defaultFreqHz={{ pl_freq_hz|int }}

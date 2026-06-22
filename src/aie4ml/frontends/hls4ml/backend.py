@@ -181,8 +181,19 @@ class AIEBackend(Backend):
         namespace=None,
         write_tar=False,
         compute_dtype=None,
+        target='aie',
+        pl_memory='uram',
+        enable_pl_timing=False,
         **_,
     ):
+        if str(target).lower() not in ('aie', 'hardware'):
+            raise ValueError(f"target must be 'aie' or 'hardware', got {target!r}.")
+        target = str(target).lower()
+
+        if str(pl_memory).lower() not in ('uram', 'bram'):
+            raise ValueError(f"pl_memory must be 'uram' or 'bram', got {pl_memory!r}.")
+        pl_memory = str(pl_memory).lower()
+
         device_info = copy.deepcopy(self._get_device_info(part))
 
         def _require(key):
@@ -210,6 +221,9 @@ class AIEBackend(Backend):
                 'PLClockFreqMHz': pl_freq,
                 'BatchSize': batch_size,
                 'Iterations': iterations,
+                'Target': target,
+                'PLMemory': pl_memory,
+                'EnablePLTiming': bool(enable_pl_timing),
                 'Memory': device_info.get('Memory'),
                 'MaxMemTileInPorts': int(device_info['MaxMemTileInPorts']),
                 'MaxMemTileOutPorts': int(device_info['MaxMemTileOutPorts']),
