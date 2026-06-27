@@ -260,10 +260,15 @@ int main(int argc, char* argv[])
     uint64_t cycles_total      = read_u64_reg(tick_gen_khdl, 9);
 {% endif %}
     // End-to-end deltas (both modes share the same five timestamps, one time base).
+    // The send / compute / recv split is only meaningful for the preload benchmark; in
+    // memory_stream those phases overlap (streaming graph + double-buffered movers), so
+    // only the round trip is reported there.
+    int64_t  round_trip_cyc    = (int64_t)cycles_last_recv  - (int64_t)cycles_first_send;
+{% if mode == 'benchmark' %}
     int64_t  send_phase_cyc    = (int64_t)cycles_last_send  - (int64_t)cycles_first_send;
     int64_t  aie_gap_cyc       = (int64_t)cycles_first_recv - (int64_t)cycles_last_send;
     int64_t  recv_phase_cyc    = (int64_t)cycles_last_recv  - (int64_t)cycles_first_recv;
-    int64_t  round_trip_cyc    = (int64_t)cycles_last_recv  - (int64_t)cycles_first_send;
+{% endif %}
 {% endif %}
 
     // ---- Timing report ----
@@ -329,12 +334,14 @@ int main(int argc, char* argv[])
 
     printf("\n--- Performance PL side (End-to-End 1 inference) PL @ %.1f MHz ---\n", PL_FREQ_HZ / 1e6);
     printf("   %-16s   %12s  %12s\n", "", "cyc", "us");
+{% if mode == 'benchmark' %}
     printf("   %-16s : %12ld  %12.4f   %s\n", "PL to AIE",
            (long)send_phase_cyc, (double)send_phase_cyc / PL_FREQ_HZ * 1e6, "PLIO ifm transit");
     printf("   %-16s : %12ld  %12.4f   %s\n", "AIE compute",
            (long)aie_gap_cyc, (double)aie_gap_cyc / PL_FREQ_HZ * 1e6, "AIE compute window");
     printf("   %-16s : %12ld  %12.4f   %s\n", "AIE to PL",
            (long)recv_phase_cyc, (double)recv_phase_cyc / PL_FREQ_HZ * 1e6, "PLIO ofm drain");
+{% endif %}
     printf("   %-16s : %12ld  %12.4f   %s\n", "PL - AIE - PL",
            (long)round_trip_cyc, (double)round_trip_cyc / PL_FREQ_HZ * 1e6, "round trip");
 {% else %}
