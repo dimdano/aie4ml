@@ -18,7 +18,6 @@ import numpy as np
 
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
-from .ir.graph import input_tensor_for_role
 
 # Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
 # This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
@@ -184,10 +183,17 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
 
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
+    # Per-PLIO-tile feature slices come from the GRAPH BOUNDARY ports -- the single graph
+    # input and single graph output (already validated to be 1 each above). 
+    gin_port = next(iter(layout.inputs.values()))[0]  
+    gout_port = next(iter(layout.outputs.values()))[0]
+    in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
+    out_feat_slice = gout_port.tiling_dimension[gout_port.slice_dimension]
+
+    # Per-layer RTP artifacts (weights/bias/...). layer_index counts every executed node
+    # (incl. param-less activations) so the RTP port suffix matches the app.cpp graph index.
     layers = []
     layer_index = 0
-    in_feat_slice = None
-    out_feat_slice = None
     for node in ctx.ir.logical:
         inst = ctx.ir.execution.get(node.name)
         if inst is None:
@@ -199,16 +205,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         parallelism = getattr(inst.config, 'parallelism', None)
         if parallelism is None:
             raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
-        lhs_name = input_tensor_for_role(node, 'lhs').name
-        # input port layout
-        out_name = node.outputs[0].name
-        in_ports = layout.inputs[lhs_name]
-        in_port = in_ports[0] # PLIO port 0 representative (all shards same shape)
-        # output port layout
-        out_ports = layout.outputs[out_name]
-        out_port = out_ports[0]
-        in_feat_slice = in_port.tiling_dimension[in_port.slice_dimension]
-        out_feat_slice = out_port.tiling_dimension[out_port.slice_dimension]
         inst_name = sanitize_identifier(node.name)
         layers.append({
             'inst_name': inst_name,
@@ -225,8 +221,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
                 for a in artifacts
             ],
         })
-    if in_feat_slice is None or out_feat_slice is None:
-        raise RuntimeError('build_system_io found no RTP-bearing (weight) layer to source feat slices from.')
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1
     cas_length = layers[-1]['cas_length'] if layers else 1
