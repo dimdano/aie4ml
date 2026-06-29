@@ -27,13 +27,13 @@ Each merged function the phases are sequential by C++ semantics:
 #include <hls_stream.h>
 #include <ap_axi_sdata.h>
 
-static const int N_IFM_STREAMS      = {{ n_ifm }};
-static const int N_OFM_STREAMS      = {{ n_ofm }};
+static const int N_IFM_STREAMS      = {{ ifm_per_stream }};
+static const int N_OFM_STREAMS      = {{ ofm_per_stream }};
 // Compile-time cap on n_iter -- sizes the local URAM buffers. This design
 // preloads ALL n_iter iters on-chip; MAX_N_ITER bounds the URAM footprint.
 static const int MAX_N_ITER         = {{ max_n_iter }};
-static const int MAX_BIG_IN         = n_ifm * MAX_N_ITER;
-static const int MAX_BIG_OUT        = n_ofm * MAX_N_ITER;
+static const int MAX_BIG_IN         = N_IFM_STREAMS * MAX_N_ITER;
+static const int MAX_BIG_OUT        = N_OFM_STREAMS * MAX_N_ITER;
 
 {% if enable_pl_timing %}
 // ---------------------------------------------------------------------------
