@@ -29,12 +29,11 @@ Each merged function the phases are sequential by C++ semantics:
 
 static const int N_IFM_STREAMS      = {{ n_ifm }};
 static const int N_OFM_STREAMS      = {{ n_ofm }};
-static const int MAX_512_PER_STREAM = {{ max_512_per_stream }};
 // Compile-time cap on n_iter -- sizes the local URAM buffers. This design
 // preloads ALL n_iter iters on-chip; MAX_N_ITER bounds the URAM footprint.
 static const int MAX_N_ITER         = {{ max_n_iter }};
-static const int MAX_BIG_IN         = MAX_512_PER_STREAM * MAX_N_ITER;
-static const int MAX_BIG_OUT        = MAX_512_PER_STREAM * MAX_N_ITER;
+static const int MAX_BIG_IN         = n_ifm * MAX_N_ITER;
+static const int MAX_BIG_OUT        = n_ofm * MAX_N_ITER;
 
 {% if enable_pl_timing %}
 // ---------------------------------------------------------------------------
