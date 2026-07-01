@@ -22,11 +22,10 @@ def validate_elementwise_tile_contract(
     *, node_name: str, precision: Dict[str, Any], lhs_view, bank_bytes: int, vec_size: int
 ) -> None:
     slice_elements = int(math.prod(lhs_view.tile))
-    full_inner = lhs_view.full_inner
-    if full_inner % vec_size != 0:
+    if slice_elements % vec_size != 0:
         raise ValueError(
-            f'{node_name}: inner dimension {full_inner} is not a multiple of vec_size {vec_size}; '
-            'the resolver must align full_inner to vec_size before building the view.'
+            f'{node_name}: elementwise tile has {slice_elements} elements, not a multiple of vec_size {vec_size}; '
+            'the resolver must choose a kernel tile with a vector-aligned element count.'
         )
     lhs_tile_bytes = slice_elements * storage_bytes_for_spec(precision['lhs'])
     rhs_tile_bytes = slice_elements * storage_bytes_for_spec(precision['rhs'])

@@ -81,6 +81,8 @@ class EdgeSpec:
     src: str
     dst: str
     tensor: Optional[str] = None
+    direct: bool = False
+    producer_exclusive: bool = True
 
 
 @dataclass
@@ -313,14 +315,57 @@ def _rects_conflict(a: Placed, b: Placed) -> bool:
     return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
 
 
+def _occupancy_box(placed: Placed) -> Tuple[int, int, int, int]:
+    return (
+        placed.x,
+        placed.x + placed.rect.w - 1,
+        placed.y,
+        placed.y + placed.rect.h - 1,
+    )
+
+
+def _boxes_conflict(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
+    ax0, ax1, ay0, ay1 = a
+    bx0, bx1, by0, by1 = b
+    return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
+
+
+def _direct_left_bank_reuse(producer: Placed, consumer: Placed, graph: GraphSpec) -> bool:
+    if consumer.rect.h != 1:
+        return False
+    if producer.rect.output_face.side != 'right' or consumer.rect.input_face.side != 'left':
+        return False
+    if producer.x + producer.rect.w != consumer.x:
+        return False
+    if not any(
+        edge.direct and edge.producer_exclusive and edge.src == producer.name and edge.dst == consumer.name
+        for edge in graph.edges
+    ):
+        return False
+
+    _, _, producer_y0, producer_y1 = _face_abs_box(producer, producer.rect.output_face)
+    _, _, consumer_y0, consumer_y1 = _face_abs_box(consumer, consumer.rect.input_face)
+    return producer_y0 == consumer_y0 and producer_y1 == consumer_y1
+
+
+def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
+    if not _rects_conflict(a, b):
+        return False
+    if _boxes_conflict(_occupancy_box(a), _occupancy_box(b)):
+        return True
+    if _direct_left_bank_reuse(a, b, graph) or _direct_left_bank_reuse(b, a, graph):
+        return False
+    return True
+
+
 def _in_bounds(p: Placed, W: int, H: int) -> bool:
     return p.x >= 0 and p.y >= 0 and p.x + p.rect.w <= W and p.y + p.rect.h <= H
 
 
-def _feasible(p: Placed, placed: Dict[str, Placed], W: int, H: int) -> bool:
+def _feasible(p: Placed, placed: Dict[str, Placed], graph: GraphSpec, W: int, H: int) -> bool:
     if not _in_bounds(p, W, H):
         return False
-    return all(not _rects_conflict(p, q) for q in placed.values())
+    return all(not _placements_conflict(p, q, graph) for q in placed.values())
 
 
 def _possible_face_domain(
@@ -386,22 +431,47 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
     if state is None:
         raise RuntimeError('Placement requires collected transport entries.')
 
+    def producer_ports(entry) -> Tuple[int, ...]:
+        if entry.unit is not None:
+            return tuple(int(port) for port in entry.unit.producer_ports)
+        return tuple(int(port) for port in entry.producer.selected_ports(entry.producer_port_count))
+
     kernel_set = set(kernel_names)
+    producer_port_uses = {}
+    for entry in state['entries']:
+        if entry.producer.node is None:
+            continue
+        for port in producer_ports(entry):
+            key = (entry.producer.node.name, entry.producer.tensor, int(port))
+            producer_port_uses[key] = producer_port_uses.get(key, 0) + 1
+
     edges = []
     seen = set()
     for entry in state['entries']:
         src = entry.producer.node
         if src is None:
             continue
+        entry_producer_ports = producer_ports(entry)
+        producer_exclusive = all(
+            producer_port_uses[(src.name, entry.producer.tensor, port)] == 1 for port in entry_producer_ports
+        )
         for connection in entry.consumers:
             consumer = connection.consumer
             if consumer is None or src.name not in kernel_set or consumer.node.name not in kernel_set:
                 continue
-            key = (src.name, consumer.node.name, entry.logical_tensor)
+            key = (src.name, consumer.node.name, entry.producer.tensor, entry_producer_ports)
             if key in seen:
                 continue
             seen.add(key)
-            edges.append(EdgeSpec(src=src.name, dst=consumer.node.name, tensor=entry.logical_tensor))
+            edges.append(
+                EdgeSpec(
+                    src=src.name,
+                    dst=consumer.node.name,
+                    tensor=entry.producer.tensor,
+                    direct=entry.decision is not None and entry.decision.realization == 'direct',
+                    producer_exclusive=producer_exclusive,
+                )
+            )
     return edges
 
 
@@ -728,7 +798,7 @@ def _validate_and_preplace_anchors(
             continue
 
         p = Placed(name=name, x=spec.anchor[0], y=spec.anchor[1], rect=spec.rect)
-        if not _feasible(p, placed, W, H):
+        if not _feasible(p, placed, graph, W, H):
             raise ValueError(f'Invalid fixed anchor for {name}: out of bounds or conflicts with another anchor.')
         placed[name] = p
 
@@ -931,7 +1001,7 @@ def _bnb_place_graph(
             heuristics,
         ):
             cand = Placed(name=name, x=x, y=y, rect=spec.rect)
-            if not _feasible(cand, placed, W, H):
+            if not _feasible(cand, placed, graph, W, H):
                 continue
 
             placed[name] = cand

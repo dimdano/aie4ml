@@ -2,6 +2,7 @@ from .math import align_up, ceildiv
 from .tensor_view import (
     TensorView,
     build_tensor_view,
+    build_tensor_view_from_staging,
     canonical_buffer_axes,
     make_staging_descriptor,
     map_view_axis,
@@ -11,6 +12,7 @@ from .tensor_view import (
 __all__ = [
     'TensorView',
     'build_tensor_view',
+    'build_tensor_view_from_staging',
     'canonical_buffer_axes',
     'align_up',
     'ceildiv',

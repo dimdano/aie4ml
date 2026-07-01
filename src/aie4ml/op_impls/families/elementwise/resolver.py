@@ -7,7 +7,7 @@ from ....aie_types import FloatIntent
 from ....ir import input_tensor_for_role
 from ...family_registry import family_resolver
 from ...registry import select_variant as _select_variant
-from ...utils import align_up, build_tensor_view, ceildiv
+from ...utils import align_up, build_tensor_view, build_tensor_view_from_staging, ceildiv
 from ...utils.io import resolve_input_contract, view_shape
 from ...utils.precision import (
     aie_rounding_token,
@@ -170,57 +170,58 @@ class AddResolver:
 
         vec_size = elementwise_vec_size(precision['lhs'], device)
         raw_inner = int(lhs_shape[-1])
-        full_inner = align_up(raw_inner, vec_size)
 
-        outer_prefix = int(math.prod(lhs_shape[:-2])) if len(lhs_shape) > 2 else 1
-        last_outer = int(lhs_shape[-2])
-
-        lhs_c = input_contracts.get(lhs_tensor.name)
-        primary = lhs_c if lhs_c is not None else input_contracts.get(rhs_tensor.name)
-        parallel_cfg = (directives or {}).get('parallelism', {}) or {}
-        elem_bytes = storage_bytes_for_spec(precision['lhs'])
-        requested_cas_num = (
-            len(primary.port_staging)
-            if (primary is not None and preserved_staging is not None)
-            else parallel_cfg.get('cas_num')
-        )
-
-        tiling = resolve_elementwise_parallelism(
-            contract=staging_contract,
-            outer_prefix=outer_prefix,
-            last_outer=last_outer,
-            raw_inner=raw_inner,
-            full_inner=full_inner,
-            elem_bytes=elem_bytes,
-            device=device,
-            requested_cas_num=requested_cas_num,
-        )
-
-        io_views = {}
-        for tensor in node.inputs:
-            io_views[tensor.name] = build_tensor_view(
-                node,
-                tensor,
-                'inputs',
-                full_inner=full_inner,
-                tile_inner=tiling.tile_inner,
-                tile_inner_raw=tiling.tile_inner_raw,
-                full_outer=tiling.full_outer,
-                tile_outer=tiling.tile_outer_raw,
-                tile_outer_raw=tiling.tile_outer_raw,
+        if preserved_staging is not None:
+            port0 = preserved_staging[0]
+            cas_num = len(preserved_staging)
+            io_views = {
+                tensor.name: build_tensor_view_from_staging(node, tensor, 'inputs', port0) for tensor in node.inputs
+            }
+            io_views.update(
+                {tensor.name: build_tensor_view_from_staging(node, tensor, 'outputs', port0) for tensor in node.outputs}
             )
-        for tensor in node.outputs:
-            io_views[tensor.name] = build_tensor_view(
-                node,
-                tensor,
-                'outputs',
+        else:
+            outer_prefix = int(math.prod(lhs_shape[:-2])) if len(lhs_shape) > 2 else 1
+            last_outer = int(lhs_shape[-2])
+            full_inner = align_up(raw_inner, vec_size)
+            parallel_cfg = (directives or {}).get('parallelism', {}) or {}
+            tiling = resolve_elementwise_parallelism(
+                contract=staging_contract,
+                outer_prefix=outer_prefix,
+                last_outer=last_outer,
+                raw_inner=raw_inner,
                 full_inner=full_inner,
-                tile_inner=tiling.tile_inner,
-                tile_inner_raw=tiling.tile_inner_raw,
-                full_outer=tiling.full_outer,
-                tile_outer=tiling.tile_outer_raw,
-                tile_outer_raw=tiling.tile_outer_raw,
+                elem_bytes=storage_bytes_for_spec(precision['lhs']),
+                device=device,
+                requested_cas_num=parallel_cfg.get('cas_num'),
             )
+            cas_num = int(tiling.cas_num)
+
+            io_views = {}
+            for tensor in node.inputs:
+                io_views[tensor.name] = build_tensor_view(
+                    node,
+                    tensor,
+                    'inputs',
+                    full_inner=full_inner,
+                    tile_inner=tiling.tile_inner,
+                    tile_inner_raw=tiling.tile_inner_raw,
+                    full_outer=tiling.full_outer,
+                    tile_outer=tiling.tile_outer_raw,
+                    tile_outer_raw=tiling.tile_outer_raw,
+                )
+            for tensor in node.outputs:
+                io_views[tensor.name] = build_tensor_view(
+                    node,
+                    tensor,
+                    'outputs',
+                    full_inner=full_inner,
+                    tile_inner=tiling.tile_inner,
+                    tile_inner_raw=tiling.tile_inner_raw,
+                    full_outer=tiling.full_outer,
+                    tile_outer=tiling.tile_outer_raw,
+                    tile_outer_raw=tiling.tile_outer_raw,
+                )
 
         if is_float:
             shift = 0
@@ -233,7 +234,7 @@ class AddResolver:
 
         return AddConfig(
             precision=precision,
-            parallelism=ElementwiseParallelismConfig(cas_num=int(tiling.cas_num)),
+            parallelism=ElementwiseParallelismConfig(cas_num=int(cas_num)),
             vec_size=vec_size,
             io_views=io_views,
             io_route=io_route,

@@ -93,6 +93,25 @@ def ordered_view_shape(view: TensorView, kind: str) -> list[int]:
     return [int(shape[index]) for index in view.buffer_order]
 
 
+def _shape_from_buffer_order(buffer_shape: Sequence[int], buffer_order: Sequence[int]) -> tuple[int, ...]:
+    if len(buffer_shape) != len(buffer_order):
+        raise ValueError(f'buffer shape rank {len(buffer_shape)} does not match buffer_order rank {len(buffer_order)}.')
+    shape = [0 for _ in buffer_order]
+    for buffer_dim, view_axis in enumerate(buffer_order):
+        shape[int(view_axis)] = int(buffer_shape[buffer_dim])
+    return tuple(shape)
+
+
+def _staging_tile_shape(desc: Mapping[str, Any]) -> tuple[int, ...]:
+    if 'tiling_dimension' not in desc:
+        raise ValueError('staging descriptor is missing tiling_dimension.')
+    shape = [int(x) for x in desc['tiling_dimension']]
+    for entry in desc.get('tile_traversal', ()):
+        dim = int(entry['dimension'])
+        shape[dim] = int(entry['stride']) * int(entry['wrap'])
+    return tuple(shape)
+
+
 def map_view_axis(view: TensorView, axis: int) -> int:
     if view.perm is None:
         return int(axis)
@@ -205,5 +224,28 @@ def build_tensor_view(
         tile=tuple(tile),
         tile_raw=tuple(tile_raw),
         buffer_order=tuple(int(x) for x in layout['buffer_order']),
+        perm=None if layout.get('perm') is None else tuple(int(x) for x in layout['perm']),
+    )
+
+
+def build_tensor_view_from_staging(node, tensor, direction: str, desc: Mapping[str, Any]) -> TensorView:
+    """Build a TensorView whose per-port tile matches an inherited staging descriptor."""
+
+    from .io import view_layout, view_shape
+
+    logical = tuple(int(x) for x in tensor.shape)
+    real = tuple(int(x) for x in view_shape(node, tensor, direction))
+    layout = view_layout(node, tensor, direction)
+    buffer_order = tuple(int(x) for x in layout['buffer_order'])
+    full = _shape_from_buffer_order(desc['buffer_dimension'], buffer_order)
+    tile = _shape_from_buffer_order(_staging_tile_shape(desc), buffer_order)
+
+    return TensorView(
+        logical=logical,
+        real=real,
+        full=full,
+        tile=tile,
+        tile_raw=tile,
+        buffer_order=buffer_order,
         perm=None if layout.get('perm') is None else tuple(int(x) for x in layout['perm']),
     )
