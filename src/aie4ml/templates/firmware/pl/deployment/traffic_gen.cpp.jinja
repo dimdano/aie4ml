@@ -1,0 +1,71 @@
+/*
+Copyright (C) 2026, Advent lab
+
+traffic_gen -- synthesizable HLS dummy AXI-stream source (external_stream deployment mode).
+Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }}, {{ n_ifm }} IFM PLIO).
+
+Replaces the DDR->PLIO mm2s mover with an ON-CHIP pattern generator: it streams a deterministic
+byte ramp into the AIE PLIO_ifm ports. traffic_gen stands in for a real external AXI producer. 
+On a deployed board it is replaced by the user's producer IP wired the same way (sc=<producer>.M_AXIS:ai_engine_0.PLIO_ifm_*).
+*/
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+
+static const int N_IFM_STREAMS = {{ n_ifm }};
+
+extern "C" {
+
+// s_out_* : 128-bit AXI-stream to AIE PLIO_ifm_* (plio_128_bits).
+// size_in : 32-bit words per iteration, summed across all {{ n_ifm }} stream(s) (same units as mm2s).
+// n_iter  : number of iterations to stream.
+void traffic_gen(
+{% for s in range(n_ifm) %}
+                 hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
+{% endfor %}
+                 int size_in, int n_iter) {
+{% for s in range(n_ifm) %}
+#pragma HLS INTERFACE axis port=s_out_{{ s }}
+{% endfor %}
+#pragma HLS INTERFACE s_axilite port=size_in bundle=control
+#pragma HLS INTERFACE s_axilite port=n_iter  bundle=control
+#pragma HLS INTERFACE s_axilite port=return  bundle=control
+
+    const int rows_per_stream = (size_in / 16) / N_IFM_STREAMS;
+
+    for (int iter = 0; iter < n_iter; iter++) {
+        // Per-stream running byte value; reset each iteration so every iteration streams the
+        // same ramp (reproducible on the host).
+{% for s in range(n_ifm) %}
+        ap_uint<8> base{{ s }} = 0;
+{% endfor %}
+
+        for (int row = 0; row < rows_per_stream; row++) {
+            // Per row, push the 4 x 128-bit beats of each stream; TLAST on the iteration's last.
+            for (int j = 0; j < 4; j++) {
+            #pragma HLS PIPELINE II=1
+                ap_uint<1> tlast = (row == rows_per_stream - 1 && j == 3) ? 1 : 0;
+
+{% for s in range(n_ifm) %}
+                ap_uint<128> w{{ s }};
+{% endfor %}
+                for (int b = 0; b < 16; b++) {   // 16 bytes per 128-bit beat -> byte ramp
+                #pragma HLS UNROLL
+{% for s in range(n_ifm) %}
+                    w{{ s }}.range(b * 8 + 7, b * 8) = (ap_uint<8>)(base{{ s }} + b);
+{% endfor %}
+                }
+{% for s in range(n_ifm) %}
+                base{{ s }} += 16;
+{% endfor %}
+
+{% for s in range(n_ifm) %}
+                ap_axis<128, 0, 0, 0> x{{ s }}; x{{ s }}.data = w{{ s }}; x{{ s }}.keep = -1; x{{ s }}.last = tlast; s_out_{{ s }}.write(x{{ s }});
+{% endfor %}
+            }
+        }
+    }
+}
+
+}

@@ -11,15 +11,25 @@
  *   Host DDR -> ddr_pl_aie_datamover (PL, {{ n_ifm }} IFM PLIO + {{ n_ofm }} OFM PLIO) -> AIE -> ddr_pl_aie_datamover -> Host DDR
 {% elif mode == 'memory_stream' %}
  *   Host DDR -> mm2s (PL, {{ n_ifm }} IFM PLIO) -> AIE -> s2mm (PL, {{ n_ofm }} OFM PLIO) -> Host DDR
+{% elif mode == 'external_stream' %}
+ *   traffic_gen (PL on-chip ramp, {{ n_ifm }} IFM PLIO) -> AIE -> s2mm (PL, {{ n_ofm }} OFM PLIO) -> Host DDR
+ *   No input DDR / mm2s: the synthesizable HLS traffic_gen source generates the input on-chip
+ *   (stand-in for a real external AXI producer). The host starts traffic_gen + s2mm and reads back.
 {% endif %}
  *
  * Transfer sizes per iter (32-bit words, total across all streams):
  *   sizeIn  = BATCH({{ batch }}) * IN_FEAT({{ in_feat }})  / 4 = {{ batch * in_feat // 4 }} words
  *   sizeOut = BATCH({{ batch }}) * OUT_FEAT({{ out_feat }}) / 4 = {{ batch * out_feat // 4 }} words
  *
+{% if mode == 'external_stream' %}
+ * Input data: generated on-chip by traffic_gen (a deterministic byte ramp), NOT supplied by the
+ * host -- data.h::ifm_packed is unused in this mode. The board output is read back to the host
+ * (and optionally dumped). Golden verification is not generated.
+{% else %}
  * Input data: data.h::ifm_packed (one packed iteration in the PL mover mem_in DDR
  * layout) is replayed into every iteration. The board output is read back to the host
  * (and optionally dumped). Golden verification is not generated.
+{% endif %}
  *
  * N_ITER (defined in src/parameters.h) is only used by aiesimulator and must
  * not be used to compute PL transfer sizes.
@@ -128,6 +138,7 @@ int main(int argc, char* argv[])
     int sizeIn  = IFM_SIZE_WORDS;
     int sizeOut = OFM_SIZE_WORDS;
 
+{% if mode != 'external_stream' %}
     //////////////////////////////////////////
     // Input buffer: n_iter * sizeIn 32-bit words
     //////////////////////////////////////////
@@ -140,6 +151,10 @@ int main(int argc, char* argv[])
     }
     printf("Input memory virtual addr 0x%px\n", (void*)in_bomapped);
     in_bohdl.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+{% else %}
+    // external_stream: no host input buffer -- traffic_gen generates the input stream on-chip.
+    // sizeIn is still passed to traffic_gen so it knows how many words/iteration to emit.
+{% endif %}
 
     //////////////////////////////////////////
     // Output buffer: n_iter * sizeOut 32-bit words
@@ -168,6 +183,13 @@ int main(int argc, char* argv[])
                                      xrt::kernel::cu_access_mode::exclusive);
 {% endif %}
     auto cghdl     = xrt::graph(device, xclbin_uuid, "dut");
+{% elif mode == 'external_stream' %}
+    // traffic_gen (on-chip input source) and s2mm (output mover) are independent host-started
+    // CUs (shared access). No mm2s (input is generated on-chip) and no tick_gen (traffic_gen
+    // emits no timing events; this mode reports host-side wall-clock latency only).
+    auto traffic_gen_khdl = xrt::kernel(device, xclbin_uuid, "traffic_gen");
+    auto s2mm_khdl        = xrt::kernel(device, xclbin_uuid, "s2mm");
+    auto cghdl            = xrt::graph(device, xclbin_uuid, "dut");
 {% endif %}
 
     // Step 1: Reset graph and load every layer's RTP artifacts (weights/bias/gamma/...),
@@ -193,6 +215,8 @@ int main(int argc, char* argv[])
     printf("run ddr_pl_aie_datamover (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
 {% elif mode == 'memory_stream' %}
     printf("run mm2s/s2mm (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
+{% elif mode == 'external_stream' %}
+    printf("run traffic_gen/s2mm (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
 {% endif %}
     printf("graph run together\n");
     printf("running %d iteration(s)...\n", n_iter);
@@ -232,6 +256,15 @@ int main(int argc, char* argv[])
 {% if enable_pl_timing %}
     tick_gen_rhdl.wait();   // completes when s2mm emits ev_done (stops the counter)
 {% endif %}
+{% elif mode == 'external_stream' %}
+    // Kernel args (stream args are nullptr -- sc-connected in the PL):
+    //   traffic_gen : (s_out_0..{{ n_ifm - 1 }}, size_in, n_iter)   [on-chip source, host-started]
+    //   s2mm        : (mem_out, s_in_0..{{ n_ofm - 1 }}, size_out, n_iter)
+    cghdl.run(n_iter);
+    auto s2mm_rhdl        = s2mm_khdl(out_bohdl, {{ (['nullptr'] * n_ofm) | join(', ') }}, sizeOut, n_iter);
+    auto traffic_gen_rhdl = traffic_gen_khdl({{ (['nullptr'] * n_ifm) | join(', ') }}, sizeIn, n_iter);
+    traffic_gen_rhdl.wait();   // on-chip source done
+    s2mm_rhdl.wait();          // all OFM drained to DDR
 {% endif %}
 
     auto t_end = std::chrono::high_resolution_clock::now();

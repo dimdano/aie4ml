@@ -187,7 +187,8 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
       ``memory_stream`` split ``mm2s`` + ``s2mm`` double-buffered CUs, plus a shared
                         ``tick_gen`` timer CU when PL timing is on (separate CUs have
                         independent ``ap_start``, so one timer gives a common time base);
-      ``external_stream`` not yet emitted (direct PLIO<->external PL wiring + traffic-gen).
+      ``external_stream`` on-chip HLS ``traffic_gen`` source -> AIE -> ``s2mm`` (a
+                        synthesizable stand-in for an external AXI producer); PL timing off.
     """
     mode = str(mode).lower()
 
@@ -241,10 +242,28 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
                 'kernels': kernels, 'nk': nk, 'sc': sc, 'host': host}
 
     if mode == 'external_stream':
-        raise NotImplementedError(
-            "PLDataMoverMode 'external_stream' is not yet emitted by the compiler "
-            '(direct PLIO<->external PL AXI-stream wiring + traffic-gen test pending).'
-        )
+        # The DDR->PLIO input mover (mm2s) is replaced by an ON-CHIP HLS traffic_gen 
+        # The output side is the unchanged s2mm mover so the host still reads the 
+        # result back / golden-checks it. On a deployed board,
+        # On read deployment the traffic_gen is swapped for the user's producer 
+        # IP wired the same way (sc=<producer>.M_AXIS:ai_engine_0.PLIO_ifm_*).
+        #
+        # traffic_gen emits no timing event pulses, so there is no shared time base -- PL timing
+        # is unavailable in this mode; the host measures wall-clock latency instead.
+        if enable_pl_timing:
+            print("[aie4ml] PLDataMoverMode='external_stream' has no PL timers "
+                  "(the traffic_gen source emits no events); using host-side timing "
+                  "(overriding EnablePLTiming=True).")
+            enable_pl_timing = False
+        src_k, ofm_k = 'traffic_gen', 's2mm'
+        kernels = [_kernel_entry(src_k, _DEPLOYMENT_TEMPLATE_DIR),
+                   _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
+        nk = [f'{src_k}:1:{src_k}', f'{ofm_k}:1:{ofm_k}']
+        sc = [f'{src_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
+        return {'mode': mode, 'enable_pl_timing': enable_pl_timing,
+                'kernels': kernels, 'nk': nk, 'sc': sc,
+                'host': {'timing_kernel': None, 'cycles': []}}
     raise ValueError(f'unknown PLDataMoverMode {mode!r}.')
 
 
@@ -342,11 +361,18 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     # On-chip budget is mode-specific, but BOTH count in BLOCKS -- the buffers are 512-bit
     # words, so each per-stream bank is width-pinned to 8 URAM/BRAM blocks regardless of depth
     # (a byte budget badly under-counts):
-    #   benchmark      preloads ALL n_iter on-chip -> cap n_iter to what the pool holds.
-    #   memory_stream  fixed 2-deep ping-pong buffers (n_iter unbounded) -> just verify they fit.
+    #   benchmark        preloads ALL n_iter on-chip -> cap n_iter to what the pool holds.
+    #   memory_stream    fixed 2-deep ping-pong buffers (n_iter unbounded) -> just verify they fit.
+    #   external_stream  like memory_stream but the input side is the on-chip traffic_gen, which
+    #                    holds NO ping-pong buffer -> only the s2mm (ofm) buffers count.
     if pl_data_mover_mode == 'benchmark':
         max_n_iter = _max_preloadable_iterations(ctx, pl_memory, n_ifm, n_ofm,
                                                  ifm_per_stream, ofm_per_stream)
+    elif pl_data_mover_mode == 'external_stream':
+        # traffic_gen streams on the fly (no input buffer): zero input banks AND rows so only
+        # the s2mm (ofm) ping-pong is charged.
+        _check_memory_stream_fits(ctx, pl_memory, 0, n_ofm, 0, ofm_per_stream)
+        max_n_iter = iterations
     else:
         # memory_stream: not preload-capped; fail early if the ping-pong won't fit the pool.
         _check_memory_stream_fits(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
