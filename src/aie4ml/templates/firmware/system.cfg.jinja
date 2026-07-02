@@ -1,0 +1,21 @@
+# =============================================================
+# system.cfg — v++ linker connectivity for {{ project_name }}
+#
+# PL data-mover mode: {{ pl_plan.mode }}
+# This design has {{ n_ifm }} input PLIO(s) and {{ n_ofm }} output PLIO(s).
+#
+# PLIO port names must exactly match the strings in
+# input_plio::create() / output_plio::create() in app.cpp.
+# =============================================================
+
+[connectivity]
+# PL kernel compute unit(s) (nk) + stream connection(s) (sc), per the data-mover plan.
+{% for entry in pl_plan.nk -%}
+nk={{ entry }}
+{% endfor %}
+{% for entry in pl_plan.sc -%}
+sc={{ entry }}
+{% endfor %}
+[clock]
+# Match pl-freq in aie.cfg ({{ "%.1f"|format(pl_freq_hz / 1e6) }} MHz)
+defaultFreqHz={{ pl_freq_hz|int }}

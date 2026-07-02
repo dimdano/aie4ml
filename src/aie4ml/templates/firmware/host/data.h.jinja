@@ -1,0 +1,7 @@
+#pragma once
+#include <cstdint>
+
+static const int IFM_SIZE_WORDS = {{ ifm_size_words }};
+static const int OFM_SIZE_WORDS = {{ ofm_size_words }};
+
+static const uint32_t ifm_packed[IFM_SIZE_WORDS] = { {{ ifm_packed | join(', ') }} };

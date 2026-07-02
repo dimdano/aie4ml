@@ -33,7 +33,20 @@ class AIEProjectEmitter:
 
         self._emit_kernel_artifacts(output_dir, layers, env)
         self._copy_kernel_sources(output_dir, ctx.project_config.custom_sources)
-        self._render_templates(output_dir, ctx, layers, graph_plan, env)
+
+        self._render_aie_templates(output_dir, ctx, layers, graph_plan, env)
+
+        # Three rendering concerns: AIE compute sources (above), the PL+host system
+        # (target='hardware' only), and the build Makefile (always; hardware-aware).
+        # The system render owns and returns the pl_plan so the Makefile can reuse it
+        # (build_pl_plan runs once). pl_plan is None for aie-only (no PL/host).
+        from .system_plan import emits_system
+
+        if emits_system(ctx):
+            pl_plan = self._render_system_templates(output_dir, ctx, env)
+        else:
+            pl_plan = None
+        self._render_makefile(output_dir, ctx, env, pl_plan)
 
     def _prepare_directories(self, output_dir: Path):
         (output_dir / 'src').mkdir(parents=True, exist_ok=True)
@@ -133,23 +146,67 @@ class AIEProjectEmitter:
         else:
             path.unlink()
 
-    def _render_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment):
+    def _render_aie_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment):
+        """Render the AIE compute sources (always, hardware-agnostic)."""
         context = {
             'layers': layers,
             'graph_plan': graph_plan,
             'plio_bitwidth': ctx.device.plio_width_bits,
             'iterations': int(ctx.aie_config['Iterations']),
             'pl_freq_mhz': float(ctx.aie_config['PLClockFreqMHz']),
-            'stamp': ctx.project_config.stamp,
-            'platform': ctx.device.platform,
         }
-
-        self._render_template(env, 'Makefile.jinja', output_dir / 'Makefile', context)
         self._render_template(env, 'aie.cfg.jinja', output_dir / 'aie.cfg', context)
         self._render_template(env, 'graph_plan.h.jinja', output_dir / 'src' / 'graph_plan.h', context)
         self._render_template(env, 'parameters.h.jinja', output_dir / 'src' / 'parameters.h', context)
         self._render_template(env, 'top_graph.h.jinja', output_dir / 'src' / 'top_graph.h', context)
         self._render_template(env, 'app.cpp.jinja', output_dir / 'app.cpp', context)
+
+    def _render_makefile(self, output_dir: Path, ctx, env: Environment, pl_plan):
+        """Render the unified build Makefile (always). It is the one base-project template
+        that is hardware-aware: when target='hardware' it adds PL/host/package targets and
+        needs the data-mover plan (kernel .xo list, per-kernel build/clean). All such uses
+        are gated behind is_hardware, so aie-only projects pass pl_plan=None.
+        """
+        context = {
+            'project_name': ctx.project_config.project_name,
+            'platform': ctx.device.platform,
+            'stamp': ctx.project_config.stamp,
+            'is_hardware': pl_plan is not None,
+            'pl_plan': pl_plan,
+        }
+        self._render_template(env, 'Makefile.jinja', output_dir / 'Makefile', context)
+
+    def _render_system_templates(self, output_dir: Path, ctx, env: Environment):
+        """Render the PL data mover + v++ connectivity + XRT host (target='hardware').
+
+        Templates live under templates/firmware/ (pl/, host/, system.cfg.jinja) and are
+        rendered with the shared firmware Jinja environment. Returns the resolved
+        ``pl_plan`` so the Makefile render can reuse it (built once, here).
+        """
+        from .system_plan import build_system_io
+
+        system_io = build_system_io(ctx)
+
+        (output_dir / 'pl').mkdir(parents=True, exist_ok=True)
+        (output_dir / 'host').mkdir(parents=True, exist_ok=True)
+
+        # Render each PL kernel the data-mover plan selects (benchmark = one combined
+        # CU; memory_stream = mm2s + s2mm [+ tick_gen when timing]). Templates may live
+        # under pl/ or pl/deployment/, but always render to pl/<name>.{cpp,cfg}.
+        for kernel in system_io['pl_plan']['kernels']:
+            name = kernel['name']
+            self._render_template(env, kernel['cpp_template'], output_dir / 'pl' / f'{name}.cpp', system_io)
+            self._render_template(env, kernel['cfg_template'], output_dir / 'pl' / f'{name}.cfg', system_io)
+
+        self._render_template(env, 'system.cfg.jinja', output_dir / 'system.cfg', system_io)
+        self._render_template(env, 'host/host.cpp.jinja', output_dir / 'host' / 'host.cpp', system_io)
+
+        # DDR-packed input header (data.h) consumed by host.cpp.
+        from .system_plan import host_data_context
+
+        self._render_template(env, 'host/data.h.jinja', output_dir / 'host' / 'data.h', host_data_context(ctx))
+
+        return system_io['pl_plan']
 
     def _render_template(self, env: Environment, template_name: str, destination: Path, context: dict):
         template = env.get_template(template_name)
