@@ -31,7 +31,7 @@ from .common import (
 )
 from .config import DenseConfig, DenseFlags
 from .resolver import (
-    _build_io_views,
+    _build_matmul_io_views,
     _resolve_numeric,
     _resolve_output_scale_shift,
     _resolve_parallelism,
@@ -100,7 +100,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
         precision = _resolve_numeric(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
         tiling = _resolve_parallelism(node, device, microtiling, precision)
-        io_views = _build_io_views(node, microtiling, tiling)
+        io_views = _build_matmul_io_views(node, microtiling, tiling)
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')

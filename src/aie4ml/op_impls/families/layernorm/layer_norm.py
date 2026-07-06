@@ -11,8 +11,8 @@ from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
     ParallelismConfig,
-    build_partition_views,
-    decompose_shape,
+    build_io_views,
+    extract_inner_outer,
     find_tile_split,
     parse_directives,
     require_power_of_two,
@@ -93,7 +93,7 @@ class LayerNormI8OpImplVariant(OpImplVariant):
         }
 
         in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
-        full_inner, outer_prefix, last_outer = decompose_shape(in_shape)
+        full_inner, outer_prefix, last_outer = extract_inner_outer(in_shape)
 
         vec_size = layernorm_vec_size(precision['lhs'], device)
         if full_inner % vec_size != 0:
@@ -124,7 +124,7 @@ class LayerNormI8OpImplVariant(OpImplVariant):
             descending=True,
         )
 
-        io_views = build_partition_views(
+        io_views = build_io_views(
             node,
             [in_tensor],
             [out_tensor],

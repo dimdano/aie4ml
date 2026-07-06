@@ -33,8 +33,7 @@ def _bank_capacity_bytes(device: Any) -> int:
     return max(1, int(getattr(device, 'bank_mem_bytes', 0) or 1))
 
 
-def _rhs_stack_overhead_bytes(op_type: str) -> int:
-    return 1024 if op_type == 'matmul' else 0
+_MATMUL_RHS_STACK_BYTES = 1024
 
 
 def _tile_bank_usage(
@@ -50,7 +49,7 @@ def _tile_bank_usage(
 ) -> Dict[str, int]:
     lhs_tile_bytes = int(full_outer) * int(tile_inner_lhs) * max(1, int(lhs_bytes))
     rhs_tile_bytes = int(tile_inner_lhs) * int(tile_inner_rhs) * max(1, int(rhs_bytes))
-    rhs_tile_bytes += _rhs_stack_overhead_bytes(op_type)
+    rhs_tile_bytes += _MATMUL_RHS_STACK_BYTES if op_type == 'matmul' else 0
     output_tile_bytes = int(full_outer) * int(tile_inner_rhs) * max(1, int(output_bytes))
     return {
         'lhs_tile_bytes': lhs_tile_bytes,
@@ -326,7 +325,7 @@ def _resolve_parallelism(
     return best[1]
 
 
-def _build_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTiling) -> Dict[str, TensorView]:
+def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTiling) -> Dict[str, TensorView]:
     full_inner_lhs = tiling.tile_inner_lhs * tiling.cas_length
     full_inner_out = tiling.tile_inner_rhs * tiling.cas_num
     outer_granularity = 2 * microtiling.microtile_m

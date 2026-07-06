@@ -8,22 +8,22 @@ from .tensor_view import (
     map_view_axis,
     ordered_view_shape,
 )
-from .tiling import ParallelismConfig, build_partition_views, decompose_shape, find_tile_split, parse_directives
+from .tiling import ParallelismConfig, build_io_views, extract_inner_outer, find_tile_split, parse_directives
 
 __all__ = [
     'ParallelismConfig',
     'TensorView',
     'align_up',
-    'build_partition_views',
+    'build_io_views',
     'build_tensor_view',
     'build_tensor_view_from_staging',
     'canonical_buffer_axes',
     'ceildiv',
-    'decompose_shape',
+    'find_tile_split',
     'make_staging_descriptor',
     'map_view_axis',
     'ordered_view_shape',
     'parse_directives',
     'require_power_of_two',
-    'find_tile_split',
+    'extract_inner_outer',
 ]

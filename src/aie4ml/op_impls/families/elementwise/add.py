@@ -11,10 +11,10 @@ from ...registry import register_variant
 from ...utils import (
     ParallelismConfig,
     align_up,
-    build_partition_views,
+    build_io_views,
     build_tensor_view_from_staging,
     ceildiv,
-    decompose_shape,
+    extract_inner_outer,
     find_tile_split,
     parse_directives,
 )
@@ -91,7 +91,7 @@ class AddOpImplVariant(OpImplVariant):
             io_views = {t.name: build_tensor_view_from_staging(node, t, 'inputs', port0) for t in node.inputs}
             io_views.update({t.name: build_tensor_view_from_staging(node, t, 'outputs', port0) for t in node.outputs})
         elif staging_contract == 'inner':
-            full_inner, outer_prefix, last_outer = decompose_shape(lhs_shape)
+            full_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
             full_inner = align_up(full_inner, vec_size)
             raw_inner = int(lhs_shape[-1])
             compacted_outer = outer_prefix * last_outer
@@ -106,7 +106,7 @@ class AddOpImplVariant(OpImplVariant):
                 contract='inner',
                 require_match=True,
             )
-            io_views = build_partition_views(
+            io_views = build_io_views(
                 node,
                 list(node.inputs),
                 list(node.outputs),
@@ -118,7 +118,7 @@ class AddOpImplVariant(OpImplVariant):
                 tile_outer_raw=last_outer,
             )
         else:
-            full_inner, outer_prefix, last_outer = decompose_shape(lhs_shape)
+            full_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
             full_inner = align_up(full_inner, vec_size)
             raw_inner = int(lhs_shape[-1])
             cas_num, tile_outer = find_tile_split(
@@ -131,7 +131,7 @@ class AddOpImplVariant(OpImplVariant):
                 primary_tensor_name=lhs_tensor.name,
                 contract='outer',
             )
-            io_views = build_partition_views(
+            io_views = build_io_views(
                 node,
                 list(node.inputs),
                 list(node.outputs),

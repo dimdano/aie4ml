@@ -27,7 +27,7 @@ def parse_directives(directives) -> tuple[dict, dict, dict]:
     )
 
 
-def decompose_shape(shape: tuple[int, ...]) -> tuple[int, int, int]:
+def extract_inner_outer(shape: tuple[int, ...]) -> tuple[int, int, int]:
     """Return (full_inner, outer_prefix, last_outer) for any ND shape.
 
     full_inner   = shape[-1]
@@ -35,7 +35,7 @@ def decompose_shape(shape: tuple[int, ...]) -> tuple[int, int, int]:
     outer_prefix = prod(shape[:-2])  (1 when rank <= 2)
     """
     if not shape:
-        raise ValueError('decompose_shape requires rank >= 1.')
+        raise ValueError('extract_inner_outer requires rank >= 1.')
     full_inner = int(shape[-1])
     last_outer = int(shape[-2]) if len(shape) >= 2 else 1
     outer_prefix = int(math.prod(shape[:-2])) if len(shape) > 2 else 1
@@ -105,7 +105,7 @@ def find_tile_split(
     )
 
 
-def build_partition_views(
+def build_io_views(
     node,
     tensors_in: list,
     tensors_out: list,
@@ -117,7 +117,7 @@ def build_partition_views(
     tile_inner_raw: int,
     tile_outer_raw: int,
 ) -> dict:
-    """Build io_views for all tensors under a partitioned contract."""
+    """Build io_views for all tensors sharing the same partition geometry."""
     from .tensor_view import build_tensor_view
 
     views = {}

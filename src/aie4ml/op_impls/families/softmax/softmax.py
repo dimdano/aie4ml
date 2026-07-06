@@ -7,7 +7,7 @@ from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ...base import OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, build_partition_views, decompose_shape, find_tile_split, parse_directives
+from ...utils import ParallelismConfig, build_io_views, extract_inner_outer, find_tile_split, parse_directives
 from ...utils.io import view_shape
 from ...utils.precision import resolve_exact_storage_dtype, storage_bytes_for_spec
 from ..elementwise.common import describe_elementwise_staging
@@ -15,7 +15,7 @@ from .common import DEFAULT_INV_SHIFT, infer_hccs_param_sets, pack_hccs_params, 
 from .config import SoftmaxConfig
 
 
-def _hccs_directives(node_name: str, directives) -> dict:
+def _parse_hccs_directives(node_name: str, directives) -> dict:
     directives = directives or {}
     approximation = str(directives.get('approximation', 'hccs')).lower()
     if approximation != 'hccs':
@@ -59,7 +59,7 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> SoftmaxConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
-        hccs = _hccs_directives(node.name, directives)
+        hccs = _parse_hccs_directives(node.name, directives)
 
         in_tensor = input_tensor_for_role(node, 'lhs')
         out_tensor = node.outputs[0]
@@ -73,7 +73,7 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
         }
 
         in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
-        full_inner, outer_prefix, last_outer = decompose_shape(in_shape)
+        full_inner, outer_prefix, last_outer = extract_inner_outer(in_shape)
         vec_size = softmax_vec_size(precision['lhs'], device)
         if full_inner % vec_size != 0:
             raise ValueError(
@@ -102,7 +102,7 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
             contract='outer',
         )
 
-        io_views = build_partition_views(
+        io_views = build_io_views(
             node,
             [in_tensor],
             [out_tensor],
