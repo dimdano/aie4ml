@@ -32,6 +32,7 @@ from .common import (
 from .config import DenseConfig, DenseFlags
 from .resolver import (
     _build_matmul_io_views,
+    _resolve_bias_dtype,
     _resolve_numeric,
     _resolve_output_scale_shift,
     _resolve_parallelism,
@@ -98,6 +99,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, _, _ = parse_directives(directives)
         precision = _resolve_numeric(node, device)
+        precision['bias'] = _resolve_bias_dtype(node, precision)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
         tiling = _resolve_parallelism(node, device, microtiling, precision)
         io_views = _build_matmul_io_views(node, microtiling, tiling)

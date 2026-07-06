@@ -110,8 +110,6 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
         if not all(isinstance(t.precision, FloatIntent) for t in (lhs_tensor, rhs_tensor, out_tensor)):
             raise ValueError(f'{node.name}: float {node.op_type} requires lhs/rhs/output to share float precision.')
         resolved['acc'] = AIEDataType(format='accfloat', frac=0)
-        if node.op_type == 'dense':
-            resolved['bias'] = AIEDataType(format='float32', frac=0)
         return resolved
 
     lhs_intent = to_quant_intent(lhs_tensor.precision)
@@ -123,19 +121,6 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
             'no implementation variant available.'
         )
 
-    if node.op_type == 'dense':
-        bias_tensor = next((t for t in node.inputs if t.is_parameter and input_role(node, t.name) == 'bias'), None)
-        if bias_tensor is not None and bias_tensor.precision is not None:
-            bias_intent = to_quant_intent(bias_tensor.precision)
-            resolved['bias'] = AIEDataType(
-                format='int32',
-                frac=int(lhs_intent.frac + rhs_intent.frac),
-                rounding=bias_intent.rounding,
-                saturation=bias_intent.saturation,
-            )
-        else:
-            resolved['bias'] = AIEDataType(format='int32', frac=int(lhs_intent.frac + rhs_intent.frac))
-
     acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'], None)
     acc_width = {'acc32': 32, 'acc48': 48, 'acc64': 64}[acc_tag]
     resolved['acc'] = AIEDataType(
@@ -143,6 +128,19 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
         frac=int(lhs_intent.frac + rhs_intent.frac),
     )
     return resolved
+
+
+def _resolve_bias_dtype(node, precision: Dict[str, AIEDataType]) -> AIEDataType:
+    """Resolve the bias accumulator dtype for dense-family ops."""
+    is_float = precision['acc'].format == 'accfloat'
+    if is_float:
+        return AIEDataType(format='float32', frac=0)
+    bias_tensor = next((t for t in node.inputs if t.is_parameter and input_role(node, t.name) == 'bias'), None)
+    frac = int(precision['lhs'].frac) + int(precision['rhs'].frac)
+    if bias_tensor is not None and bias_tensor.precision is not None:
+        bias_intent = to_quant_intent(bias_tensor.precision)
+        return AIEDataType(format='int32', frac=frac, rounding=bias_intent.rounding, saturation=bias_intent.saturation)
+    return AIEDataType(format='int32', frac=frac)
 
 
 def _resolve_output_scale_shift(node, *, is_float: bool) -> int:
