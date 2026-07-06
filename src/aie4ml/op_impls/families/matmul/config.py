@@ -3,13 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ...utils import TensorView
-
-
-@dataclass(frozen=True)
-class MatmulParallelismConfig:
-    cas_length: int
-    cas_num: int
+from ...utils import ParallelismConfig, TensorView
 
 
 @dataclass(frozen=True)
@@ -17,7 +11,7 @@ class MatmulMicrotileConfig:
     """aie::mmul intrinsic microtile dimensions.
 
     This is the smallest granularity: data must be rearranged to match these
-    shapes before the aie::mmul intrinsic is called .
+    shapes before the aie::mmul intrinsic is called.
     """
 
     microtile_m: int
@@ -41,7 +35,7 @@ class MatmulFlags:
 @dataclass(frozen=True)
 class DenseConfig:
     precision: Dict[str, Any]
-    parallelism: MatmulParallelismConfig
+    parallelism: ParallelismConfig
     microtiling: MatmulMicrotileConfig
     io_views: Dict[str, TensorView]
     io_route: Dict[str, Any]
@@ -54,7 +48,7 @@ class DenseConfig:
 @dataclass(frozen=True)
 class MatmulConfig:
     precision: Dict[str, Any]
-    parallelism: MatmulParallelismConfig
+    parallelism: ParallelismConfig
     microtiling: MatmulMicrotileConfig
     io_views: Dict[str, TensorView]
     io_route: Dict[str, Any]

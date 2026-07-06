@@ -64,8 +64,7 @@ class Resolve(AIEPass):
             resolved_directives['io_route'] = resolve_io_route(node)  # user intents
             resolved_directives['input_contracts'] = _resolved_input_contracts(ctx, node)
 
-            config = resolver.resolve(node, ctx.device, resolved_directives)
-            variant = resolver.select_variant(config, ctx.device.generation)
+            config, variant = resolver.resolve(node, ctx.device, resolved_directives)
             variant.validate_config(node, config, ctx.device)
             ports = variant.build_ports(node, config)
 

@@ -6,27 +6,17 @@ from typing import Any, Dict, Optional
 
 from ....aie_types import AIEDataType, FloatIntent, legality_format
 from ....ir import input_role, input_tensor_for_role
-from ...family_registry import family_resolver
+from ...family_registry import FamilyResolver, family_resolver
 from ...registry import get_op_impl_registry
-from ...registry import select_variant as _select_variant
 from ...utils import TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
 from ...utils.precision import (
-    aie_rounding_token,
     element_bytes,
     infer_accumulator_tag,
-    resolve_accumulator_output_shift,
     resolve_exact_storage_dtype,
     to_quant_intent,
 )
-from .config import (
-    DenseConfig,
-    DenseFlags,
-    MatmulConfig,
-    MatmulFlags,
-    MatmulMicrotileConfig,
-    MatmulParallelismConfig,
-)
+from .config import MatmulMicrotileConfig
 
 
 @dataclass(frozen=True)
@@ -359,7 +349,6 @@ def _build_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTili
                 full_outer=align_up(last_outer, outer_granularity),
             )
         elif role == 'rhs' and not tensor.is_parameter:
-            # matmul activation RHS: outer dim = K slice, inner dim = N slice
             shapes[tensor.name] = build_tensor_view(
                 node,
                 tensor,
@@ -372,7 +361,6 @@ def _build_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTili
                 tile_outer_raw=tiling.tile_inner_lhs_raw,
             )
         else:
-            # parameter (dense weights, bias): no padding applied
             shapes[tensor.name] = build_tensor_view(
                 node,
                 tensor,
@@ -426,62 +414,18 @@ def _validate_matmul_family_rank_contract(node) -> None:
 
 
 @family_resolver('dense')
-class DenseResolver:
+class DenseFamilyResolver(FamilyResolver):
     op_type = 'dense'
 
-    def resolve(self, node, device, directives=None) -> DenseConfig:
+    def validate_structure(self, node, _device) -> None:
         _validate_matmul_family_rank_contract(node)
-        io_route = dict((directives or {}).get('io_route', {}))
-        precision = _resolve_numeric(node, device)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision)
-        io_views = _build_io_views(node, microtiling, tiling)
-
-        lhs_tensor = input_tensor_for_role(node, 'lhs')
-        rhs_tensor = input_tensor_for_role(node, 'rhs')
-        lhs_perm = io_views[lhs_tensor.name].perm
-        is_float = isinstance(lhs_tensor.precision, FloatIntent)
-
-        shift = (
-            0
-            if is_float
-            else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
-        )
-        shift += _resolve_output_scale_shift(node, is_float=is_float)
-
-        fused_act = node.traits.get('fused_activation')
-        use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
-
-        return DenseConfig(
-            precision=precision,
-            parallelism=MatmulParallelismConfig(
-                cas_length=tiling.cas_length,
-                cas_num=tiling.cas_num,
-            ),
-            microtiling=microtiling,
-            io_views=io_views,
-            io_route=io_route,
-            shift=shift,
-            accumulator_tag='accfloat'
-            if is_float
-            else infer_accumulator_tag(device, precision['lhs'], precision['rhs'], precision.get('acc')),
-            rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
-            flags=DenseFlags(
-                use_relu=use_relu,
-                transpose_lhs=bool(lhs_perm is not None and lhs_perm[-1] != (len(lhs_perm) - 1)),
-                use_bias=bool(node.metadata.get('use_bias')),
-            ),
-        )
-
-    def select_variant(self, config: DenseConfig, generation: str):
-        return _select_variant(self.op_type, config, generation)
 
 
 @family_resolver('matmul')
-class MatmulResolver:
+class MatmulFamilyResolver(FamilyResolver):
     op_type = 'matmul'
 
-    def resolve(self, node, device, directives=None) -> MatmulConfig:
+    def validate_structure(self, node, _device) -> None:
         _validate_matmul_family_rank_contract(node)
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         if rhs_tensor.is_parameter:
@@ -489,44 +433,3 @@ class MatmulResolver:
                 f'{node.name}: matmul.v1 requires a runtime RHS tensor. Constant RHS MatMul must lower to dense, '
                 'parallel rank-2 MatMul ops, or a static/batched matmul variant.'
             )
-        io_route = dict((directives or {}).get('io_route', {}))
-        precision = _resolve_numeric(node, device)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision)
-        io_views = _build_io_views(node, microtiling, tiling)
-
-        lhs_tensor = input_tensor_for_role(node, 'lhs')
-        rhs_tensor = input_tensor_for_role(node, 'rhs')
-        lhs_perm = io_views[lhs_tensor.name].perm
-        rhs_perm = io_views[rhs_tensor.name].perm
-        is_float = isinstance(rhs_tensor.precision, FloatIntent)
-
-        shift = (
-            0
-            if is_float
-            else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
-        )
-        shift += _resolve_output_scale_shift(node, is_float=is_float)
-
-        return MatmulConfig(
-            precision=precision,
-            parallelism=MatmulParallelismConfig(
-                cas_length=tiling.cas_length,
-                cas_num=tiling.cas_num,
-            ),
-            microtiling=microtiling,
-            io_views=io_views,
-            io_route=io_route,
-            shift=shift,
-            accumulator_tag='accfloat'
-            if is_float
-            else infer_accumulator_tag(device, precision['lhs'], precision['rhs'], precision.get('acc')),
-            rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
-            flags=MatmulFlags(
-                transpose_lhs=bool(lhs_perm is not None and lhs_perm[-1] != (len(lhs_perm) - 1)),
-                transpose_rhs=bool(rhs_perm is not None and rhs_perm[-1] != (len(rhs_perm) - 1)),
-            ),
-        )
-
-    def select_variant(self, config: MatmulConfig, generation: str):
-        return _select_variant(self.op_type, config, generation)

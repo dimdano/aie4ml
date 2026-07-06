@@ -15,3 +15,8 @@ def ceildiv(numer: int, denom: int) -> int:
         raise ValueError(f'ceildiv requires denom > 0, got {denom}.')
     numer = int(numer)
     return (numer + denom - 1) // denom
+
+
+def require_power_of_two(label: str, value: int) -> None:
+    if value <= 0 or (value & (value - 1)) != 0:
+        raise ValueError(f'{label}: must be a power of two, got {value}.')

@@ -7,7 +7,6 @@ import numpy as np
 from ....aie_types import FLOAT_FORMATS
 from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 from ...utils import TensorView, canonical_buffer_axes, make_staging_descriptor, ordered_view_shape
-from ...utils.precision import storage_bytes_for_spec
 
 # Keys are canonical format-string pairs (lhs_format, rhs_format).
 # Integer formats: 'int8', 'int16' (sign-agnostic — both int8_t and uint8_t map here).
@@ -177,48 +176,6 @@ def describe_family_rhs_staging(view: TensorView, microtiling, parallelism, port
             'packing_microtile_n': microtile_n,
         },
     )
-
-
-def validate_family_tile_contract(
-    *,
-    node_name: str,
-    precision,
-    parallelism,
-    microtiling,
-    lhs_view: TensorView,
-    output_view: TensorView,
-    bank_bytes: int,
-    rhs_overhead_bytes: int = 0,
-) -> None:
-    tile_outer = lhs_view.compacted_tile_outer
-    tile_inner_lhs = lhs_view.tile_inner
-    tile_inner_rhs = output_view.tile_inner
-    full_inner_lhs = lhs_view.full_inner
-    full_inner_rhs = output_view.full_inner
-
-    a_tile_bytes = int(tile_outer) * tile_inner_lhs * storage_bytes_for_spec(precision['lhs'])
-    b_tile_bytes = tile_inner_lhs * tile_inner_rhs * storage_bytes_for_spec(precision['rhs'])
-    c_tile_bytes = int(tile_outer) * tile_inner_rhs * storage_bytes_for_spec(precision['output'])
-    if a_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: A tile uses {a_tile_bytes}B, exceeds one {bank_bytes}B bank.')
-    if b_tile_bytes + int(rhs_overhead_bytes) > bank_bytes:
-        raise ValueError(
-            f'{node_name}: B tile plus overhead uses '
-            f'{b_tile_bytes + int(rhs_overhead_bytes)}B, exceeds one {bank_bytes}B bank.'
-        )
-    if c_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: C tile uses {c_tile_bytes}B, exceeds one {bank_bytes}B bank.')
-
-    if full_inner_lhs != tile_inner_lhs * int(parallelism.cas_length):
-        raise ValueError(f'{node_name}: full_inner_lhs must equal tile_inner_lhs * cas_length.')
-    if full_inner_rhs != tile_inner_rhs * int(parallelism.cas_num):
-        raise ValueError(f'{node_name}: full_inner_rhs must equal tile_inner_rhs * cas_num.')
-    if tile_inner_lhs % max(1, 2 * int(microtiling.microtile_k)) != 0:
-        raise ValueError(f'{node_name}: tile_inner_lhs must be divisible by 2 * microtile_k.')
-    if tile_inner_rhs % max(1, 2 * int(microtiling.microtile_n)) != 0:
-        raise ValueError(f'{node_name}: tile_inner_rhs must be divisible by 2 * microtile_n.')
-    if lhs_view.compacted_tile_outer % max(1, 2 * int(microtiling.microtile_m)) != 0:
-        raise ValueError(f'{node_name}: tile_outer (lhs) must be divisible by 2 * microtile_m.')
 
 
 def np_dtype_for_spec(spec) -> np.dtype:

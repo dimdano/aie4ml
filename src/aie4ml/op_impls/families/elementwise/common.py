@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-import math
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from ...utils import canonical_buffer_axes, make_staging_descriptor, ordered_view_shape
 from ...utils.precision import storage_bytes_for_spec
@@ -16,26 +15,6 @@ def elementwise_vec_size(lhs_precision, device) -> int:
     """
     lhs_bytes = storage_bytes_for_spec(lhs_precision)
     return int(device.vector_bytes) // max(1, int(lhs_bytes))
-
-
-def validate_elementwise_tile_contract(
-    *, node_name: str, precision: Dict[str, Any], lhs_view, bank_bytes: int, vec_size: int
-) -> None:
-    slice_elements = int(math.prod(lhs_view.tile))
-    if slice_elements % vec_size != 0:
-        raise ValueError(
-            f'{node_name}: elementwise tile has {slice_elements} elements, not a multiple of vec_size {vec_size}; '
-            'the resolver must choose a kernel tile with a vector-aligned element count.'
-        )
-    lhs_tile_bytes = slice_elements * storage_bytes_for_spec(precision['lhs'])
-    rhs_tile_bytes = slice_elements * storage_bytes_for_spec(precision['rhs'])
-    out_tile_bytes = slice_elements * storage_bytes_for_spec(precision['output'])
-    if lhs_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: lhs tile uses {lhs_tile_bytes}B, exceeds one {bank_bytes}B bank.')
-    if rhs_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: rhs tile uses {rhs_tile_bytes}B, exceeds one {bank_bytes}B bank.')
-    if out_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: output tile uses {out_tile_bytes}B, exceeds one {bank_bytes}B bank.')
 
 
 def describe_elementwise_staging(view, port: int, access: str, contract: str, buf_dims=None):
@@ -61,8 +40,6 @@ def describe_elementwise_staging(view, port: int, access: str, contract: str, bu
         {
             'dimension': traverse_dim,
             'stride': int(raw_slice[traverse_dim]),
-            # 'inner' contract: the outer axis is traversed in full across the port's inner slice.
-            # 'outer' contract: each port covers exactly one outer slice, so wrap=1.
             'wrap': (
                 max(1, int(buffer_dimension[traverse_dim]) // max(1, int(raw_slice[traverse_dim])))
                 if contract == 'inner'

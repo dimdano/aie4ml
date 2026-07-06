@@ -4,9 +4,8 @@ from .common import (
     GAMMA_FRAC_BITS,
     layernorm_vec_size,
     pack_layernorm_param,
-    validate_layernorm_tile_contract,
 )
-from .config import LayerNormConfig, LayerNormParallelismConfig
+from .config import LayerNormConfig
 from .layer_norm import LayerNormI8OpImplVariant
 
 __all__ = [
@@ -14,8 +13,6 @@ __all__ = [
     'GAMMA_FRAC_BITS',
     'LayerNormConfig',
     'LayerNormI8OpImplVariant',
-    'LayerNormParallelismConfig',
     'layernorm_vec_size',
     'pack_layernorm_param',
-    'validate_layernorm_tile_contract',
 ]

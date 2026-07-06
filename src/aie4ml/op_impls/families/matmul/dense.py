@@ -4,10 +4,19 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
+from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import OpImplFootprint, OpImplVariant
+from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
+from ...utils import ParallelismConfig, parse_directives
+from ...utils.precision import (
+    aie_rounding_token,
+    infer_accumulator_tag,
+    resolve_accumulator_output_shift,
+    resolve_exact_storage_dtype,
+)
 from .common import (
     MICROTILE_OPTIONS,
     describe_family_lhs_staging,
@@ -19,19 +28,21 @@ from .common import (
     pack_vector_by_n_slice,
     quantize_to_int,
     select_generation_key,
-    validate_family_tile_contract,
 )
-from .config import DenseConfig
+from .config import DenseConfig, DenseFlags
+from .resolver import (
+    _build_io_views,
+    _resolve_numeric,
+    _resolve_output_scale_shift,
+    _resolve_parallelism,
+    _resolve_tile_cfg,
+)
+
+_SUPPORTED_INT_WIDTH_COMBOS = frozenset({(8, 8), (16, 8), (16, 16)})
 
 
 class _BaseDenseMatmulVariant(OpImplVariant):
-    """Unregistered shared base for Dense and Matmul variants.
-
-    Holds the methods that are identical across both op types.
-    Each subclass is responsible for its own class-var declarations
-    (variant_id, op_type, supported_precisions, etc.) and any
-    method overrides specific to that op.
-    """
+    """Unregistered shared base for Dense and Matmul variants."""
 
     def build_template_params(self, node, config):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -49,18 +60,18 @@ class _BaseDenseMatmulVariant(OpImplVariant):
         )
         return params
 
-    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         view = config.io_views[tensor_name]
         return describe_family_lhs_staging(view, config.microtiling, port, buf_dims)
 
-    def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         view = config.io_views[tensor_name]
         return describe_family_output_staging(view, config.microtiling, port, buf_dims)
 
     def microtiling_options(self, generation: str, query) -> List[Tuple[int, int, int]]:
         return list(MICROTILE_OPTIONS.get(select_generation_key(generation), {}).get(tuple(query), []))
 
-    def output_staging_contract(self, node, config, tensor_name: str):
+    def output_staging_contract(self, _node, _config, _tensor_name: str):
         return 'inner'
 
 
@@ -71,24 +82,58 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
     graph_header = 'dense_bias_relu_graph.h'
     graph_name = 'dense_bias_relu_graph'
     param_template = 'dense_bias_relu'
-    supported_generations = ('AIE-ML', 'AIE-MLV2')
-    supported_precisions = (
-        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int8', 'acc': 'int32', 'bias': 'int32'},
-        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int16', 'acc': 'int32', 'bias': 'int32'},
-        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int32', 'acc': 'int32', 'bias': 'int32'},
-        {'lhs': 'int16', 'rhs': 'int8', 'output': 'int8', 'acc': 'int32', 'bias': 'int32'},
-        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int16', 'acc': 'int64', 'bias': 'int32'},
-        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int32', 'acc': 'int64', 'bias': 'int32'},
-        {'lhs': 'bfloat16', 'rhs': 'bfloat16', 'output': 'bfloat16', 'acc': 'accfloat', 'bias': 'float32'},
-        {'lhs': 'float32', 'rhs': 'float32', 'output': 'float32', 'acc': 'accfloat', 'bias': 'float32'},
-        {'lhs': 'fp8_e4m3', 'rhs': 'fp8_e4m3', 'output': 'fp8_e4m3', 'acc': 'accfloat', 'bias': 'float32'},
-    )
-    supported_input_modes = ('direct', 'memtile', 'plio', 'auto')
-    supported_output_modes = ('direct', 'memtile', 'plio', 'auto')
+    plevel = 10
+
+    def matches(self, node: OpNode, device) -> bool:
+        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
+            return False
+        lhs = input_tensor_for_role(node, 'lhs')
+        rhs = input_tensor_for_role(node, 'rhs')
+        if isinstance(lhs.precision, FloatIntent):
+            return True
+        lhs_p = resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name)
+        rhs_p = resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name)
+        return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS
+
+    def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
+        io_route, _, _ = parse_directives(directives)
+        precision = _resolve_numeric(node, device)
+        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
+        tiling = _resolve_parallelism(node, device, microtiling, precision)
+        io_views = _build_io_views(node, microtiling, tiling)
+
+        lhs_tensor = input_tensor_for_role(node, 'lhs')
+        rhs_tensor = input_tensor_for_role(node, 'rhs')
+        lhs_perm = io_views[lhs_tensor.name].perm
+        is_float = isinstance(lhs_tensor.precision, FloatIntent)
+
+        shift = (
+            0
+            if is_float
+            else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
+        )
+        shift += _resolve_output_scale_shift(node, is_float=is_float)
+
+        fused_act = node.traits.get('fused_activation')
+        use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
+
+        return DenseConfig(
+            precision=precision,
+            parallelism=ParallelismConfig(cas_length=tiling.cas_length, cas_num=tiling.cas_num),
+            microtiling=microtiling,
+            io_views=io_views,
+            io_route=io_route,
+            shift=shift,
+            accumulator_tag=infer_accumulator_tag(device, None, None, precision['acc']),
+            rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
+            flags=DenseFlags(
+                use_relu=use_relu,
+                transpose_lhs=bool(lhs_perm is not None and lhs_perm[-1] != (len(lhs_perm) - 1)),
+                use_bias=bool(node.metadata.get('use_bias')),
+            ),
+        )
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
-        from ....aie_types import FloatIntent
-
         p = inst.config
         input_tensor = inst.node.inputs[0]
         weight_tensor = inst.node.inputs[1]
@@ -154,22 +199,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
         )
         return {'packed_weights': packed_W, 'packed_bias': packed_B}
 
-    def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
-        p = config
-        lhs_tensor = input_tensor_for_role(node, 'lhs')
-        lhs_view = p.io_views[lhs_tensor.name]
-        output_view = p.io_views[node.outputs[0].name]
-        validate_family_tile_contract(
-            node_name=node.name,
-            precision=p.precision,
-            parallelism=p.parallelism,
-            microtiling=p.microtiling,
-            lhs_view=lhs_view,
-            output_view=output_view,
-            bank_bytes=int(device.bank_mem_bytes),
-        )
-
-    def footprint(self, node, config) -> OpImplFootprint:
+    def footprint(self, _node, config) -> OpImplFootprint:
         return OpImplFootprint(
             width=config.parallelism.cas_length,
             height=config.parallelism.cas_num,
@@ -194,9 +224,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
         ]
         packed_bias = inst.artifacts.get('packed_bias')
         if packed_bias is None:
-            # The current dense graph always exposes a bias RTP port. For biasless
-            # layers we feed an explicit zero bias matching the fixed kernel
-            # interface instead of trying to specialize the graph signature.
+            # Dense graph always exposes a bias RTP port; feed explicit zeros for biasless layers.
             packed_bias = np.zeros(
                 (int(p.parallelism.cas_num), output_view.tile_inner),
                 dtype=np_bias_dtype_for_spec(p.precision['bias']),
@@ -215,5 +243,15 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
         )
         return artifacts
 
+    def validate_config(self, node: OpNode, config: DenseConfig, _device) -> None:
+        if config.shift < 0:
+            raise ValueError(f'{node.name}: dense accumulator output shift must be non-negative, got {config.shift}.')
+
     def build_ports(self, node: OpNode, config: DenseConfig):
-        return super().build_ports(node, int(config.parallelism.cas_length), int(config.parallelism.cas_num))
+        n_in = int(config.parallelism.cas_length)
+        n_out = int(config.parallelism.cas_num)
+        data_inputs = [t for t in node.inputs if not t.is_parameter]
+        return PortMap(
+            inputs={t.name: PortBinding(group=f'in{i+1}', count=n_in) for i, t in enumerate(data_inputs)},
+            outputs={t.name: PortBinding(group=f'out{i+1}', count=n_out) for i, t in enumerate(node.outputs)},
+        )

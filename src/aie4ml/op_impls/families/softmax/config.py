@@ -3,19 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict
 
-from ...utils import TensorView
-
-
-@dataclass(frozen=True)
-class SoftmaxParallelismConfig:
-    cas_num: int
-    cas_length: int = 1
+from ...utils import ParallelismConfig, TensorView
 
 
 @dataclass(frozen=True)
 class SoftmaxConfig:
     precision: Dict[str, Any]
-    parallelism: SoftmaxParallelismConfig
+    parallelism: ParallelismConfig
     param_sets: int
     vec_size: int
     inv_shift: int

@@ -2,12 +2,29 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ...base import OpImplFootprint, OpImplVariant
+from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
+from ...utils import ParallelismConfig, build_partition_views, decompose_shape, find_tile_split, parse_directives
+from ...utils.io import view_shape
+from ...utils.precision import resolve_exact_storage_dtype, storage_bytes_for_spec
 from ..elementwise.common import describe_elementwise_staging
-from .common import pack_hccs_params, validate_softmax_tile_contract
+from .common import DEFAULT_INV_SHIFT, infer_hccs_param_sets, pack_hccs_params, softmax_vec_size, validate_hccs_params
 from .config import SoftmaxConfig
+
+
+def _hccs_directives(node_name: str, directives) -> dict:
+    directives = directives or {}
+    approximation = str(directives.get('approximation', 'hccs')).lower()
+    if approximation != 'hccs':
+        raise ValueError(f'{node_name}: only approximation="hccs" is supported for integer Softmax.')
+    hccs = dict(directives.get('hccs', {}) or {})
+    missing = [name for name in ('B', 'S', 'Dmax') if name not in hccs]
+    if missing:
+        raise ValueError(f'{node_name}: HCCS Softmax directives missing {", ".join(missing)}.')
+    return hccs
 
 
 @register_variant
@@ -25,13 +42,100 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
     graph_header = 'softmax_graph.h'
     graph_name = 'softmax_hccs_graph'
     param_template = 'softmax'
-    supported_generations = ('AIE-ML', 'AIE-MLV2')
-    supported_precisions = (
-        {'lhs': 'int8', 'output': 'int8', 'B': 'int16', 'S': 'int8', 'Dmax': 'int8'},
-        {'lhs': 'int8', 'output': 'int16', 'B': 'int16', 'S': 'int8', 'Dmax': 'int8'},
-    )
-    supported_input_modes = ('direct', 'memtile', 'plio', 'auto')
-    supported_output_modes = ('direct', 'memtile', 'plio', 'auto')
+    plevel = 10
+
+    def matches(self, node: OpNode, device) -> bool:
+        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
+            return False
+        in_tensor = input_tensor_for_role(node, 'lhs')
+        if isinstance(in_tensor.precision, FloatIntent):
+            return False
+        directives = node.directives or {}
+        if str(directives.get('approximation', 'hccs')).lower() != 'hccs':
+            return False
+        in_prec = resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name)
+        out_prec = resolve_exact_storage_dtype(node.outputs[0].precision, namespace='output', layer_name=node.name)
+        return in_prec.format == 'int8' and out_prec.format in ('uint8', 'int16')
+
+    def resolve(self, node: OpNode, device, directives=None) -> SoftmaxConfig:
+        io_route, input_contracts, parallel_cfg = parse_directives(directives)
+        hccs = _hccs_directives(node.name, directives)
+
+        in_tensor = input_tensor_for_role(node, 'lhs')
+        out_tensor = node.outputs[0]
+
+        precision = {
+            'lhs': resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name),
+            'output': resolve_exact_storage_dtype(out_tensor.precision, namespace='output', layer_name=node.name),
+            'B': AIEDataType(format='int16'),
+            'S': AIEDataType(format='int8'),
+            'Dmax': AIEDataType(format='uint8'),
+        }
+
+        in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
+        full_inner, outer_prefix, last_outer = decompose_shape(in_shape)
+        vec_size = softmax_vec_size(precision['lhs'], device)
+        if full_inner % vec_size != 0:
+            raise ValueError(
+                f'{node.name}: softmax axis length {full_inner} must be a multiple of vec_size={vec_size}; '
+                'pad the softmax dimension before lowering.'
+            )
+
+        cas_length = int(parallel_cfg.get('cas_length', 1))
+        if cas_length != 1:
+            raise ValueError(f'{node.name}: HCCS Softmax requires cas_length=1, got {cas_length}.')
+
+        in_bpp = storage_bytes_for_spec(precision['lhs'])
+        out_bpp = storage_bytes_for_spec(precision['output'])
+        cas_num, tile_outer = find_tile_split(
+            partition_size=last_outer,
+            max_rows=max(1, int(device.rows)),
+            bank_bytes=int(device.bank_mem_bytes),
+            tile_bytes_fn=lambda to: max(
+                outer_prefix * to * full_inner * in_bpp,
+                outer_prefix * to * full_inner * out_bpp,
+                full_inner * 2,
+            ),
+            parallel_cfg=parallel_cfg,
+            input_contracts=input_contracts,
+            primary_tensor_name=in_tensor.name,
+            contract='outer',
+        )
+
+        io_views = build_partition_views(
+            node,
+            [in_tensor],
+            [out_tensor],
+            full_inner=full_inner,
+            full_outer=last_outer,
+            tile_inner=full_inner,
+            tile_outer=tile_outer,
+            tile_inner_raw=full_inner,
+            tile_outer_raw=tile_outer,
+        )
+
+        return SoftmaxConfig(
+            precision=precision,
+            parallelism=ParallelismConfig(cas_num=int(cas_num)),
+            param_sets=int(infer_hccs_param_sets(hccs)),
+            vec_size=int(vec_size),
+            inv_shift=int(hccs.get('inv_shift', DEFAULT_INV_SHIFT)),
+            use_clb=bool(hccs.get('use_clb', False)),
+            io_views=io_views,
+            io_route=io_route,
+            hccs=hccs,
+        )
+
+    def validate_config(self, node: OpNode, config: SoftmaxConfig, _device) -> None:
+        if config.param_sets != 1:
+            raise ValueError(
+                f'{node.name}: softmax.hccs.i8.v1 does not support multi-head param_sets={config.param_sets}; '
+                'lower attention to one Softmax op per head.'
+            )
+        if not (1 <= int(config.inv_shift) <= 30):
+            raise ValueError(f'{node.name}: HCCS Softmax inv_shift must be in [1, 30], got {config.inv_shift}.')
+        in_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
+        validate_hccs_params(config.hccs, cols=int(in_view.full_inner), param_sets=int(config.param_sets))
 
     def build_template_params(self, node: OpNode, config: SoftmaxConfig):
         in_tensor = input_tensor_for_role(node, 'lhs')
@@ -49,38 +153,14 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
         )
         return params
 
-    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, producer=None):
+    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         return describe_elementwise_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
 
-    def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_elementwise_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
 
-    def output_staging_contract(self, node, config: SoftmaxConfig, tensor_name: str):
+    def output_staging_contract(self, _node, _config: SoftmaxConfig, _tensor_name: str):
         return 'outer'
-
-    def validate_config(self, node: OpNode, config: SoftmaxConfig, device) -> None:
-        lhs_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
-        validate_softmax_tile_contract(
-            node_name=node.name,
-            precision=config.precision,
-            rows=int(lhs_view.compacted_tile_outer),
-            cols=int(lhs_view.full_inner),
-            bank_bytes=int(device.bank_mem_bytes),
-            vec_size=int(config.vec_size),
-        )
-        if int(config.inv_shift) < 1 or int(config.inv_shift) > 30:
-            raise ValueError(f'{node.name}: HCCS Softmax inv_shift must be in [1, 30], got {config.inv_shift}.')
-        if int(lhs_view.compacted_tile_outer) * int(config.parallelism.cas_num) != int(lhs_view.compacted_full_outer):
-            raise ValueError(
-                f'{node.name}: compacted_full_outer={lhs_view.compacted_full_outer} must equal '
-                f'compacted_tile_outer * cas_num ({lhs_view.compacted_tile_outer} * {config.parallelism.cas_num}).'
-            )
-        pack_hccs_params(
-            config.hccs,
-            param_sets=int(config.param_sets),
-            cols=int(lhs_view.full_inner),
-            cas_num=int(config.parallelism.cas_num),
-        )
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         return {}
@@ -93,8 +173,8 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
 
     def build_ports(self, node: OpNode, config: SoftmaxConfig):
         in_tensor = input_tensor_for_role(node, 'lhs')
-        return super().build_ports(
-            node,
-            {in_tensor.name: int(config.parallelism.cas_num)},
-            int(config.parallelism.cas_num),
+        n = int(config.parallelism.cas_num)
+        return PortMap(
+            inputs={in_tensor.name: PortBinding(group='in1', count=n)},
+            outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )

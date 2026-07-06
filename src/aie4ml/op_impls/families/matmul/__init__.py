@@ -9,7 +9,7 @@ from .common import (
     quantize_to_int,
     select_generation_key,
 )
-from .config import DenseConfig, DenseFlags, MatmulConfig, MatmulFlags, MatmulMicrotileConfig, MatmulParallelismConfig
+from .config import DenseConfig, DenseFlags, MatmulConfig, MatmulFlags, MatmulMicrotileConfig
 from .dense import DenseOpImplVariant
 from .matmul import MatmulOpImplVariant
 
@@ -21,7 +21,6 @@ __all__ = [
     'MatmulFlags',
     'MatmulOpImplVariant',
     'MatmulMicrotileConfig',
-    'MatmulParallelismConfig',
     'MICROTILE_OPTIONS',
     'np_bias_dtype_for_spec',
     'np_dtype_for_spec',

@@ -1,3 +1,4 @@
+from . import families  # noqa: F401 — populates both global registries
 from .base import OpImplFootprint, OpImplVariant
 from .common_types import PortBinding, PortMap
 from .family_registry import FamilyResolverRegistry, get_family_resolver_registry

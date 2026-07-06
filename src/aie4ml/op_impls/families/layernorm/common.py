@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any, Dict
-
 import numpy as np
 
 from ...utils.precision import storage_bytes_for_spec
@@ -12,10 +10,8 @@ __all__ = [
     'DEFAULT_ISQRT_NR_ITERS',
     'DEFAULT_USE_AIE_INVSQRT',
     'layernorm_vec_size',
-    'validate_layernorm_tile_contract',
     'pack_layernorm_param',
 ]
-
 
 # Fixed-point conventions baked into the integer LayerNorm kernel.
 # gamma is multiplied by inv_std (Q15) and right-shifted by GAMMA_SHIFT, so
@@ -39,39 +35,6 @@ def layernorm_vec_size(precision, device) -> int:
     if elem_bytes <= 1:
         return 32
     return int(device.vector_bytes) // max(1, elem_bytes)
-
-
-def validate_layernorm_tile_contract(
-    *,
-    node_name: str,
-    precision: Dict[str, Any],
-    tile_outer: int,
-    full_inner: int,
-    bank_bytes: int,
-    vec_size: int,
-) -> None:
-    if full_inner % vec_size != 0:
-        raise ValueError(
-            f'{node_name}: full_inner={full_inner} is not a multiple of vec_size={vec_size}; '
-            'the resolver must align full_inner before building the view.'
-        )
-    if full_inner <= 0 or (full_inner & (full_inner - 1)) != 0:
-        raise ValueError(
-            f'{node_name}: full_inner={full_inner} must be a power of two for the integer LayerNorm kernel.'
-        )
-
-    in_bytes = tile_outer * full_inner * storage_bytes_for_spec(precision['lhs'])
-    out_bytes = tile_outer * full_inner * storage_bytes_for_spec(precision['output'])
-    gamma_bytes = full_inner * storage_bytes_for_spec(precision['gamma'])
-    beta_bytes = full_inner * storage_bytes_for_spec(precision['beta'])
-    if in_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: input tile uses {in_bytes}B, exceeds one {bank_bytes}B bank.')
-    if out_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: output tile uses {out_bytes}B, exceeds one {bank_bytes}B bank.')
-    if gamma_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: gamma tile uses {gamma_bytes}B, exceeds one {bank_bytes}B bank.')
-    if beta_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: beta tile uses {beta_bytes}B, exceeds one {bank_bytes}B bank.')
 
 
 def pack_layernorm_param(

@@ -94,7 +94,7 @@ void layernorm_i8<ConfigT>::layernorm_row(
     // inputs: both floor-divisions accumulate independently, giving up to 2*|mu|
     // units of variance error.
     //
-    // Fits in int32: validate_layernorm_tile_contract caps COLS*1B <= bank_bytes
+    // Fits in int32: resolver enforces COLS*1B <= bank_bytes
     // (16 KiB), so |sum_sq|, |2*mu*sum_x|, |COLS*mu*mu| each stay under ~512M.
     // Worst-case partial sum < 1B, well below int32 max (2.1B).
     const int32_t centered_sq = sum_sq - 2 * mu * sum_x + COLS * mu * mu;

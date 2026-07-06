@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, Mapping, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from ..ir.graph import OpNode
-from .common_types import PortBinding, PortMap
+from ..ir.graph import OpImplInstance, OpNode
+from .common_types import PortMap
 
 
 @dataclass(frozen=True)
@@ -17,125 +17,72 @@ class OpImplFootprint:
 
 
 class OpImplVariant:
-    """Reusable implementation descriptor for one op type."""
+    """Self-contained compilation unit for one op variant.
+
+    Each subclass owns the full lifecycle: selection (matches + plevel),
+    configuration (resolve), verification (validate_config), and code
+    generation (build_template_params, build_ports, footprint, pack, get_artifacts).
+    """
 
     variant_id: ClassVar[str] = ''
     op_type: ClassVar[str] = ''
     graph_header: ClassVar[str] = ''
     graph_name: ClassVar[str] = ''
     param_template: ClassVar[str] = ''
-    supported_generations: ClassVar[Tuple[str, ...]] = ()
-    supported_precisions: ClassVar[Tuple[Dict[str, Any], ...]] = ()
-    supported_input_modes: ClassVar[Tuple[str, ...]] = ()
-    supported_output_modes: ClassVar[Tuple[str, ...]] = ()
+    plevel: ClassVar[int] = 10  # higher value = higher selection priority
 
-    def supports_generation(self, generation: str) -> bool:
-        if not self.supported_generations:
-            return True
-        norm = (generation or '').upper()
-        for token in self.supported_generations:
-            if token.upper() in norm:
-                return True
-        return False
+    def matches(self, _node: OpNode, _device: Any) -> bool:
+        raise NotImplementedError
 
-    def supports_io_route(self, io_route: Dict[str, Any]) -> bool:
-        if self.supported_input_modes:
-            for mode in io_route.get('inputs', {}).values():
-                if isinstance(mode, str) and mode not in self.supported_input_modes:
-                    return False
+    def resolve(self, _node: OpNode, _device: Any, _directives: Optional[Dict[str, Any]] = None) -> Any:
+        raise NotImplementedError
 
-        if self.supported_output_modes:
-            for mode in io_route.get('outputs', {}).values():
-                if isinstance(mode, str) and mode not in self.supported_output_modes:
-                    return False
+    def validate_config(self, _node: OpNode, _config: Any, _device: Any) -> None:
+        """Post-lowering attribute verifier. Override to enforce kernel ABI rules."""
 
-        return True
-
-    def supports_precisions(self, precision: Dict[str, Any]) -> bool:
-        if not self.supported_precisions:
-            return True
-        return any(all(precision.get(k) == v for k, v in spec.items()) for spec in self.supported_precisions)
-
-    def build_template_params(self, node: OpNode, config: Any) -> Any:
-        """Return the parameters object passed as ``P`` to the Jinja parameter template.
-
-        Subclasses override this to attach derived shape fields.
-        """
+    def build_template_params(self, _node: OpNode, config: Any) -> Dict[str, Any]:
         return config
 
-    def output_staging_contract(self, node: OpNode, config: Any, tensor_name: str) -> Optional[str]:
+    def output_staging_contract(self, _node: OpNode, _config: Any, _tensor_name: str) -> Optional[str]:
         return None
 
-    def output_port_count(self, node: OpNode, config: Any) -> Optional[int]:
-        """Number of ports that partition each output tensor of this variant.
-
-        Default: config.parallelism.cas_num by hardware design convention.
-        """
+    def output_port_count(self, _node: OpNode, config: Any) -> Optional[int]:
         return int(config.parallelism.cas_num)
 
-    def validate_config(self, node: OpNode, config: Any, device) -> None:
-        return None
-
-    def microtiling_options(self, generation: str, query: Any):
+    def microtiling_options(self, generation: str, query: Any) -> List[Tuple[int, int, int]]:
         raise NotImplementedError
 
-    def pack(self, inst):
+    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def get_artifacts(self, inst):
+    def get_artifacts(self, inst: OpImplInstance) -> List[Dict[str, Any]]:
         return []
 
-    def input_precision(self, config: Any, role: str):
+    def input_precision(self, config: Any, role: str) -> Any:
         return config.precision[role]
 
-    def output_precision(self, config: Any):
+    def output_precision(self, config: Any) -> Any:
         return config.precision['output']
 
     def describe_output_staging(
-        self,
-        node: OpNode,
-        config: Any,
-        tensor_name: str,
-        port: int,
-        buf_dims=None,
-    ):
+        self, _node: OpNode, _config: Any, _tensor_name: str, _port: int, _buf_dims: Any = None
+    ) -> Any:
         return None
 
     def describe_input_staging(
         self,
-        consumer: OpNode,
-        config: Any,
-        tensor_name: str,
-        port: int,
-        buf_dims=None,
-        producer: Optional[OpNode] = None,
-    ):
+        _consumer: OpNode,
+        _config: Any,
+        _tensor_name: str,
+        _port: int,
+        _buf_dims: Any = None,
+        _producer: Optional[OpNode] = None,
+    ) -> Any:
         return None
 
     def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
         raise NotImplementedError
 
-    def build_ports(
-        self,
-        node: OpNode,
-        input_port_count: int | Mapping[str, int],
-        output_port_count: int | Mapping[str, int],
-    ) -> PortMap:
-        inputs: Dict[str, PortBinding] = {}
-        outputs: Dict[str, PortBinding] = {}
-
-        def _count(spec: int | Mapping[str, int], tensor_name: str) -> int:
-            if isinstance(spec, Mapping):
-                if tensor_name not in spec:
-                    raise KeyError(f'Missing port count for tensor {tensor_name}.')
-                return int(spec[tensor_name])
-            return int(spec)
-
-        data_inputs = [tensor for tensor in node.inputs if not tensor.is_parameter]
-        for index, tensor in enumerate(data_inputs):
-            inputs[tensor.name] = PortBinding(group=f'in{index+1}', count=_count(input_port_count, tensor.name))
-
-        for index, tensor in enumerate(node.outputs):
-            outputs[tensor.name] = PortBinding(group=f'out{index+1}', count=_count(output_port_count, tensor.name))
-
-        return PortMap(inputs=inputs, outputs=outputs)
+    def build_ports(self, _node: OpNode, _config: Any) -> PortMap:
+        """Assemble the PortMap for this variant.  Must be overridden."""
+        raise NotImplementedError

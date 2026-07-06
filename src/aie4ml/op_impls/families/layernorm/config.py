@@ -3,13 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ...utils import TensorView
-
-
-@dataclass(frozen=True)
-class LayerNormParallelismConfig:
-    cas_num: int
-    cas_length: int = 1
+from ...utils import ParallelismConfig, TensorView
 
 
 @dataclass(frozen=True)
@@ -21,7 +15,7 @@ class LayerNormConfig:
     """
 
     precision: Dict[str, Any]
-    parallelism: LayerNormParallelismConfig
+    parallelism: ParallelismConfig
     rows: int
     cols: int
     vec_size: int

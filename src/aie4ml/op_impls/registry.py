@@ -1,33 +1,31 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
+from pathlib import Path
+from typing import List, Tuple
 
-from ..aie_types import legality_format
 from .base import OpImplVariant
+
+_TEMPLATE_ROOT = Path(__file__).resolve().parent.parent / 'templates' / 'firmware' / 'variants'
 
 
 class OpImplRegistry:
     def __init__(self):
-        self._variants = {}
+        self._variants: dict[str, list[OpImplVariant]] = {}
 
     def register(self, variant: OpImplVariant) -> None:
         self._variants.setdefault(variant.op_type, []).append(variant)
 
-    def variants(self, op_type: str) -> Iterable[OpImplVariant]:
-        return self._variants.get(op_type, [])
+    def candidates(self, op_type: str) -> list[OpImplVariant]:
+        """Return registered variants for op_type sorted by descending plevel."""
+        return sorted(self._variants.get(op_type, []), key=lambda v: v.plevel, reverse=True)
 
     def supported_microtilings(self, op_type: str, generation: str, query) -> List[Tuple[int, int, int]]:
-        candidates = self._variants.get(op_type, [])
-        variant = None
-        for cand in candidates:
-            if cand.supports_generation(generation):
-                variant = cand
-                break
-        if variant is None and candidates:
-            variant = candidates[0]
-        if variant is None:
-            return []
-        return variant.microtiling_options(generation, query)
+        for variant in self.candidates(op_type):
+            try:
+                return variant.microtiling_options(generation, query)
+            except NotImplementedError:
+                continue
+        return []
 
 
 _GLOBAL_OP_IMPL_REGISTRY = OpImplRegistry()
@@ -38,31 +36,12 @@ def get_op_impl_registry() -> OpImplRegistry:
 
 
 def register_variant(cls):
+    if cls.param_template:
+        expected = _TEMPLATE_ROOT / cls.param_template / 'parameters.h.jinja'
+        if not expected.exists():
+            raise FileNotFoundError(
+                f'{cls.__name__}: param_template={cls.param_template!r} has no template at {expected}. '
+                'Create the template before registering the variant.'
+            )
     _GLOBAL_OP_IMPL_REGISTRY.register(cls())
     return cls
-
-
-def select_variant(op_type: str, config, generation: str) -> OpImplVariant:
-    precision_query: Dict[str, object] = {key: legality_format(dtype.format) for key, dtype in config.precision.items()}
-
-    matched: List[OpImplVariant] = []
-    for variant in _GLOBAL_OP_IMPL_REGISTRY.variants(op_type):
-        if not variant.supports_generation(generation):
-            continue
-        if not variant.supports_io_route(config.io_route):
-            continue
-        if variant.supports_precisions(precision_query):
-            matched.append(variant)
-
-    if not matched:
-        raise RuntimeError(f'No implementation variant satisfies resolved {op_type} config.')
-    if len(matched) > 1:
-        ids = ', '.join(v.variant_id for v in matched)
-        raise RuntimeError(
-            f'Ambiguous {op_type} variant selection — multiple variants match: {ids}. '
-            'Use a compiler directive to specify the variant explicitly.'
-        )
-    return matched[0]
-
-
-from . import families  # noqa: E402,F401
