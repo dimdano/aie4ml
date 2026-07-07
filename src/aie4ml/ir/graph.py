@@ -163,6 +163,8 @@ class LogicalIR:
                     consumer.inputs[i] = in_tv
             if consumer not in in_tv.consumers:
                 in_tv.consumers.append(consumer)
+            if out_tv.name in consumer.roles:
+                consumer.roles[in_tv.name] = consumer.roles.pop(out_tv.name)
 
         if node in in_tv.consumers:
             in_tv.consumers.remove(node)
