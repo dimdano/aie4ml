@@ -5,6 +5,7 @@ from .passes import (
     CollectMemoryEntries,
     CompactBufferRank,
     FoldApplyAlpha,
+    FoldBias,
     FoldScale,
     FoldViewOps,
     ForceFloatMode,
@@ -20,6 +21,7 @@ from .passes import (
 HLS4ML_FLOW_SPEC = (
     ('force_float', ForceFloatMode),
     ('fold_apply_alpha', FoldApplyAlpha),
+    ('fold_bias', FoldBias),
     ('fold_scale', FoldScale),
     ('fuse', FuseActivationCasts),
     ('fold_views', FoldViewOps),

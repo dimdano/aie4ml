@@ -3,6 +3,7 @@
 from .base import AIEPass, run_aie_passes
 from .compact_buffer_rank import CompactBufferRank
 from .fold_apply_alpha import FoldApplyAlpha
+from .fold_bias import FoldBias
 from .fold_scale import FoldScale
 from .fold_views import FoldViewOps
 from .force_float_mode import ForceFloatMode
@@ -24,6 +25,7 @@ __all__ = [
     'run_aie_passes',
     'FuseActivationCasts',
     'FoldApplyAlpha',
+    'FoldBias',
     'FoldScale',
     'ForceFloatMode',
     'FoldViewOps',
