@@ -14,11 +14,9 @@
 
 ## Current Support
 
-aie4ml currently supports Dense/GEMM, dynamic MatMul, Elementwise Add, quantized LayerNorm, HCCS Softmax, final-two-axis
-Permute, Split/Slice, Concat, fanout, and fused ReLU across AIE-ML and AIE-MLv2 devices.
+aie4ml currently supports Dense/GEMM, dynamic MatMul, Elementwise Add, quantized LayerNorm, quantized Softmax (approx.), last-two-axis Permute, Split/Slice, Concat, fanout, and fused ReLU across AIE-ML and AIE-MLv2 devices.
 
-See the [operator and feature support matrix](docs/support.md) for supported precisions, frontend coverage, tensor and
-transport contracts, and current limitations.
+See the [operator support matrix](docs/support.md) for coverage, tensor and transport contracts, and current limitations.
 
 ## Prerequisites
 
@@ -58,16 +56,29 @@ General `hls4ml` concepts: [https://fastmachinelearning.org/hls4ml](https://fast
 
 ## Citation
 
-If `aie4ml` contributes to your research, please cite the corresponding arXiv preprint:
+If `aie4ml` contributes to your research, please cite the corresponding publications:
 
 ```bibtex
-@misc{danopoulos2025aie4mlendtoendframeworkcompiling,
-      title={AIE4ML: An End-to-End Framework for Compiling Neural Networks for the Next Generation of AMD AI Engines},
-      author={Dimitrios Danopoulos and Enrico Lupi and Chang Sun and Sebastian Dittmeier and Michael Kagan and Vladimir Loncar and Maurizio Pierini},
-      year={2025},
-      eprint={2512.15946},
+@INPROCEEDINGS{11552717,
+  author={Danopoulos, Dimitrios and Lupi, Enrico and Sun, Chang and Dittmeier, Sebastian and Kagan, Michael and Loncar, Vladimir and Pierini, Maurizio},
+  booktitle={2026 IEEE 34th Annual International Symposium on Field-Programmable Custom Computing Machines (FCCM)},
+  title={AIE4ML: An End-to-End Framework for Compiling Neural Networks for the Next Generation of AMD AI Engines},
+  year={2026},
+  volume={},
+  number={},
+  pages={176-184},
+  keywords={Tiles;Modeling;Arrays;Kernel;Memory;Information rates;Throughput;System-on-chip;Loading;Engines;ai engines;hls4ml;aie4ml;versal;acceleration;inference},
+  doi={10.1109/FCCM68464.2026.00035}}
+```
+
+```bibtex
+@misc{danopoulos2026tamingexponentialfastsoftmax,
+      title={Taming the Exponential: A Fast Softmax Surrogate for Integer-Native Edge Inference},
+      author={Dimitrios Danopoulos and Enrico Lupi and Michael Kagan and Maurizio Pierini},
+      year={2026},
+      eprint={2604.02292},
       archivePrefix={arXiv},
       primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2512.15946},
+      url={https://arxiv.org/abs/2604.02292},
 }
 ```
