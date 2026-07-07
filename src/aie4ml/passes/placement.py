@@ -434,7 +434,11 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
     def producer_ports(entry) -> Tuple[int, ...]:
         if entry.unit is not None:
             return tuple(int(port) for port in entry.unit.producer_ports)
-        return tuple(int(port) for port in entry.producer.selected_ports(entry.producer_port_count))
+        # producer_port_count is the number of ports this entry uses, not the total; use
+        # the endpoint's explicit selection directly (e.g. a lone port 1 from a slice view).
+        if entry.producer.ports is not None:
+            return tuple(int(port) for port in entry.producer.ports)
+        return tuple(range(int(entry.producer_port_count)))
 
     kernel_set = set(kernel_names)
     producer_port_uses = {}
