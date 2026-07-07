@@ -54,12 +54,19 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
         if str(directives.get('approximation', 'hccs')).lower() != 'hccs':
             return False
         in_prec = resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name)
-        out_prec = resolve_exact_storage_dtype(node.outputs[0].precision, namespace='output', layer_name=node.name)
-        return in_prec.format == 'int8' and out_prec.format in ('uint8', 'int16')
+        return in_prec.format == 'int8'
 
     def resolve(self, node: OpNode, device, directives=None) -> SoftmaxConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
         hccs = _parse_hccs_directives(node.name, directives)
+
+        input_scale = float(node.trait_data('input_scale').get('scale', 1.0))
+        if abs(input_scale - 1.0) > 1e-9:
+            raise ValueError(
+                f'{node.name}: softmax.hccs.i8.v1 cannot apply a runtime input_scale={input_scale}; '
+                'bake the softmax temperature into the HCCS B/S/Dmax calibration, or lower to a '
+                'float softmax variant that applies input_scale at runtime.'
+            )
 
         in_tensor = input_tensor_for_role(node, 'lhs')
         out_tensor = node.outputs[0]
@@ -127,6 +134,9 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
         )
 
     def validate_config(self, node: OpNode, config: SoftmaxConfig, _device) -> None:
+        out_format = config.precision['output'].format
+        if out_format not in ('uint8', 'int16'):
+            raise ValueError(f'{node.name}: softmax.hccs.i8.v1 requires uint8 or int16 output, got {out_format!r}.')
         if config.param_sets != 1:
             raise ValueError(
                 f'{node.name}: softmax.hccs.i8.v1 does not support multi-head param_sets={config.param_sets}; '
