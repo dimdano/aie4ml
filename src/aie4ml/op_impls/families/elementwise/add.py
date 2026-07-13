@@ -14,6 +14,7 @@ from ...utils import (
     build_io_views,
     build_tensor_view_from_staging,
     ceildiv,
+    describe_partition_staging,
     extract_inner_outer,
     find_tile_split,
     parse_directives,
@@ -26,7 +27,7 @@ from ...utils.precision import (
     resolve_exact_storage_dtype,
     storage_bytes_for_spec,
 )
-from .common import describe_elementwise_staging, elementwise_vec_size
+from .common import elementwise_vec_size
 from .config import AddConfig
 
 
@@ -181,14 +182,12 @@ class AddOpImplVariant(OpImplVariant):
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         if config.preserved_staging is not None:
             return dict(config.preserved_staging[int(port)])
-        return describe_elementwise_staging(
-            config.io_views[tensor_name], port, 'read', config.staging_contract, buf_dims
-        )
+        return describe_partition_staging(config.io_views[tensor_name], port, 'read', config.staging_contract, buf_dims)
 
     def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
         if config.preserved_staging is not None:
             return dict(config.preserved_staging[int(port)])
-        return describe_elementwise_staging(
+        return describe_partition_staging(
             config.io_views[tensor_name], port, 'write', config.staging_contract, buf_dims
         )
 

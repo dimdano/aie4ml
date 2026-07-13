@@ -51,8 +51,8 @@ class FoldViewOps(AIEPass):
         if (node.metadata.get('data_format', 'channels_last') or '').lower() != 'channels_last':
             raise ValueError(f'{node.name}: only channels_last transpose is supported.')
 
+        # buffer_order is derived (the fixed axis reversal); only perm is view data.
         in_view = {
-            'buffer_order': [int(i) for i in reversed(range(rank))],
             'perm': [int(p) for p in perm],
         }
 

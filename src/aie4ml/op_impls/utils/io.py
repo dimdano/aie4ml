@@ -18,18 +18,13 @@ def ensure_io_view(node, generation: str) -> None:
     gen = (generation or '').upper()
     max_rank = 5 if 'AIE-MLV2' in gen else 4
 
-    def _default_view(rank: int) -> Dict[str, Any]:
-        return {
-            'buffer_order': list(reversed(range(rank))),
-        }
-
     for direction, tensors in (('inputs', node.inputs), ('outputs', node.outputs)):
         for tensor in tensors:
             rank = len(tuple(int(x) for x in tensor.shape))
             if rank > max_rank:
                 raise ValueError(f'{node.name}: tensor rank {rank} exceeds max {max_rank} for {generation}.')
-            if tensor.name not in data[direction]:
-                data[direction][tensor.name] = _default_view(rank)
+            # Empty view = identity (no perm); buffer_order is derived (see TensorView).
+            data[direction].setdefault(tensor.name, {})
 
 
 def resolve_io_route(node) -> Dict[str, Any]:

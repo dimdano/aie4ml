@@ -12,6 +12,7 @@ from ...registry import register_variant
 from ...utils import (
     ParallelismConfig,
     build_io_views,
+    describe_partition_staging,
     extract_inner_outer,
     find_tile_split,
     parse_directives,
@@ -24,7 +25,6 @@ from ...utils.precision import (
     storage_bytes_for_spec,
     to_quant_intent,
 )
-from ..elementwise.common import describe_elementwise_staging
 from .common import (
     BETA_FRAC_BITS,
     DEFAULT_ISQRT_NR_ITERS,
@@ -166,10 +166,10 @@ class LayerNormI8OpImplVariant(OpImplVariant):
         return {f: getattr(config, f) for f in config.__dataclass_fields__}
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_elementwise_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
+        return describe_partition_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
 
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_elementwise_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
+        return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
 
     def output_staging_contract(self, _node, _config: LayerNormConfig, _tensor_name: str):
         return 'outer'

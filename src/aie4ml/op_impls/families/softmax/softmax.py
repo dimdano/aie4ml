@@ -7,10 +7,16 @@ from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ...base import OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, build_io_views, extract_inner_outer, find_tile_split, parse_directives
+from ...utils import (
+    ParallelismConfig,
+    build_io_views,
+    describe_partition_staging,
+    extract_inner_outer,
+    find_tile_split,
+    parse_directives,
+)
 from ...utils.io import view_shape
 from ...utils.precision import resolve_exact_storage_dtype, storage_bytes_for_spec
-from ..elementwise.common import describe_elementwise_staging
 from .common import DEFAULT_INV_SHIFT, infer_hccs_param_sets, pack_hccs_params, softmax_vec_size, validate_hccs_params
 from .config import SoftmaxConfig
 
@@ -164,10 +170,10 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_elementwise_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
+        return describe_partition_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
 
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_elementwise_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
+        return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
 
     def output_staging_contract(self, _node, _config: SoftmaxConfig, _tensor_name: str):
         return 'outer'
