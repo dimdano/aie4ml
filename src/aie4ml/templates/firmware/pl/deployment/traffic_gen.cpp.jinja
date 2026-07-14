@@ -5,7 +5,7 @@ traffic_gen -- synthesizable HLS dummy AXI-stream source (external_stream deploy
 Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }}, {{ n_ifm }} IFM PLIO).
 
 Replaces the DDR->PLIO mm2s mover with an ON-CHIP pattern generator: it streams a deterministic
-byte ramp into the AIE PLIO_ifm ports. traffic_gen stands in for a real external AXI producer. 
+byte ramp into the AIE PLIO_ifm ports. traffic_gen stands in for a real external AXI producer.
 On a deployed board it is replaced by the user's producer IP wired the same way (sc=<producer>.M_AXIS:ai_engine_0.PLIO_ifm_*).
 */
 

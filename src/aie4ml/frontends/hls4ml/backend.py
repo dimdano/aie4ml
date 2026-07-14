@@ -202,9 +202,7 @@ class AIEBackend(Backend):
         # that emission path lands.
         _pl_data_mover_modes = ('benchmark', 'memory_stream', 'external_stream')
         if str(pl_data_mover_mode).lower() not in _pl_data_mover_modes:
-            raise ValueError(
-                f'pl_data_mover_mode must be one of {_pl_data_mover_modes}, got {pl_data_mover_mode!r}.'
-            )
+            raise ValueError(f'pl_data_mover_mode must be one of {_pl_data_mover_modes}, got {pl_data_mover_mode!r}.')
         pl_data_mover_mode = str(pl_data_mover_mode).lower()
 
         device_info = copy.deepcopy(self._get_device_info(part))

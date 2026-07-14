@@ -31,11 +31,13 @@ _ITERATIONS_PER_GROUP = 8
 
 # Fraction of the on-chip RAM pool the planner is allowed to spend on preload/stream buffers.
 # The model assumes perfect packing, but HLS's adds some overhead
-# Budgeting only 80% of the pool leaves headroom for the overhead 
+# Budgeting only 80% of the pool leaves headroom for the overhead
 _PL_USABLE_FRACTION = 0.8
 
-def _max_preloadable_iterations(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
-                                ifm_per_stream: int, ofm_per_stream: int) -> int:
+
+def _max_preloadable_iterations(
+    ctx, pl_memory: str, n_ifm: int, n_ofm: int, ifm_per_stream: int, ofm_per_stream: int
+) -> int:
     """Largest n_iter whose benchmark preload buffers fit the PL on-chip pool (URAM or BRAM,
     whichever PLMemory selects), rounded down to a whole group of _ITERATIONS_PER_GROUP.
 
@@ -50,8 +52,9 @@ def _max_preloadable_iterations(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
         raise RuntimeError('PL on-chip budget is unknown for this device (missing UltraRAM/BlockRAM block geometry).')
 
     def _blocks(n_iter: int) -> int:
-        return (_onchip_blocks(512, ifm_per_stream * n_iter, n_ifm, depth, width, copies=1)
-                + _onchip_blocks(512, ofm_per_stream * n_iter, n_ofm, depth, width, copies=1))
+        return _onchip_blocks(512, ifm_per_stream * n_iter, n_ifm, depth, width, copies=1) + _onchip_blocks(
+            512, ofm_per_stream * n_iter, n_ofm, depth, width, copies=1
+        )
 
     # Grow by whole groups while they still fit (block count is monotonic in n_iter).
     possible_iters = 0
@@ -67,9 +70,10 @@ def _max_preloadable_iterations(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
     return possible_iters
 
 
-# A 512-bit data-mover word is WIDTH-PINNED to ceil(512/WidthBits)=8 blocks no matter how shallow it is 
+# A 512-bit data-mover word is WIDTH-PINNED to ceil(512/WidthBits)=8 blocks no matter how shallow it is
 # which is why a shallow ping-pong buffer can exhaust the pool by block count even when its byte footprint
 # looks tiny. So the budgets below count blocks, not bytes.
+
 
 def _pl_pool(ctx, pl_memory: str):
     """(usable_blocks, depth, width_bits, label) for the on-chip RAM pool PLMemory selects, read
@@ -82,8 +86,9 @@ def _pl_pool(ctx, pl_memory: str):
     return int(blocks * _PL_USABLE_FRACTION), depth, width, label
 
 
-def _onchip_blocks(word_bits: int, rows: int, n_banks: int,
-                   block_depth: int, block_width_bits: int, copies: int = 2) -> int:
+def _onchip_blocks(
+    word_bits: int, rows: int, n_banks: int, block_depth: int, block_width_bits: int, copies: int = 2
+) -> int:
     """RAM blocks for `copies` ping-pong buffers, each `n_banks` independent banks of `rows`
     deep x `word_bits` wide. Width-pinned: ceil(word_bits/block_width_bits) blocks per bank,
     depth rounded up to block_depth."""
@@ -92,17 +97,18 @@ def _onchip_blocks(word_bits: int, rows: int, n_banks: int,
     return int(copies) * int(n_banks) * width_blocks * depth_blocks
 
 
-def _stream_buffer_blocks(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
-                          ifm_per_stream: int, ofm_per_stream: int) -> int:
+def _stream_buffer_blocks(ctx, pl_memory: str, n_ifm: int, n_ofm: int, ifm_per_stream: int, ofm_per_stream: int) -> int:
     """Total URAM/BRAM blocks the memory_stream ping-pong buffers occupy (mm2s + s2mm) in the
     pool PLMemory selects. mm2s = n_ifm banks x ifm_per_stream rows; s2mm = n_ofm x ofm_per_stream."""
     _, depth, width, _ = _pl_pool(ctx, pl_memory)
-    return (_onchip_blocks(512, ifm_per_stream, n_ifm, depth, width)
-            + _onchip_blocks(512, ofm_per_stream, n_ofm, depth, width))
+    return _onchip_blocks(512, ifm_per_stream, n_ifm, depth, width) + _onchip_blocks(
+        512, ofm_per_stream, n_ofm, depth, width
+    )
 
 
-def _check_memory_stream_fits(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
-                              ifm_per_stream: int, ofm_per_stream: int) -> int:
+def _check_memory_stream_fits(
+    ctx, pl_memory: str, n_ifm: int, n_ofm: int, ifm_per_stream: int, ofm_per_stream: int
+) -> int:
     """If the memory_stream ping-pong buffers exceed
     the on-chip pool, counted in BLOCKS. Suggests the other pool when it would fit. Returns blocks."""
     avail, _, width, label = _pl_pool(ctx, pl_memory)
@@ -121,6 +127,7 @@ def _check_memory_stream_fits(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
             f'pins {math.ceil(512 / width)} blocks/bank).' + hint
         )
     return needed
+
 
 # PL data-mover template locations. The benchmark mover lives under pl/benchmark/; the
 # deployment movers (memory_stream / external_stream) live under pl/deployment/.
@@ -148,7 +155,9 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
     port0 = ports_map[tensors[0]][0]
     total = int(math.prod(port0.numpy_boundary_shape))
     if total % int(batch) != 0:
-        raise RuntimeError(f'graph {direction} {tensors[0]!r}: element count {total} is not divisible by batch {batch}.')
+        raise RuntimeError(
+            f'graph {direction} {tensors[0]!r}: element count {total} is not divisible by batch {batch}.'
+        )
     return total // int(batch), int(port0.dtype.width) // 8
 
 
@@ -196,8 +205,7 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
         # Benchmark is a cycle-accurate measurement harness -- the PL timers are its
         # whole point, so force them ON regardless of EnablePLTiming.
         if not enable_pl_timing:
-            print("[aie4ml] PLDataMoverMode='benchmark' forces PL timers ON "
-                  "(overriding EnablePLTiming=False).")
+            print("[aie4ml] PLDataMoverMode='benchmark' forces PL timers ON " '(overriding EnablePLTiming=False).')
             enable_pl_timing = True
         name = _BENCHMARK_KERNEL
         sc = [f'{name}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
@@ -211,15 +219,21 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
             'sc': sc,
             'host': {
                 'timing_kernel': name,
-                'cycles': ['preload_done', 'first_send', 'last_send', 'first_recv',
-                           'last_recv', 'compute_done', 'total'],
+                'cycles': [
+                    'preload_done',
+                    'first_send',
+                    'last_send',
+                    'first_recv',
+                    'last_recv',
+                    'compute_done',
+                    'total',
+                ],
             },
         }
 
     if mode == 'memory_stream':
         ifm_k, ofm_k = 'mm2s', 's2mm'
-        kernels = [_kernel_entry(ifm_k, _DEPLOYMENT_TEMPLATE_DIR),
-                   _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
+        kernels = [_kernel_entry(ifm_k, _DEPLOYMENT_TEMPLATE_DIR), _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
         nk = [f'{ifm_k}:1:{ifm_k}', f'{ofm_k}:1:{ofm_k}']
         sc = [f'{ifm_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
         sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
@@ -236,34 +250,45 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
                 f'{ofm_k}.ev_last_recv:{timer}.ev_last_recv',
                 f'{ofm_k}.ev_done:{timer}.ev_done',
             ]
-            host = {'timing_kernel': timer,
-                    'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total']}
-        return {'mode': mode, 'enable_pl_timing': enable_pl_timing,
-                'kernels': kernels, 'nk': nk, 'sc': sc, 'host': host}
+            host = {'timing_kernel': timer, 'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total']}
+        return {
+            'mode': mode,
+            'enable_pl_timing': enable_pl_timing,
+            'kernels': kernels,
+            'nk': nk,
+            'sc': sc,
+            'host': host,
+        }
 
     if mode == 'external_stream':
-        # The DDR->PLIO input mover (mm2s) is replaced by an ON-CHIP HLS traffic_gen 
-        # The output side is the unchanged s2mm mover so the host still reads the 
+        # The DDR->PLIO input mover (mm2s) is replaced by an ON-CHIP HLS traffic_gen
+        # The output side is the unchanged s2mm mover so the host still reads the
         # result back / golden-checks it. On a deployed board,
-        # On read deployment the traffic_gen is swapped for the user's producer 
+        # On read deployment the traffic_gen is swapped for the user's producer
         # IP wired the same way (sc=<producer>.M_AXIS:ai_engine_0.PLIO_ifm_*).
         #
         # traffic_gen emits no timing event pulses, so there is no shared time base -- PL timing
         # is unavailable in this mode; the host measures wall-clock latency instead.
         if enable_pl_timing:
-            print("[aie4ml] PLDataMoverMode='external_stream' has no PL timers "
-                  "(the traffic_gen source emits no events); using host-side timing "
-                  "(overriding EnablePLTiming=True).")
+            print(
+                "[aie4ml] PLDataMoverMode='external_stream' has no PL timers "
+                '(the traffic_gen source emits no events); using host-side timing '
+                '(overriding EnablePLTiming=True).'
+            )
             enable_pl_timing = False
         src_k, ofm_k = 'traffic_gen', 's2mm'
-        kernels = [_kernel_entry(src_k, _DEPLOYMENT_TEMPLATE_DIR),
-                   _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
+        kernels = [_kernel_entry(src_k, _DEPLOYMENT_TEMPLATE_DIR), _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
         nk = [f'{src_k}:1:{src_k}', f'{ofm_k}:1:{ofm_k}']
         sc = [f'{src_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
         sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
-        return {'mode': mode, 'enable_pl_timing': enable_pl_timing,
-                'kernels': kernels, 'nk': nk, 'sc': sc,
-                'host': {'timing_kernel': None, 'cycles': []}}
+        return {
+            'mode': mode,
+            'enable_pl_timing': enable_pl_timing,
+            'kernels': kernels,
+            'nk': nk,
+            'sc': sc,
+            'host': {'timing_kernel': None, 'cycles': []},
+        }
     raise ValueError(f'unknown PLDataMoverMode {mode!r}.')
 
 
@@ -295,8 +320,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
     # Per-PLIO-tile feature slices come from the GRAPH BOUNDARY ports -- the single graph
-    # input and single graph output (already validated to be 1 each above). 
-    gin_port = next(iter(layout.inputs.values()))[0]  
+    # input and single graph output (already validated to be 1 each above).
+    gin_port = next(iter(layout.inputs.values()))[0]
     gout_port = next(iter(layout.outputs.values()))[0]
     in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
     out_feat_slice = gout_port.tiling_dimension[gout_port.slice_dimension]
@@ -317,21 +342,23 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         if parallelism is None:
             raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
         inst_name = sanitize_identifier(node.name)
-        layers.append({
-            'inst_name': inst_name,
-            'cas_num': int(parallelism.cas_num),
-            'cas_length': int(parallelism.cas_length),
-            'artifacts': [
-                {
-                    'name': a['name'],
-                    'kind': a['kind'],                     # '1d' | '2d' -> RTP loop shape
-                    'header': a['filename'],               # generated header to #include
-                    'prefix': f"{a['name']}_{inst_name}",  # C symbol base (matches header)
-                    'port': f"{a['port']}{layer_index}",   # ADF RTP port (name + layer idx, == app.cpp Lidx)
-                }
-                for a in artifacts
-            ],
-        })
+        layers.append(
+            {
+                'inst_name': inst_name,
+                'cas_num': int(parallelism.cas_num),
+                'cas_length': int(parallelism.cas_length),
+                'artifacts': [
+                    {
+                        'name': a['name'],
+                        'kind': a['kind'],  # '1d' | '2d' -> RTP loop shape
+                        'header': a['filename'],  # generated header to #include
+                        'prefix': f"{a['name']}_{inst_name}",  # C symbol base (matches header)
+                        'port': f"{a['port']}{layer_index}",  # ADF RTP port (name + layer idx, == app.cpp Lidx)
+                    }
+                    for a in artifacts
+                ],
+            }
+        )
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1
     cas_length = layers[-1]['cas_length'] if layers else 1
@@ -351,11 +378,10 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
 
-    # PL data-path style (benchmark single CU vs split deployment movers). 
-    # Resolve the mode FIRST -- the on-chip budget below is mode-specific. 
+    # PL data-path style (benchmark single CU vs split deployment movers).
+    # Resolve the mode FIRST -- the on-chip budget below is mode-specific.
     pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
-    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm,
-                            bool(ctx.aie_config.get('EnablePLTiming', True)))
+    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm, bool(ctx.aie_config.get('EnablePLTiming', True)))
     enable_pl_timing = pl_plan['enable_pl_timing']
 
     # On-chip budget is mode-specific, but BOTH count in BLOCKS -- the buffers are 512-bit
@@ -366,8 +392,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     #   external_stream  like memory_stream but the input side is the on-chip traffic_gen, which
     #                    holds NO ping-pong buffer -> only the s2mm (ofm) buffers count.
     if pl_data_mover_mode == 'benchmark':
-        max_n_iter = _max_preloadable_iterations(ctx, pl_memory, n_ifm, n_ofm,
-                                                 ifm_per_stream, ofm_per_stream)
+        max_n_iter = _max_preloadable_iterations(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
     elif pl_data_mover_mode == 'external_stream':
         # traffic_gen streams on the fly (no input buffer): zero input banks AND rows so only
         # the s2mm (ofm) ping-pong is charged.
@@ -402,6 +427,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'pl_data_mover_mode': pl_data_mover_mode,
         'pl_plan': pl_plan,
     }
+
 
 # ---------------------------------------------------------------------------
 # Host data.h generation (DDR-packed input) — target='hardware'
@@ -500,9 +526,7 @@ def pack_host_data(model_or_ctx, X=None):
 
     out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
     if out_total_bytes % 4 != 0:
-        raise NotImplementedError(
-            f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).'
-        )
+        raise NotImplementedError(f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).')
     ofm_size_words = out_total_bytes // 4
     return ifm_packed, ofm_size_words
 

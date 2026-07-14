@@ -1,17 +1,15 @@
+import hls4ml
 import numpy as np
 import tensorflow as tf
+from aie4ml.simulation import read_aie_report
+from qkeras import QActivation, QDense, quantized_bits
 from tensorflow.keras import Model
 from tensorflow.keras.optimizers import Adam
-
-from qkeras import QDense, QActivation, quantized_bits
-
-import hls4ml
-from keras.utils import plot_model
 
 np.random.seed(42)
 tf.random.set_seed(42)
 
-N_IN  = 256
+N_IN = 256
 BATCH = 256
 ITERS = 4
 PLATFORM = 'xilinx_vek280_base_202520_1'
@@ -22,10 +20,11 @@ PROJECT_NAME = 'hardware_new'
 def build_model():
     inp = tf.keras.Input(batch_size=BATCH, shape=(N_IN,), name='inp')
     x = QActivation(quantized_bits(8, 0), name='input_quant')(inp)
-    x = QDense(128,  kernel_quantizer=quantized_bits(8, 0, alpha=1), name='dense_0')(x)
+    x = QDense(128, kernel_quantizer=quantized_bits(8, 0, alpha=1), name='dense_0')(x)
     x = QActivation(quantized_bits(8, 0), name='quant_0')(x)
     out = QActivation(quantized_bits(8, 0), name='quant_out')(x)
     return Model(inp, out, name='single_dense_large')
+
 
 model = build_model()
 model.compile(optimizer=Adam(1e-3), loss='mse')
@@ -53,21 +52,21 @@ aie_model = hls4ml.converters.convert_from_keras_model(
     batch_size=BATCH,
     iterations=ITERS,
     part=PLATFORM,
-    target='hardware',          # hardware | aie
-    pl_memory='uram',            # uram | bram
-    enable_pl_timing = True,    # True | False 
-    pl_data_mover_mode = 'memory_stream' # benchmark | memory_stream | external_stream
+    target='hardware',  # hardware | aie
+    pl_memory='uram',  # uram | bram
+    enable_pl_timing=True,  # True | False
+    pl_data_mover_mode='memory_stream',  # benchmark | memory_stream | external_stream
 )
 
 aie_model.compile()
-# By default the simulation works for hardware target, To build for hardware_emulation use aie_model.build(make_target='hw_emu')
+# By default the simulation works for the hardware target. To build for hardware emulation,
+# use aie_model.build(make_target='hw_emu')
 aie_model.build()
 
 # Simulation
 x = np.random.random((BATCH, N_IN)).astype(np.float32)
 y_aie = aie_model.predict(x, simulator='aie')[:BATCH]
 
-from aie4ml.simulation import read_aie_report
 report = read_aie_report(aie_model)
 
 print('\n' + '=' * 60)
@@ -86,6 +85,6 @@ if 'output_interval' in report:
     print('\n[Output Interval (ns)]')
     for name, vals in ii.items():
         if isinstance(vals, dict):
-            print(f"  {name}:")
+            print(f'  {name}:')
             for k, v in vals.items():
-                print(f"    {k}: {v} ns")
+                print(f'    {k}: {v} ns')

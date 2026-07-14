@@ -161,7 +161,6 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
         )
     resolved_aie_config['PLDataMoverMode'] = pl_data_mover_mode
 
-
     ctx = AIEBackendContext(
         device=device,
         policies=policies,

@@ -7,7 +7,7 @@ This document describes the PL integration code-generation flow added to **aie4m
 ## Setup (Vitis + board environment)
 
 The hardware / emulation build needs the Vitis tools (`v++`), the
-aarch64 cross-compiler, XRT, and the board's rootfs / kernel image. 
+aarch64 cross-compiler, XRT, and the board's rootfs / kernel image.
 
 ```bash
     source <>/2025.2/Vitis/settings64.sh
@@ -32,7 +32,7 @@ aie_model = hls4ml.converters.convert_from_keras_model(
 )
 ```
 
-- `target='aie'` (default): unchanged — emits only AIE source 
+- `target='aie'` (default): unchanged — emits only AIE source
 - `target='hardware'`: additionally emits the PL data mover, connectivity, host, and a Makefile with hw and hw_emu compilation
 ---
 
@@ -127,7 +127,7 @@ make hw_emu    # build for hardware emulation (launch with: make run_emu)
 
 Note: Hardware emulation has to be run manually and it not wired through Python.
 ```bash
-make run_emu 
+make run_emu
 # After the system boots in QEMU, run
 ./host.exe a.xclbin <ITERATIONS>
 ```
@@ -135,7 +135,7 @@ make run_emu
 Instructions to run on hardware VEK280 board
 
 * Copy all the files generated in `output/sd_card/*` to `/run/media/mmcblk0p1/`
-* Reboot the board 
+* Reboot the board
 * `cd /run/media/mmcblk0p1/` then run `./host.exe a.xclbin <ITERATIONS>`
 
 ---
