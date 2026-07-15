@@ -1,0 +1,414 @@
+{%- set ctr_base = 2 + n_ifm + n_ofm + 3 -%}
+{%- set mode = pl_plan.mode -%}
+/*
+ * Host application for {{ project_name }}.
+ * Single Dense layer: {{ in_feat }}->{{ out_feat }}, int8, BATCH={{ batch }}.
+ *
+ * PL data-mover mode: {{ mode }}
+ *
+ * Data flow:
+{% if mode == 'benchmark' %}
+ *   Host DDR -> ddr_pl_aie_datamover (PL, {{ n_ifm }} IFM PLIO + {{ n_ofm }} OFM PLIO) -> AIE -> ddr_pl_aie_datamover -> Host DDR
+{% elif mode == 'memory_stream' %}
+ *   Host DDR -> mm2s (PL, {{ n_ifm }} IFM PLIO) -> AIE -> s2mm (PL, {{ n_ofm }} OFM PLIO) -> Host DDR
+{% elif mode == 'external_stream' %}
+ *   traffic_gen (PL on-chip ramp, {{ n_ifm }} IFM PLIO) -> AIE -> s2mm (PL, {{ n_ofm }} OFM PLIO) -> Host DDR
+ *   No input DDR / mm2s: the synthesizable HLS traffic_gen source generates the input on-chip
+ *   (stand-in for a real external AXI producer). The host starts traffic_gen + s2mm and reads back.
+{% endif %}
+ *
+ * Transfer sizes per iter (32-bit words, total across all streams):
+ *   sizeIn  = BATCH({{ batch }}) * IN_FEAT({{ in_feat }})  / 4 = {{ batch * in_feat // 4 }} words
+ *   sizeOut = BATCH({{ batch }}) * OUT_FEAT({{ out_feat }}) / 4 = {{ batch * out_feat // 4 }} words
+ *
+{% if mode == 'external_stream' %}
+ * Input data: generated on-chip by traffic_gen (a deterministic byte ramp), NOT supplied by the
+ * host -- data.h::ifm_packed is unused in this mode. The board output is read back to the host
+ * (and optionally dumped). Golden verification is not generated.
+{% else %}
+ * Input data: data.h::ifm_packed (one packed iteration in the PL mover mem_in DDR
+ * layout) is replayed into every iteration. The board output is read back to the host
+ * (and optionally dumped). Golden verification is not generated.
+{% endif %}
+ *
+ * N_ITER (defined in src/parameters.h) is only used by aiesimulator and must
+ * not be used to compute PL transfer sizes.
+ */
+
+// Weight headers use alignas(aie::vector_decl_align) unless __X86SIM__ is set.
+// Define it here so they compile with standard C++ (static thread_local const path).
+// <cstdint> must come first so int8_t/int32_t are defined before the weight arrays.
+#include <cstdint>
+#define __X86SIM__
+{% for L in layers %}
+{% for spec in L.artifacts %}
+#include "../src/weights/{{ spec.header }}"
+{% endfor %}
+{% endfor %}
+#undef __X86SIM__
+
+#include <fstream>
+#include <iostream>
+#include <cstring>
+#include <chrono>
+
+#include "experimental/xrt_kernel.h"
+#include "experimental/xrt_graph.h"
+#include "data.h"
+
+
+// IN_FEAT={{ in_feat }} split across {{ n_ifm }} PLIO(s) → IN_FEAT_SLICE = {{ in_feat_slice }} per tile.
+// OUT_FEAT={{ out_feat }} split across CAS_NUM={{ cas_num }} chain(s) → OUT_FEAT_SLICE = {{ out_feat_slice }} per tile.
+// Per-tile weight block = IN_FEAT_SLICE * OUT_FEAT_SLICE = {{ in_feat_slice }} * {{ out_feat_slice }} = {{ in_feat_slice * out_feat_slice }}.
+// CAS_NUM * CAS_LENGTH = {{ cas_num }} * {{ cas_length }} = {{ cas_num * cas_length }} weight tiles total.
+static constexpr int IN_FEAT       = {{ in_feat }};
+static constexpr int OUT_FEAT      = {{ out_feat }};
+static constexpr int CAS_NUM       = {{ cas_num }};
+static constexpr int CAS_LENGTH    = {{ cas_length }};
+static constexpr int IN_FEAT_SLICE  = {{ in_feat_slice }};
+static constexpr int OUT_FEAT_SLICE = {{ out_feat_slice }};
+
+// PL clock — must match `pl-freq` in aie.cfg.
+static constexpr double PL_FREQ_HZ = {{ "%.1f"|format(pl_freq_hz / 1e6) }}e6;
+
+{% if mode == 'benchmark' %}
+// Build-time iteration cap — MUST match MAX_N_ITER in pl/ddr_pl_aie_datamover.cpp. The datamover
+// preloads all n_iter iters into fixed-size URAM buffers sized for this many
+// iters; passing more makes the kernel index past the buffers (the on-chip
+// address wraps mod the URAM depth -> iter 64 aliases iter 0, silent
+// corruption). Reject over-cap runs here instead of launching a bad kernel.
+static constexpr int MAX_N_ITER = {{ max_n_iter }};
+{% endif %}
+
+{% if enable_pl_timing %}
+// Read a 64-bit s_axilite output register (LSW first, then MSW at offset+4).
+static uint64_t read_u64_reg(const xrt::kernel& k, int arg_idx) {
+    uint32_t off = k.offset(arg_idx);
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+    uint32_t lo  = k.read_register(off);
+    uint32_t hi  = k.read_register(off + 4);
+#pragma GCC diagnostic pop
+    return ((uint64_t)hi << 32) | lo;
+}
+{% endif %}
+
+int main(int argc, char* argv[])
+{
+    if (argc < 2) {
+        std::cerr << "Usage: " << argv[0] << " <xclbin> [n_iter=1] [--dump-ofm|-d]\n"
+                  << "  --dump-ofm, -d   print the first 8 ofm beats of iter0 per PLIO stream\n";
+        return 1;
+    }
+    int  n_iter   = 1;
+    bool dump_ofm = false;     // gate the raw ofm-vector dump (off unless requested)
+    for (int a = 2; a < argc; a++) {
+        if (strcmp(argv[a], "--dump-ofm") == 0 || strcmp(argv[a], "-d") == 0) {
+            dump_ofm = true;
+        } else {
+            n_iter = std::stoi(argv[a]);
+        }
+    }
+{% if mode == 'benchmark' %}
+    if (n_iter < 1 || n_iter > MAX_N_ITER) {
+        std::cerr << "Error: n_iter=" << n_iter << " out of range [1, " << MAX_N_ITER
+                  << "]. The datamover URAM buffers are sized for MAX_N_ITER=" << MAX_N_ITER
+                  << " (must match pl/ddr_pl_aie_datamover.cpp); larger values silently corrupt.\n";
+        return 1;
+    }
+{% else %}
+    if (n_iter < 1) {
+        std::cerr << "Error: n_iter=" << n_iter << " must be >= 1.\n";
+        return 1;
+    }
+{% endif %}
+
+    //////////////////////////////////////////
+    // Open xclbin
+    //////////////////////////////////////////
+    auto device = xrt::device(0);
+    if (device == nullptr) {
+        throw std::runtime_error("No valid device handle found.");
+    }
+    auto xclbin_uuid = device.load_xclbin(argv[1]);
+
+    // IFM_SIZE_WORDS / OFM_SIZE_WORDS come from data.h (one iteration each):
+    //   IFM = BATCH({{ batch }}) * IN_FEAT({{ in_feat }})  / 4 = {{ batch * in_feat // 4 }} int32 words
+    //   OFM = BATCH({{ batch }}) * OUT_FEAT({{ out_feat }}) / 4 = {{ batch * out_feat // 4 }} int32 words
+    int sizeIn  = IFM_SIZE_WORDS;
+    int sizeOut = OFM_SIZE_WORDS;
+
+{% if mode != 'external_stream' %}
+    //////////////////////////////////////////
+    // Input buffer: n_iter * sizeIn 32-bit words
+    //////////////////////////////////////////
+    auto in_bohdl   = xrt::bo(device, n_iter * sizeIn * sizeof(uint32_t), 0, 0);
+    auto in_bomapped = in_bohdl.map<uint32_t*>();
+    // Load the packed input (data.h::ifm_packed, one iter in the PL mover mem_in
+    // layout) into every iteration slice. All iters share the same input.
+    for (int it = 0; it < n_iter; it++) {
+        memcpy(in_bomapped + (size_t)it * sizeIn, ifm_packed, sizeIn * sizeof(uint32_t));
+    }
+    printf("Input memory virtual addr 0x%px\n", (void*)in_bomapped);
+    in_bohdl.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+{% else %}
+    // external_stream: no host input buffer -- traffic_gen generates the input stream on-chip.
+    // sizeIn is still passed to traffic_gen so it knows how many words/iteration to emit.
+{% endif %}
+
+    //////////////////////////////////////////
+    // Output buffer: n_iter * sizeOut 32-bit words
+    //////////////////////////////////////////
+    auto out_bohdl    = xrt::bo(device, n_iter * sizeOut * sizeof(uint32_t), 0, 0);
+    auto out_bomapped = out_bohdl.map<uint32_t*>();
+    memset(out_bomapped, 0, n_iter * sizeOut * sizeof(uint32_t));
+    printf("Output memory virtual addr 0x%px\n", (void*)out_bomapped);
+
+{% if mode == 'benchmark' %}
+    // Create kernel and graph handles.
+    // cu_access_mode::exclusive is required to call read_register() on the
+    // s_axilite cycle-counter outputs; default (shared) raises:
+    //   "Cannot read or write kernel with shared access".
+    auto datamover_khdl = xrt::kernel(device, xclbin_uuid, "ddr_pl_aie_datamover",
+                                      xrt::kernel::cu_access_mode::exclusive);
+    auto cghdl      = xrt::graph(device, xclbin_uuid, "dut");
+{% elif mode == 'memory_stream' %}
+    // mm2s/s2mm are independent CUs (shared access). tick_gen owns the shared
+    // free-running counter; it needs exclusive access for read_register() on its
+    // cycles_* outputs.
+    auto mm2s_khdl = xrt::kernel(device, xclbin_uuid, "mm2s");
+    auto s2mm_khdl = xrt::kernel(device, xclbin_uuid, "s2mm");
+{% if enable_pl_timing %}
+    auto tick_gen_khdl = xrt::kernel(device, xclbin_uuid, "tick_gen",
+                                     xrt::kernel::cu_access_mode::exclusive);
+{% endif %}
+    auto cghdl     = xrt::graph(device, xclbin_uuid, "dut");
+{% elif mode == 'external_stream' %}
+    // traffic_gen (on-chip input source) and s2mm (output mover) are independent host-started
+    // CUs (shared access). No mm2s (input is generated on-chip) and no tick_gen (traffic_gen
+    // emits no timing events; this mode reports host-side wall-clock latency only).
+    auto traffic_gen_khdl = xrt::kernel(device, xclbin_uuid, "traffic_gen");
+    auto s2mm_khdl        = xrt::kernel(device, xclbin_uuid, "s2mm");
+    auto cghdl            = xrt::graph(device, xclbin_uuid, "dut");
+{% endif %}
+
+    // Step 1: Reset graph and load every layer's RTP artifacts (weights/bias/gamma/...),
+    // generically over L.artifacts: 2d -> CAS_NUM x CAS_LENGTH tiles, 1d -> CAS_NUM chains.
+    cghdl.reset();
+{% for L in layers %}
+{% for spec in L.artifacts %}
+{% if spec.kind == '2d' %}
+{% for chain in range(L.cas_num) %}
+{%- for col in range(L.cas_length) %}
+    cghdl.update("dut.{{ spec.port }}[{{ chain * L.cas_length + col }}]", {{ spec.prefix }}_{{ chain }}_{{ col }});
+{% endfor %}
+{%- endfor %}
+{% else %}
+{%- for chain in range(L.cas_num) %}
+    cghdl.update("dut.{{ spec.port }}[{{ chain }}]", {{ spec.prefix }}_{{ chain }});
+{% endfor %}
+{% endif %}
+{% endfor %}
+{% endfor %}
+    printf("weights loaded\n");
+{% if mode == 'benchmark' %}
+    printf("run ddr_pl_aie_datamover (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
+{% elif mode == 'memory_stream' %}
+    printf("run mm2s/s2mm (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
+{% elif mode == 'external_stream' %}
+    printf("run traffic_gen/s2mm (sizeIn=%d, sizeOut=%d words)\n", sizeIn, sizeOut);
+{% endif %}
+    printf("graph run together\n");
+    printf("running %d iteration(s)...\n", n_iter);
+    auto t_start = std::chrono::high_resolution_clock::now();
+
+{% if mode == 'benchmark' %}
+    // ddr_pl_aie_datamover args ({{ n_ifm }} IFM + {{ n_ofm }} OFM stream(s)): mem_in, mem_out,
+    // s_out_*, s_in_*, size_in, size_out, n_iter{% if enable_pl_timing %}, then 7 cycles_* s_axilite
+    // output regs (read back via read_register after wait){% endif %}. Stream args are nullptr.
+    cghdl.run(n_iter);
+    auto datamover_rhdl = datamover_khdl(in_bohdl, out_bohdl,
+                                 {{ (['nullptr'] * n_ifm) | join(', ') }},
+                                 {{ (['nullptr'] * n_ofm) | join(', ') }},
+                                 sizeIn, sizeOut, n_iter{% if enable_pl_timing %},
+                                 (uint64_t)0, (uint64_t)0, (uint64_t)0,
+                                 (uint64_t)0, (uint64_t)0, (uint64_t)0,
+                                 (uint64_t)0{% endif %});
+    datamover_rhdl.wait();
+{% elif mode == 'memory_stream' %}
+    // Kernel args (stream/event args are nullptr -- sc-connected in the PL):
+    //   mm2s    : (mem_in, s_out_0..{{ n_ifm - 1 }}{% if enable_pl_timing %}, ev_first_send, ev_last_send{% endif %}, size_in, n_iter)
+    //   s2mm    : (mem_out, s_in_0..{{ n_ofm - 1 }}{% if enable_pl_timing %}, ev_first_recv, ev_last_recv, ev_done{% endif %}, size_out, n_iter)
+{% if enable_pl_timing %}
+    //   tick_gen: (5 axis events, then cycles_first_send/last_send/first_recv/last_recv/total)
+    // Launch tick_gen FIRST so its counter is free-running before any event arrives.
+    auto tick_gen_rhdl = tick_gen_khdl(nullptr, nullptr, nullptr, nullptr, nullptr,
+                                       (uint64_t)0, (uint64_t)0, (uint64_t)0,
+                                       (uint64_t)0, (uint64_t)0);
+{% endif %}
+    cghdl.run(n_iter);
+    auto s2mm_rhdl = s2mm_khdl(out_bohdl, {{ (['nullptr'] * n_ofm) | join(', ') }}{% if enable_pl_timing %},
+                               nullptr, nullptr, nullptr{% endif %}, sizeOut, n_iter);
+    auto mm2s_rhdl = mm2s_khdl(in_bohdl, {{ (['nullptr'] * n_ifm) | join(', ') }}{% if enable_pl_timing %},
+                               nullptr, nullptr{% endif %}, sizeIn, n_iter);
+    mm2s_rhdl.wait();
+    s2mm_rhdl.wait();
+{% if enable_pl_timing %}
+    tick_gen_rhdl.wait();   // completes when s2mm emits ev_done (stops the counter)
+{% endif %}
+{% elif mode == 'external_stream' %}
+    // Kernel args (stream args are nullptr -- sc-connected in the PL):
+    //   traffic_gen : (s_out_0..{{ n_ifm - 1 }}, size_in, n_iter)   [on-chip source, host-started]
+    //   s2mm        : (mem_out, s_in_0..{{ n_ofm - 1 }}, size_out, n_iter)
+    cghdl.run(n_iter);
+    auto s2mm_rhdl        = s2mm_khdl(out_bohdl, {{ (['nullptr'] * n_ofm) | join(', ') }}, sizeOut, n_iter);
+    auto traffic_gen_rhdl = traffic_gen_khdl({{ (['nullptr'] * n_ifm) | join(', ') }}, sizeIn, n_iter);
+    traffic_gen_rhdl.wait();   // on-chip source done
+    s2mm_rhdl.wait();          // all OFM drained to DDR
+{% endif %}
+
+    auto t_end = std::chrono::high_resolution_clock::now();
+    printf("graph end\n");
+
+{% if enable_pl_timing %}
+{% if mode == 'benchmark' %}
+    // ddr_pl_aie_datamover s_axilite arg indices: mem_in=0, mem_out=1, s_out_*={{ 2 }}..,
+    // s_in_*=.., size_in={{ 2 + n_ifm + n_ofm }}, size_out={{ 3 + n_ifm + n_ofm }},
+    // n_iter={{ 4 + n_ifm + n_ofm }}, cycles_*={{ ctr_base }}..{{ ctr_base + 6 }}.
+    uint64_t cycles_preload_done = read_u64_reg(datamover_khdl, {{ ctr_base }});
+    uint64_t cycles_first_send   = read_u64_reg(datamover_khdl, {{ ctr_base + 1 }});
+    uint64_t cycles_last_send    = read_u64_reg(datamover_khdl, {{ ctr_base + 2 }});
+    uint64_t cycles_first_recv   = read_u64_reg(datamover_khdl, {{ ctr_base + 3 }});
+    uint64_t cycles_last_recv    = read_u64_reg(datamover_khdl, {{ ctr_base + 4 }});
+    uint64_t cycles_compute_done = read_u64_reg(datamover_khdl, {{ ctr_base + 5 }});
+    uint64_t cycles_total        = read_u64_reg(datamover_khdl, {{ ctr_base + 6 }});
+    (void)cycles_preload_done;   // read for register-map completeness; no longer printed
+{% elif mode == 'memory_stream' %}
+    // tick_gen s_axilite arg indices: 0-4 axis events, then the cycles_* output regs:
+    //   5 cycles_first_send  6 cycles_last_send  7 cycles_first_recv  8 cycles_last_recv  9 cycles_total
+    uint64_t cycles_first_send = read_u64_reg(tick_gen_khdl, 5);
+    uint64_t cycles_last_send  = read_u64_reg(tick_gen_khdl, 6);
+    uint64_t cycles_first_recv = read_u64_reg(tick_gen_khdl, 7);
+    uint64_t cycles_last_recv  = read_u64_reg(tick_gen_khdl, 8);
+    uint64_t cycles_total      = read_u64_reg(tick_gen_khdl, 9);
+{% endif %}
+    // End-to-end deltas (both modes share the same five timestamps, one time base).
+    // The send / compute / recv split is only meaningful for the preload benchmark; in
+    // memory_stream those phases overlap (streaming graph + double-buffered movers), so
+    // only the round trip is reported there.
+    int64_t  round_trip_cyc    = (int64_t)cycles_last_recv  - (int64_t)cycles_first_send;
+{% if mode == 'benchmark' %}
+    int64_t  send_phase_cyc    = (int64_t)cycles_last_send  - (int64_t)cycles_first_send;
+    int64_t  aie_gap_cyc       = (int64_t)cycles_first_recv - (int64_t)cycles_last_send;
+    int64_t  recv_phase_cyc    = (int64_t)cycles_last_recv  - (int64_t)cycles_first_recv;
+{% endif %}
+{% endif %}
+
+    // ---- Timing report ----
+    double total_ms    = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    double latency_ms  = total_ms / n_iter;   // avg per iteration
+    double latency_s   = latency_ms * 1e-3;
+
+    double total_bytes = (sizeIn + sizeOut) * (double)sizeof(uint32_t);
+    double throughput  = 1.0 / latency_s;
+    double bw_gbs      = (total_bytes * throughput) / 1e9;
+
+{% if enable_pl_timing and mode == 'benchmark' %}
+    // ---- 3-phase breakdown (all n_iter iterations) ----
+    // preload_done carries a data-dependence anchor in the kernel, so it fires at the
+    // true end of preload. We partition on first_send (start of compute); the two agree
+    // within a few cycles.
+    //   Phase1: 0          -> first_send    (DDR -> URAM, all iters)
+    //   Phase2: first_send -> compute_done  (send + AIE + recv, overlapped)
+    //   Phase3: compute_done -> total       (URAM -> DDR, all iters)
+    int64_t preload_phase_cyc   = (int64_t)cycles_first_send;
+    int64_t compute_phase_cyc   = (int64_t)cycles_compute_done - (int64_t)cycles_first_send;
+    int64_t postwrite_phase_cyc = (int64_t)cycles_total        - (int64_t)cycles_compute_done;
+{% endif %}
+
+    printf("\n============= Performance (%d iter) =============\n\n", n_iter);
+
+    printf("--- Performance Host side (%d iter) ---\n", n_iter);
+    printf("   %-16s : %10.3f ms\n",           "Total time",     total_ms);
+    printf("   %-16s : %10.3f ms\n",           "Latency / iter", latency_ms);
+    printf("   %-16s : %10.1f inferences/s\n", "Throughput",     throughput);
+    printf("   %-16s : %10.3f GB/s    (in %d B, out %d B)\n", "DRAM bandwidth",
+           bw_gbs, sizeIn * (int)sizeof(uint32_t), sizeOut * (int)sizeof(uint32_t));
+
+    printf("\n--- Performance PL side (%d iter) PL @ %.1f MHz ---\n", n_iter, PL_FREQ_HZ / 1e6);
+{% if enable_pl_timing %}
+{% if mode == 'benchmark' %}
+    printf("   %-16s   %12s  %12s  %12s\n", "", "cyc", "us", "us/iter");
+    printf("   %-16s : %12lu  %12.4f  %12.4f\n", "Total",
+           (unsigned long)cycles_total,
+           (double)cycles_total / PL_FREQ_HZ * 1e6,
+           (double)cycles_total / PL_FREQ_HZ * 1e6 / n_iter);
+    printf("   %-16s : %12ld  %12.4f  %12.4f   %s\n", "Preload",
+           (long)preload_phase_cyc,
+           (double)preload_phase_cyc / PL_FREQ_HZ * 1e6,
+           (double)preload_phase_cyc / PL_FREQ_HZ * 1e6 / n_iter, "DDR->URAM");
+    printf("   %-16s : %12ld  %12.4f  %12.4f   %s\n", "Compute (AIE)",
+           (long)compute_phase_cyc,
+           (double)compute_phase_cyc / PL_FREQ_HZ * 1e6,
+           (double)compute_phase_cyc / PL_FREQ_HZ * 1e6 / n_iter, "send+AIE+recv (overlapped)");
+    printf("   %-16s : %12ld  %12.4f  %12.4f   %s\n", "Postwrite",
+           (long)postwrite_phase_cyc,
+           (double)postwrite_phase_cyc / PL_FREQ_HZ * 1e6,
+           (double)postwrite_phase_cyc / PL_FREQ_HZ * 1e6 / n_iter, "URAM->DDR");
+    printf("   %-16s : %12s  %12s  %12.4f   %s\n", "AIE Latency/iter", "<->", "<->",
+           (double)compute_phase_cyc / PL_FREQ_HZ * 1e6 / n_iter, "Compute / iter, AIE side latency");
+{% elif mode == 'memory_stream' %}
+    printf("   %-16s   %12s  %12s  %12s\n", "", "cyc", "us", "us/iter");
+    printf("   %-16s : %12lu  %12.4f  %12.4f\n", "Total",
+           (unsigned long)cycles_total,
+           (double)cycles_total / PL_FREQ_HZ * 1e6,
+           (double)cycles_total / PL_FREQ_HZ * 1e6 / n_iter);
+{% endif %}
+
+    printf("\n--- Performance PL side (End-to-End 1 inference) PL @ %.1f MHz ---\n", PL_FREQ_HZ / 1e6);
+    printf("   %-16s   %12s  %12s\n", "", "cyc", "us");
+{% if mode == 'benchmark' %}
+    printf("   %-16s : %12ld  %12.4f   %s\n", "PL to AIE",
+           (long)send_phase_cyc, (double)send_phase_cyc / PL_FREQ_HZ * 1e6, "PLIO ifm transit");
+    printf("   %-16s : %12ld  %12.4f   %s\n", "AIE compute",
+           (long)aie_gap_cyc, (double)aie_gap_cyc / PL_FREQ_HZ * 1e6, "AIE compute window");
+    printf("   %-16s : %12ld  %12.4f   %s\n", "AIE to PL",
+           (long)recv_phase_cyc, (double)recv_phase_cyc / PL_FREQ_HZ * 1e6, "PLIO ofm drain");
+{% endif %}
+    printf("   %-16s : %12ld  %12.4f   %s\n", "PL - AIE - PL",
+           (long)round_trip_cyc, (double)round_trip_cyc / PL_FREQ_HZ * 1e6, "round trip");
+{% else %}
+    printf("   PL side perf measurement not enabled\n");
+{% endif %}
+    printf("=================================================\n\n");
+
+
+    out_bohdl.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+    //////////////////////////////////////////
+    // Raw output dump (iter 0), de-interleaved back into the {{ n_ofm }} ofm PLIO
+    // stream(s) so each line matches a data line of aiesimulator_output/data/
+    // y_p*.txt. mem_out word i <- stream s = i % N_OFM, pos b = i / N_OFM; word i
+    // lane j (128b = 16 int8) = stream s beat t = b*4 + j.
+    //////////////////////////////////////////
+    if (dump_ofm) {
+        const int DUMP_BEATS = 8;   // beats per stream to print
+        for (int s = 0; s < {{ n_ofm }}; s++) {
+            printf("\n--- ofm stream y_p%d (board iter0, first %d beats) ---\n", s, DUMP_BEATS);
+            for (int t = 0; t < DUMP_BEATS; t++) {
+                int b = t >> 2, j = t & 3;
+                int i = b * {{ n_ofm }} + s;                       // 512-bit word index
+                const int8_t* p = reinterpret_cast<const int8_t*>(&out_bomapped[i * 16 + j * 4]);
+                printf(" ");
+                for (int k = 0; k < 16; k++) {
+                    printf(" %4d", (int)p[k]);
+                }
+                printf("\n");
+            }
+        }
+        printf("\n");
+    }
+
+    printf("\nran %d iteration(s); board output read back to host (no golden verification)\n", n_iter);
+    return 0;
+}

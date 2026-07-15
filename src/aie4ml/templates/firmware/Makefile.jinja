@@ -11,6 +11,12 @@ LIBADF_X86    := libadf_x86.a
 AIE_WORKDIR     := ./Work
 X86_WORKDIR     := ./Work_x86
 STAMP_MARKER  := stamp_{{ stamp | default('00000000') }}.marker
+{% if is_hardware %}
+PFM           := {{ project_name }}
+CONFIG_FILE   := system.cfg
+OUTPUT_DIR    := output
+KERNEL_XO     := {% for k in pl_plan.kernels %}pl/{{ k.name }}.xo{% if not loop.last %} {% endif %}{% endfor %}
+{% endif %}
 
 # ---------- Platform ----------
 VITIS_HOME     := $(strip $(shell dirname "$$(dirname "$$(which vitis 2>/dev/null)")" 2>/dev/null))
@@ -21,6 +27,12 @@ endif
 
 PLATFORM_USE  ?= {{ platform }}
 PLATFORM      ?= $(VITIS_HOME)/base_platforms/$(PLATFORM_USE)/$(PLATFORM_USE).xpfm
+{% if is_hardware %}
+SDK_VER          := 2025.2
+ROOTFS           ?= ${PLATFORM_REPO_PATHS}/host/versal/xilinx-versal-common-v$(SDK_VER)/rootfs.ext4
+IMAGE            ?= ${PLATFORM_REPO_PATHS}/host/versal/xilinx-versal-common-v$(SDK_VER)/Image
+SDKTARGETSYSROOT ?= ${SYSROOT}
+{% endif %}
 
 # ---------- Sources and includes (generated layout) ----------
 SRC_DIR       := src
@@ -53,6 +65,36 @@ ifeq ($(AIE_SIM_ONLY), true)
   AIE_FLAGS_X86 := $(AIE_FLAGS_X86) --aie.Xpreproc="-DAIE_SIM_ONLY"
 endif
 
+{% if is_hardware %}
+# ---------- VPP / host flags (hardware) ----------
+VPP            := v++
+VPP_XO_FLAGS   := -c --mode hls --platform $(PLATFORM)
+
+GCC_FLAGS   := -Wall -c -std=c++17 -I$(SDKTARGETSYSROOT)/usr/include/xrt
+GCC_LDFLAGS := -lxrt_coreutil -std=c++17
+
+# ---------- Guards (hardware build env) ----------
+check_defined = \
+  $(strip $(foreach 1,$1, \
+    $(call __check_defined,$1,$(strip $(value 2)))))
+__check_defined = \
+  $(if $(value $1),, \
+    $(error Undefined $1$(if $2, ($2))))
+
+guard-PLATFORM_REPO_PATHS:
+	$(call check_defined, PLATFORM_REPO_PATHS, Set where you downloaded $(PLATFORM_USE))
+guard-ROOTFS:
+	$(call check_defined, ROOTFS, Set to: xilinx-versal-common-v$(SDK_VER)/rootfs.ext4)
+guard-IMAGE:
+	$(call check_defined, IMAGE, Set to: xilinx-versal-common-v$(SDK_VER)/Image)
+guard-CXX:
+	$(call check_defined, CXX, Run: xilinx-versal-common-v$(SDK_VER)/environment-setup-aarch64-xilinx-linux)
+guard-SDKTARGETSYSROOT:
+	$(call check_defined, SDKTARGETSYSROOT, Run: xilinx-versal-common-v$(SDK_VER)/environment-setup-aarch64-xilinx-linux)
+
+.PHONY: hw hw_emu aiecom kernels xsa_hw xsa_hw_emu host package_hw package_hw_emu run_emu
+{% endif %}
+
 .PHONY: help clean compile all x86all x86com x86sim sim profile trace analyze
 
 help::
@@ -68,7 +110,12 @@ help::
 	@echo "  make analyze      - Open Vitis Analyzer"
 	@echo "  make clean        - Remove build artifacts"
 
+{% if is_hardware %}
+all: hw
+aiecom: compile
+{% else %}
 all: compile
+{% endif %}
 compile: $(STAMP_MARKER) $(LIBADF)
 
 $(STAMP_MARKER):
@@ -97,6 +144,66 @@ trace:
 analyze:
 	vitis_analyzer aiesimulator_output/default.aierun_summary
 
+{% if is_hardware %}
+# ---------- Hardware: on-board (hw) and emulation (hw_emu) ----------
+hw:     aiecom kernels xsa_hw     host package_hw
+hw_emu: aiecom kernels xsa_hw_emu host package_hw_emu
+
+# ---------- PL kernels (HLS data movers -> .xo) ----------
+kernels: guard-PLATFORM_REPO_PATHS
+{% for k in pl_plan.kernels %}
+	$(VPP) $(VPP_XO_FLAGS) --config pl/{{ k.name }}.cfg
+{% endfor %}
+
+# ---------- XSA (link PL .xo + AIE graph) ----------
+xsa_hw: guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
+	$(VPP) -l -t hw --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM).xsa
+	@echo "COMPLETE: $(PFM).xsa (hw) created."
+
+xsa_hw_emu: guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
+	$(VPP) -l -t hw_emu --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM).xsa
+	@echo "COMPLETE: $(PFM).xsa (hw_emu) created."
+
+# ---------- Host (aarch64 cross-compile) ----------
+host: guard-CXX guard-SDKTARGETSYSROOT
+	mkdir -p $(OUTPUT_DIR)
+	cd ./host && \
+	$(CXX) $(GCC_FLAGS) -o ../$(OUTPUT_DIR)/host.o host.cpp && \
+	$(CXX) ../$(OUTPUT_DIR)/host.o $(GCC_LDFLAGS) -o ../$(OUTPUT_DIR)/host.exe
+	@echo "COMPLETE: Host application ($(OUTPUT_DIR)/host.exe) created."
+
+# ---------- Package (sd_card) ----------
+package_hw: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
+	mkdir -p $(OUTPUT_DIR)
+	v++ -p -t hw \
+		-f $(PLATFORM) \
+		--package.rootfs=$(ROOTFS) \
+		--package.image_format=ext4 \
+		--package.boot_mode=sd \
+		--package.kernel_image=$(IMAGE) \
+		--package.defer_aie_run \
+		--package.out_dir $(OUTPUT_DIR) \
+		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM).xsa $(LIBADF)
+	@echo "COMPLETE: hw package created."
+
+package_hw_emu: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
+	mkdir -p $(OUTPUT_DIR)
+	v++ -p -t hw_emu \
+		-f $(PLATFORM) \
+		--package.rootfs=$(ROOTFS) \
+		--package.image_format=ext4 \
+		--package.boot_mode=sd \
+		--package.kernel_image=$(IMAGE) \
+		--package.defer_aie_run \
+		--package.out_dir $(OUTPUT_DIR) \
+		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM).xsa $(LIBADF)
+	@echo "COMPLETE: hw_emu package created."
+
+# ---------- Run hw_emu ----------
+run_emu:
+	cd ./$(OUTPUT_DIR) && ./launch_hw_emu.sh -add-env AIE_COMPILER_WORKDIR=../Work
+{% endif %}
+
 clean:
 	rm -rf .Xil $(AIE_WORKDIR) $(X86_WORKDIR) libadf.a libadf_x86.a
 	rm -rf aiesimulator_output* aiesimulator*.log
@@ -106,4 +213,13 @@ clean:
 	rm -rf *.xpe *.elf *.db *.soln Map_* xnw* *.lp *.log .xil .Xil *.lp *.db *.log *.exe *.vcd *.json
 	rm -rf vitis_analyzer* pl_sample_counts* pl_sample_count_*
 	rm -rf temp ISS_RPC_SERVER_PORT .crashReporter .AIE_SIM_CMD_LINE_OPTIONS
-	rm -rf system*.* trdata.aiesim function_wdb_dir .wsdata vfs_work _ide .ipynb_checkpoints
+	rm -rf trdata.aiesim function_wdb_dir .wsdata vfs_work _ide .ipynb_checkpoints
+	# Remove generated system* build artifacts but keep the template-authored system.cfg.
+	find . -maxdepth 1 -name 'system*.*' ! -name 'system.cfg' -exec rm -rf {} +
+{% if is_hardware %}
+	rm -rf $(OUTPUT_DIR) *.xsa *.xsa.* *.xclbin* *$(PFM)* _x v++_*
+{% for k in pl_plan.kernels %}
+	rm -rf pl/{{ k.name }}.xo {{ k.name }}.xo {{ k.name }}/
+{% endfor %}
+	rm -rf host/host.o host/*.exe host/sd_card host/sd_card.img host/_x host/Work host/launch_hw_emu.sh host/*.bif
+{% endif %}

@@ -1,0 +1,71 @@
+/*
+Copyright (C) 2026, Advent lab
+
+tick_gen -- standalone PL-clock timestamp kernel for the split mm2s/s2mm movers.
+
+Events (one-shot, iter0-scoped except ev_done):
+   ev_first_send  <- mm2s : first PLIO_ifm beat of iter0 (start of compute)
+   ev_last_send   <- mm2s : last  PLIO_ifm beat of iter0
+   ev_first_recv  <- s2mm : first PLIO_ofm beat of iter0
+   ev_last_recv   <- s2mm : last  PLIO_ofm beat of iter0
+   ev_done        <- s2mm : all iterations stored -- STOPS the counter
+
+All cycles_* are s_axilite output registers read back by the host (which needs exclusive
+access on this CU). cycles_total is the counter value at ev_done (tick_gen lifetime).
+*/
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+
+using ev_t = ap_axis<32, 0, 0, 0>;
+
+extern "C" {
+
+void tick_gen(hls::stream<ev_t>& ev_first_send,
+              hls::stream<ev_t>& ev_last_send,
+              hls::stream<ev_t>& ev_first_recv,
+              hls::stream<ev_t>& ev_last_recv,
+              hls::stream<ev_t>& ev_done,
+              ap_uint<64>* cycles_first_send,
+              ap_uint<64>* cycles_last_send,
+              ap_uint<64>* cycles_first_recv,
+              ap_uint<64>* cycles_last_recv,
+              ap_uint<64>* cycles_total) {
+#pragma HLS INTERFACE axis port=ev_first_send
+#pragma HLS INTERFACE axis port=ev_last_send
+#pragma HLS INTERFACE axis port=ev_first_recv
+#pragma HLS INTERFACE axis port=ev_last_recv
+#pragma HLS INTERFACE axis port=ev_done
+#pragma HLS INTERFACE s_axilite port=cycles_first_send bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_last_send  bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_first_recv bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_last_recv  bundle=control
+#pragma HLS INTERFACE s_axilite port=cycles_total      bundle=control
+#pragma HLS INTERFACE s_axilite port=return            bundle=control
+
+    ap_uint<64> t = 0;
+    ap_uint<64> fs_t = 0, ls_t = 0, fr_t = 0, lr_t = 0;
+    bool fs_cap = false, ls_cap = false, fr_cap = false, lr_cap = false;
+    bool stop = false;
+    ev_t e;
+
+    while (!stop) {
+    #pragma HLS PIPELINE II=1
+        if (!fs_cap && ev_first_send.read_nb(e)) { fs_t = t; fs_cap = true; }
+        if (!ls_cap && ev_last_send.read_nb(e))  { ls_t = t; ls_cap = true; }
+        if (!fr_cap && ev_first_recv.read_nb(e)) { fr_t = t; fr_cap = true; }
+        if (!lr_cap && ev_last_recv.read_nb(e))  { lr_t = t; lr_cap = true; }
+        if (ev_done.read_nb(e)) {
+            stop = true;
+        }
+        t++;
+    }
+    *cycles_first_send = fs_t;
+    *cycles_last_send  = ls_t;
+    *cycles_first_recv = fr_t;
+    *cycles_last_recv  = lr_t;
+    *cycles_total      = t;
+}
+
+}

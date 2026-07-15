@@ -23,7 +23,9 @@
     "PLClockFreqMHz": 312.5,
     "Memory": { "BankMemBytes": 16384 },
     "MaxMemTileInPorts": 8,
-    "MaxMemTileOutPorts": 8
+    "MaxMemTileOutPorts": 8,
+    "UltraRAM": { "BlockBytes": 36864, "Blocks": 264, "Depth": 4096, "WidthBits": 72 },
+    "BlockRAM": { "BlockBytes": 4608, "Blocks": 600, "Depth": 512, "WidthBits": 72 }
   },
   "xilinx_vek280_base_202510_1": {
     "DeviceName": "Vek280",
@@ -36,6 +38,8 @@
     "PLClockFreqMHz": 312.5,
     "Memory": { "BankMemBytes": 16384 },
     "MaxMemTileInPorts": 8,
-    "MaxMemTileOutPorts": 8
+    "MaxMemTileOutPorts": 8,
+    "UltraRAM": { "BlockBytes": 36864, "Blocks": 264, "Depth": 4096, "WidthBits": 72 },
+    "BlockRAM": { "BlockBytes": 4608, "Blocks": 600, "Depth": 512, "WidthBits": 72 }
   }
 }
