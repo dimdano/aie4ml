@@ -136,6 +136,27 @@ _BENCHMARK_TEMPLATE_DIR = 'pl/benchmark'
 _DEPLOYMENT_TEMPLATE_DIR = 'pl/deployment'
 
 
+# Hardware-emission vocabulary — the single source of truth both frontends validate against.
+PL_TARGETS = ('aie', 'hardware')
+PL_MEMORIES = ('uram', 'bram')
+PL_DATA_MOVER_MODES = ('benchmark', 'memory_stream', 'external_stream')
+
+
+def _one_of(cfg: Dict[str, Any], key: str, valid, default: str) -> None:
+    value = str(cfg.get(key, default)).lower()
+    if value not in valid:
+        raise ValueError(f'AIEConfig.{key} must be one of {valid}, got {cfg.get(key)!r}.')
+    cfg[key] = value
+
+
+def normalize_pl_config(aie_config: Dict[str, Any]) -> Dict[str, Any]:
+    _one_of(aie_config, 'Target', PL_TARGETS, 'aie')
+    _one_of(aie_config, 'PLMemory', PL_MEMORIES, 'uram')
+    _one_of(aie_config, 'PLDataMoverMode', PL_DATA_MOVER_MODES, 'benchmark')
+    aie_config['EnablePLTiming'] = bool(aie_config.get('EnablePLTiming', False))
+    return aie_config
+
+
 def emits_system(model_or_ctx) -> bool:
     """Return True when PL + host code should be emitted (``target='hardware'``).
 

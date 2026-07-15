@@ -9,6 +9,7 @@ from ...aie_types import FloatFormat, FloatIntent, QuantIntent, RoundingMode, Sa
 from ...device_catalog import load_device_catalog
 from ...ir import BackendPolicies
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
+from ...system_plan import normalize_pl_config
 from ..common import register_default_traits
 
 
@@ -139,27 +140,7 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
     resolved_aie_config = dict(merged)
     resolved_aie_config['Part'] = str(part_name)
 
-    # Validate + default the hardware-emission knobs
-    target = str(resolved_aie_config.get('Target', 'aie')).lower()
-    if target not in ('aie', 'hardware'):
-        raise ValueError(f"AIEConfig.Target must be 'aie' or 'hardware', got {resolved_aie_config.get('Target')!r}.")
-    resolved_aie_config['Target'] = target
-
-    pl_memory = str(resolved_aie_config.get('PLMemory', 'uram')).lower()
-    if pl_memory not in ('uram', 'bram'):
-        raise ValueError(f"AIEConfig.PLMemory must be 'uram' or 'bram', got {resolved_aie_config.get('PLMemory')!r}.")
-    resolved_aie_config['PLMemory'] = pl_memory
-
-    # PL cycle-timer instrumentation (tick_gen + cycles_* regs). Default OFF
-    resolved_aie_config['EnablePLTiming'] = bool(resolved_aie_config.get('EnablePLTiming', False))
-
-    _pl_data_mover_modes = ('benchmark', 'memory_stream', 'external_stream')
-    pl_data_mover_mode = str(resolved_aie_config.get('PLDataMoverMode', 'benchmark')).lower()
-    if pl_data_mover_mode not in _pl_data_mover_modes:
-        raise ValueError(
-            f'AIEConfig.PLDataMoverMode must be one of {_pl_data_mover_modes}, got {pl_data_mover_mode!r}.'
-        )
-    resolved_aie_config['PLDataMoverMode'] = pl_data_mover_mode
+    normalize_pl_config(resolved_aie_config)
 
     ctx = AIEBackendContext(
         device=device,

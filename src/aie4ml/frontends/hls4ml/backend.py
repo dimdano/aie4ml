@@ -17,6 +17,7 @@ from hls4ml.writer import get_writer
 from ...device_catalog import load_device_catalog
 from ...ir import get_backend_context
 from ...model import AIEModel
+from ...system_plan import normalize_pl_config
 
 log = logging.getLogger(__name__)
 
@@ -187,24 +188,6 @@ class AIEBackend(Backend):
         pl_data_mover_mode='benchmark',
         **_,
     ):
-        if str(target).lower() not in ('aie', 'hardware'):
-            raise ValueError(f"target must be 'aie' or 'hardware', got {target!r}.")
-        target = str(target).lower()
-
-        if str(pl_memory).lower() not in ('uram', 'bram'):
-            raise ValueError(f"pl_memory must be 'uram' or 'bram', got {pl_memory!r}.")
-        pl_memory = str(pl_memory).lower()
-
-        # PL data-path style. 'benchmark' = preload-all single-CU mover (today);
-        # 'memory_stream' = split mm2s/s2mm double-buffered movers (DDR-backed
-        # deployment); 'external_stream' = PLIOs wired directly to external PL
-        # AXI-stream producers/consumers. Default flips to 'memory_stream' once
-        # that emission path lands.
-        _pl_data_mover_modes = ('benchmark', 'memory_stream', 'external_stream')
-        if str(pl_data_mover_mode).lower() not in _pl_data_mover_modes:
-            raise ValueError(f'pl_data_mover_mode must be one of {_pl_data_mover_modes}, got {pl_data_mover_mode!r}.')
-        pl_data_mover_mode = str(pl_data_mover_mode).lower()
-
         device_info = copy.deepcopy(self._get_device_info(part))
 
         def _require(key):
@@ -248,6 +231,7 @@ class AIEBackend(Backend):
             },
         }
 
+        normalize_pl_config(config['AIEConfig'])
         return config
 
     def build(self, model, make_target='all', env=None, log_to_stdout=True):
