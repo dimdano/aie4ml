@@ -157,12 +157,12 @@ kernels: guard-PLATFORM_REPO_PATHS
 
 # ---------- XSA (link PL .xo + AIE graph) ----------
 xsa_hw: guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
-	$(VPP) -l -t hw --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM).xsa
-	@echo "COMPLETE: $(PFM).xsa (hw) created."
+	$(VPP) -l -t hw --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM)_hw.xsa
+	@echo "COMPLETE: $(PFM)_hw.xsa (hw) created."
 
 xsa_hw_emu: guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
-	$(VPP) -l -t hw_emu --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM).xsa
-	@echo "COMPLETE: $(PFM).xsa (hw_emu) created."
+	$(VPP) -l -t hw_emu --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM)_hw_emu.xsa
+	@echo "COMPLETE: $(PFM)_hw_emu.xsa (hw_emu) created."
 
 # ---------- Host (aarch64 cross-compile) ----------
 host: guard-CXX guard-SDKTARGETSYSROOT
@@ -183,7 +183,7 @@ package_hw: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
 		--package.kernel_image=$(IMAGE) \
 		--package.defer_aie_run \
 		--package.out_dir $(OUTPUT_DIR) \
-		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM).xsa $(LIBADF)
+		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM)_hw.xsa $(LIBADF)
 	@echo "COMPLETE: hw package created."
 
 package_hw_emu: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
@@ -196,7 +196,7 @@ package_hw_emu: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
 		--package.kernel_image=$(IMAGE) \
 		--package.defer_aie_run \
 		--package.out_dir $(OUTPUT_DIR) \
-		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM).xsa $(LIBADF)
+		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM)_hw_emu.xsa $(LIBADF)
 	@echo "COMPLETE: hw_emu package created."
 
 # ---------- Run hw_emu ----------
