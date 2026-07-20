@@ -8,6 +8,7 @@ struct {{L.struct_name}} {
   using c_t = result_t;
   static constexpr int IN_FEAT = {{L.n_in}}; static constexpr int OUT_FEAT = {{L.n_out}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
+  static constexpr bool PARALLELISM_CONTRACT_OUTER = {{ 'true' if P.parallelism.contract == 'outer' else 'false' }};
   static constexpr bool TRANSPOSE_A = {{ 'true' if P.flags.transpose_lhs else 'false' }};
   static constexpr bool TRANSPOSE_B = {{ 'true' if P.flags.transpose_rhs else 'false' }};
   static constexpr int SHIFT = {{P.shift}};

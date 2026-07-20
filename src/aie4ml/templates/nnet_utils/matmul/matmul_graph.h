@@ -15,6 +15,11 @@ public:
   static constexpr unsigned K_SLICE    = ConfigT::K_SLICE;
   static constexpr unsigned N_SLICE    = ConfigT::N_SLICE;
 
+  // 'outer' splits the rows across the chains, so each tile reads its own lhs slice rather
+  // than sharing one per cascade column. padded_M is already the per-tile row extent.
+  static constexpr bool PARALLELISM_CONTRACT_OUTER = ConfigT::PARALLELISM_CONTRACT_OUTER;
+  static constexpr unsigned LHS_PORTS = PARALLELISM_CONTRACT_OUTER ? CAS_NUM * CAS_LENGTH : CAS_LENGTH;
+
   using a_t = typename ConfigT::a_t;
   using b_t = typename ConfigT::b_t;
   using c_t = typename ConfigT::c_t;
@@ -34,7 +39,7 @@ public:
   static_assert(C_TILE_BYTES <= BANK_BYTES,
                 "One C ping/pong tile must fit in one 16 KiB bank");
 
-  input_port inA[CAS_LENGTH];
+  input_port inA[LHS_PORTS];
   input_port inB[CAS_NUM * CAS_LENGTH];
   output_port outC[CAS_NUM];
   kernel kk[CAS_NUM * CAS_LENGTH];
@@ -100,7 +105,7 @@ public:
     for (unsigned col = 0; col < CAS_LENGTH; ++col) {
       for (unsigned row = 0; row < CAS_NUM; ++row) {
         const int idx = row * CAS_LENGTH + col;
-        connect<>(inA[col], kk[idx].in[0]);
+        connect<>(inA[PARALLELISM_CONTRACT_OUTER ? idx : col], kk[idx].in[0]);
         dimensions(kk[idx].in[0]) = {padded_M * K_SLICE};
       }
     }

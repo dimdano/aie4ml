@@ -4,9 +4,11 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from ....aie_types import FLOAT_FORMATS
+from ....aie_types import FLOAT_FORMATS, FloatIntent
+from ....ir.graph import STAGING_CONTRACTS, input_tensor_for_role
 from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 from ...utils import AxisPlan, TensorView, build_staging_descriptor, canonical_buffer_axes
+from ...utils.precision import resolve_exact_storage_dtype
 
 # Keys are canonical format-string pairs (lhs_format, rhs_format).
 # Integer formats: 'int8', 'int16' (sign-agnostic — both int8_t and uint8_t map here).
@@ -47,8 +49,40 @@ def select_generation_key(generation: str) -> str:
     return 'AIE'
 
 
-def describe_family_lhs_staging(view: TensorView, microtiling, port: int, buf_dims=None):
-    """Staging descriptor for an LHS (activation input) tensor."""
+_SUPPORTED_INT_WIDTH_COMBOS = frozenset({(8, 8), (16, 8), (16, 16)})
+
+
+def bitwidths_supported(node, device) -> bool:
+    """Whether this device can run the node's lhs/rhs storage widths."""
+    if device.generation not in ('AIE-ML', 'AIE-MLV2'):
+        return False
+    lhs = input_tensor_for_role(node, 'lhs')
+    rhs = input_tensor_for_role(node, 'rhs')
+    if isinstance(lhs.precision, FloatIntent):
+        return True
+    lhs_p = resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name)
+    rhs_p = resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name)
+    return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS
+
+
+# Policy, not a law: the contract used when nothing asks for one. A global partition
+# optimizer will write the directive instead, at which point this is only the fallback for
+# graphs it did not run on.
+DEFAULT_CONTRACT = 'inner'
+
+
+def requested_contract(node) -> str:
+    """The parallelism contract asked of this node; selects between the family's variants."""
+    contract = str((node.directives.get('parallelism', {}) or {}).get('contract', DEFAULT_CONTRACT))
+    if contract not in STAGING_CONTRACTS:
+        raise ValueError(
+            f'{node.name}: unknown parallelism contract {contract!r}; expected one of {sorted(STAGING_CONTRACTS)}.'
+        )
+    return contract
+
+
+def describe_inner_lhs_staging(view: TensorView, microtiling, port: int, buf_dims=None):
+    """LHS staging for the 'inner' contract: the port selects a K-chain; the rows stay whole."""
     microtile_m = int(microtiling.microtile_m)
     microtile_k = int(microtiling.microtile_k)
     in_slice = view.tile_inner
@@ -68,8 +102,8 @@ def describe_family_lhs_staging(view: TensorView, microtiling, port: int, buf_di
     )
 
 
-def describe_family_output_staging(view: TensorView, microtiling, port: int, buf_dims=None):
-    """Staging descriptor for an output tensor."""
+def describe_inner_output_staging(view: TensorView, microtiling, port: int, buf_dims=None):
+    """Output staging for the 'inner' contract: the port selects an N-slice; the rows stay whole."""
     microtile_m = int(microtiling.microtile_m)
     microtile_n = int(microtiling.microtile_n)
     out_slice = view.tile_inner
@@ -88,11 +122,85 @@ def describe_family_output_staging(view: TensorView, microtiling, port: int, buf
     )
 
 
-def describe_family_rhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
-    """Staging descriptor for an RHS (weight) tensor.
+def describe_outer_lhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
+    """LHS staging for the 'outer' contract: the port selects a (row-group, K-chain) tile."""
+    microtile_m = int(microtiling.microtile_m)
+    microtile_k = int(microtiling.microtile_k)
+    in_slice = view.tile_inner
+    outer_slice = view.tile_outer
+    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
 
-    For matmul rhs: view.tile_outer = K slice per port, view.tile_inner = N slice per port.
-    """
+    cas_length = max(1, int(parallelism.cas_length))
+    row_group = int(port) // cas_length
+    k_chain = int(port) % cas_length
+
+    return build_staging_descriptor(
+        view,
+        access='read',
+        plans={
+            inner_dim: AxisPlan(microtile_k, microtile_k, in_slice // microtile_k, k_chain * in_slice),
+            outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, row_group * outer_slice),
+        },
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        buf_dims=buf_dims,
+        slice_dim=outer_dim,
+        boundary_shape='logical',
+    )
+
+
+def describe_outer_output_staging(view: TensorView, microtiling, port: int, buf_dims=None):
+    """Output staging for the 'outer' contract: the port selects a row-group; N stays whole."""
+    microtile_m = int(microtiling.microtile_m)
+    microtile_n = int(microtiling.microtile_n)
+    out_slice = view.tile_inner
+    outer_slice = view.tile_outer
+    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    return build_staging_descriptor(
+        view,
+        access='write',
+        plans={
+            inner_dim: AxisPlan(microtile_n, microtile_n, out_slice // microtile_n),
+            outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, int(port) * outer_slice),
+        },
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        buf_dims=buf_dims,
+        slice_dim=outer_dim,
+    )
+
+
+def describe_outer_rhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
+    """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it."""
+    microtile_k = int(microtiling.microtile_k)
+    microtile_n = int(microtiling.microtile_n)
+    k_slice = view.tile_outer
+    n_slice = view.tile_inner
+    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+
+    k_chain = int(port) % max(1, int(parallelism.cas_length))
+
+    return build_staging_descriptor(
+        view,
+        access='read',
+        plans={
+            inner_dim: AxisPlan(microtile_n, microtile_n, max(1, n_slice // microtile_n)),
+            outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), k_chain * k_slice),
+        },
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        buf_dims=buf_dims,
+        boundary_shape='logical',
+        extras={
+            'packing': 'mmul_rhs',
+            'packing_microtile_k': microtile_k,
+            'packing_microtile_n': microtile_n,
+        },
+    )
+
+
+def describe_inner_rhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
+    """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile."""
     microtile_k = int(microtiling.microtile_k)
     microtile_n = int(microtiling.microtile_n)
     # The rhs view encodes both K and N slices: outer dim = K, inner dim = N.

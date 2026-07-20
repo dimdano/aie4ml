@@ -9,12 +9,17 @@ from typing import Callable
 class ParallelismConfig:
     """Parallelism contract for any op variant.
 
-    cas_num    number of kernel chains partitioning the output / outer axis.
-    cas_length number of kernel columns partitioning the shared / inner axis.
+    contract   which axis cas_num partitions (same vocabulary as output_staging_contract):
+               'inner' -> the inner/feature axis; every tile keeps the full outer extent.
+               'outer' -> the outer/row axis; every tile keeps the full inner extent, so a
+                          tile's output stays whole and a consumer can take it directly.
+    cas_num    number of kernel chains partitioning that axis.
+    cas_length number of kernel columns partitioning the shared / reduction axis.
     """
 
     cas_num: int
     cas_length: int = 1
+    contract: str = 'inner'
 
 
 def parse_directives(directives) -> tuple[dict, dict, dict]:

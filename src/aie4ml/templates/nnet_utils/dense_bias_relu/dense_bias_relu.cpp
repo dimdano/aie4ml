@@ -25,8 +25,10 @@ static_assert(
         ConfigT::padded_IN_FEAT == ConfigT::IN_FEAT_SLICE * ConfigT::CAS_LENGTH,
         "padded_IN_FEAT must equal IN_FEAT_SLICE * CAS_LENGTH");
   static_assert(
-        ConfigT::padded_OUT_FEAT == ConfigT::OUT_FEAT_SLICE * ConfigT::CAS_NUM,
-        "padded_OUT_FEAT must equal OUT_FEAT_SLICE * CAS_NUM");
+        ConfigT::PARALLELISM_CONTRACT_OUTER
+            ? (ConfigT::padded_OUT_FEAT == ConfigT::OUT_FEAT_SLICE)
+            : (ConfigT::padded_OUT_FEAT == ConfigT::OUT_FEAT_SLICE * ConfigT::CAS_NUM),
+        "padded_OUT_FEAT must equal OUT_FEAT_SLICE * CAS_NUM ('inner') or OUT_FEAT_SLICE ('outer')");
 }
 
 template<int M, typename VT, int N>

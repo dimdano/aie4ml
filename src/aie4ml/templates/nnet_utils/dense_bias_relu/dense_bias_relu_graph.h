@@ -23,7 +23,12 @@ public:
   static constexpr int K  = ConfigT::K;
   static constexpr int N  = ConfigT::N;
 
-  input_port  in1[CAS_LENGTH];
+  // 'inner' multicasts one LHS slice per column to every chain; 'outer' gives each
+  // (chain, column) tile its own row slice, so the port array is per-tile.
+  static constexpr bool PARALLELISM_CONTRACT_OUTER = ConfigT::PARALLELISM_CONTRACT_OUTER;
+  static constexpr unsigned LHS_PORTS = PARALLELISM_CONTRACT_OUTER ? CAS_NUM * CAS_LENGTH : CAS_LENGTH;
+
+  input_port  in1[LHS_PORTS];
   adf::port<adf::direction::in> wts[CAS_NUM * CAS_LENGTH];
   adf::port<adf::direction::in> bias[CAS_NUM];
   output_port out1[CAS_NUM];
@@ -102,7 +107,7 @@ void place_graph(int COL_START, int ROW_START)
     for (unsigned col = 0; col < CAS_LENGTH; ++col) {
       for (unsigned ch = 0; ch < CAS_NUM; ++ch) {
         int idx = ch*CAS_LENGTH + col;
-        connect<>( in1[col], kk[idx].in[0] );
+        connect<>( in1[PARALLELISM_CONTRACT_OUTER ? idx : col], kk[idx].in[0] );
         dimensions( kk[idx].in[0] ) = { padded_independent_extent * IN_FEAT_SLICE };
       }
     }

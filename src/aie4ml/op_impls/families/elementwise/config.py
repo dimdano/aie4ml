@@ -16,5 +16,4 @@ class AddConfig:
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
-    staging_contract: str = 'outer'
     preserved_staging: Optional[Tuple[Dict[str, Any], ...]] = None

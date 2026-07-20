@@ -153,14 +153,13 @@ class AddOpImplVariant(OpImplVariant):
 
         return AddConfig(
             precision=precision,
-            parallelism=ParallelismConfig(cas_num=int(cas_num)),
+            parallelism=ParallelismConfig(cas_num=int(cas_num), contract=staging_contract),
             vec_size=vec_size,
             io_views=io_views,
             io_route=io_route,
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,
-            staging_contract=staging_contract,
             preserved_staging=preserved_staging,
         )
 
@@ -182,17 +181,19 @@ class AddOpImplVariant(OpImplVariant):
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         if config.preserved_staging is not None:
             return dict(config.preserved_staging[int(port)])
-        return describe_partition_staging(config.io_views[tensor_name], port, 'read', config.staging_contract, buf_dims)
+        return describe_partition_staging(
+            config.io_views[tensor_name], port, 'read', config.parallelism.contract, buf_dims
+        )
 
     def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
         if config.preserved_staging is not None:
             return dict(config.preserved_staging[int(port)])
         return describe_partition_staging(
-            config.io_views[tensor_name], port, 'write', config.staging_contract, buf_dims
+            config.io_views[tensor_name], port, 'write', config.parallelism.contract, buf_dims
         )
 
     def output_staging_contract(self, node, config: AddConfig, tensor_name: str):
-        return str(config.staging_contract)
+        return str(config.parallelism.contract)
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         return {}

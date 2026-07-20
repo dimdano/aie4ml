@@ -74,10 +74,12 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
         parallel_cfg = raw['parallelism']
         if not isinstance(parallel_cfg, dict):
             raise TypeError(f'{name}: parallelism override must be a dict.')
-        parallelism: Dict[str, int] = {}
+        parallelism: Dict[str, Any] = {}
         for key in ('cas_num', 'cas_length', 'parallel_factor'):
             if key in parallel_cfg:
                 parallelism[key] = int(parallel_cfg[key])
+        if 'contract' in parallel_cfg:
+            parallelism['contract'] = str(parallel_cfg['contract'])
         if parallelism:
             directives['parallelism'] = parallelism
 

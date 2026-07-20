@@ -22,8 +22,10 @@ matmul_base<ConfigT>::matmul_base() {
       ConfigT::padded_K == ConfigT::K_SLICE * ConfigT::CAS_LENGTH,
       "padded_K must equal K_SLICE * CAS_LENGTH");
   static_assert(
-      ConfigT::padded_N == ConfigT::N_SLICE * ConfigT::CAS_NUM,
-      "padded_N must equal N_SLICE * CAS_NUM");
+      ConfigT::PARALLELISM_CONTRACT_OUTER
+          ? (ConfigT::padded_N == ConfigT::N_SLICE)
+          : (ConfigT::padded_N == ConfigT::N_SLICE * ConfigT::CAS_NUM),
+      "padded_N must equal N_SLICE ('outer' keeps N whole) or N_SLICE * CAS_NUM ('inner' slices it)");
 }
 
 template<typename ConfigT>

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, ClassVar, Dict, List, Tuple
 
 import numpy as np
 
@@ -15,18 +15,21 @@ from ...utils.precision import (
     aie_rounding_token,
     infer_accumulator_tag,
     resolve_accumulator_output_shift,
-    resolve_exact_storage_dtype,
 )
 from .common import (
     MICROTILE_OPTIONS,
-    describe_family_lhs_staging,
-    describe_family_output_staging,
+    bitwidths_supported,
+    describe_inner_lhs_staging,
+    describe_inner_output_staging,
+    describe_outer_lhs_staging,
+    describe_outer_output_staging,
     np_bias_dtype_for_spec,
     np_dtype_for_spec,
     pack_as_float,
     pack_mmul_rhs_matrix,
     pack_vector_by_n_slice,
     quantize_to_int,
+    requested_contract,
     select_generation_key,
 )
 from .config import DenseConfig, DenseFlags
@@ -39,11 +42,11 @@ from .resolver import (
     _resolve_tile_cfg,
 )
 
-_SUPPORTED_INT_WIDTH_COMBOS = frozenset({(8, 8), (16, 8), (16, 16)})
-
 
 class _BaseDenseMatmulVariant(OpImplVariant):
     """Unregistered shared base for Dense and Matmul variants."""
+
+    contract: ClassVar[str]
 
     def build_template_params(self, node, config):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -51,7 +54,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
         output_view = config.io_views[node.outputs[0].name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         params.update(
-            full_outer=lhs_view.compacted_full_outer,
+            full_outer=self.kernel_outer_extent(lhs_view),
             full_inner_lhs=lhs_view.full_inner,
             full_inner_rhs=output_view.full_inner,
             tile_inner_lhs=lhs_view.tile_inner,
@@ -61,24 +64,24 @@ class _BaseDenseMatmulVariant(OpImplVariant):
         )
         return params
 
-    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        view = config.io_views[tensor_name]
-        return describe_family_lhs_staging(view, config.microtiling, port, buf_dims)
+    def kernel_outer_extent(self, lhs_view):
+        """Rows this kernel loops over. Contract-specific: declared by each variant."""
+        raise NotImplementedError
 
-    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        view = config.io_views[tensor_name]
-        return describe_family_output_staging(view, config.microtiling, port, buf_dims)
+    def lhs_port_count(self, config) -> int:
+        """LHS ports this variant needs. Contract-specific: declared by each variant."""
+        raise NotImplementedError
 
     def microtiling_options(self, generation: str, query) -> List[Tuple[int, int, int]]:
         return list(MICROTILE_OPTIONS.get(select_generation_key(generation), {}).get(tuple(query), []))
 
-    def output_staging_contract(self, _node, _config, _tensor_name: str):
-        return 'inner'
+    def output_staging_contract(self, _node, config, _tensor_name: str):
+        return str(config.parallelism.contract)
 
 
-@register_variant
-class DenseOpImplVariant(_BaseDenseMatmulVariant):
-    variant_id = 'dense.b.r.v1'
+class _DenseVariantBase(_BaseDenseMatmulVariant):
+    """Everything the dense variants share, independent of which contract they implement."""
+
     op_type = 'dense'
     graph_header = 'dense_bias_relu_graph.h'
     graph_name = 'dense_bias_relu_graph'
@@ -86,22 +89,14 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
-            return False
-        lhs = input_tensor_for_role(node, 'lhs')
-        rhs = input_tensor_for_role(node, 'rhs')
-        if isinstance(lhs.precision, FloatIntent):
-            return True
-        lhs_p = resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name)
-        rhs_p = resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name)
-        return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS
+        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, _, _ = parse_directives(directives)
         precision = _resolve_numeric(node, device)
         precision['bias'] = _resolve_bias_dtype(node, precision)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision)
+        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -121,7 +116,9 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
 
         return DenseConfig(
             precision=precision,
-            parallelism=ParallelismConfig(cas_length=tiling.cas_length, cas_num=tiling.cas_num),
+            parallelism=ParallelismConfig(
+                cas_length=tiling.cas_length, cas_num=tiling.cas_num, contract=tiling.contract
+            ),
             microtiling=microtiling,
             io_views=io_views,
             io_route=io_route,
@@ -135,13 +132,11 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
             ),
         )
 
-    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
-        p = inst.config
+    def _quantize_weight_bias(self, inst: OpImplInstance):
+        """Quantize the weight matrix and bias vector; shared by every dense contract."""
         input_tensor = inst.node.inputs[0]
         weight_tensor = inst.node.inputs[1]
         bias_tensor = inst.node.inputs[2] if len(inst.node.inputs) > 2 else None
-        lhs_view = p.io_views[input_tensor.name]
-        output_view = p.io_views[inst.node.outputs[0].name]
 
         wi = weight_tensor.precision
         if isinstance(wi, FloatIntent):
@@ -173,33 +168,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
         W = np.asarray(W)
         if W.ndim < 2:
             raise ValueError(f'{inst.name}: weight matrix must have at least 2 dimensions, got {W.ndim}.')
-        n_in = int(W.shape[-2])
-        n_out = int(W.shape[-1])
-
-        packed_W = pack_mmul_rhs_matrix(
-            W,
-            K=n_in,
-            N=n_out,
-            K_slice=lhs_view.tile_inner,
-            N_slice=output_view.tile_inner,
-            microtile_k=p.microtiling.microtile_k,
-            microtile_n=p.microtiling.microtile_n,
-            cas_length=p.parallelism.cas_length,
-            cas_num=p.parallelism.cas_num,
-            dtype=np_dtype_for_spec(p.precision['rhs']),
-        )
-        packed_B = (
-            pack_vector_by_n_slice(
-                b,
-                N=n_out,
-                N_slice=output_view.tile_inner,
-                cas_num=p.parallelism.cas_num,
-                dtype=np_bias_dtype_for_spec(p.precision['bias']),
-            )
-            if b is not None
-            else None
-        )
-        return {'packed_weights': packed_W, 'packed_bias': packed_B}
+        return W, b, int(W.shape[-2]), int(W.shape[-1])
 
     def footprint(self, _node, config) -> OpImplFootprint:
         return OpImplFootprint(
@@ -250,10 +219,123 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
             raise ValueError(f'{node.name}: dense accumulator output shift must be non-negative, got {config.shift}.')
 
     def build_ports(self, node: OpNode, config: DenseConfig):
-        n_in = int(config.parallelism.cas_length)
+        n_in = self.lhs_port_count(config)
         n_out = int(config.parallelism.cas_num)
         data_inputs = [t for t in node.inputs if not t.is_parameter]
         return PortMap(
-            inputs={t.name: PortBinding(group=f'in{i+1}', count=n_in) for i, t in enumerate(data_inputs)},
-            outputs={t.name: PortBinding(group=f'out{i+1}', count=n_out) for i, t in enumerate(node.outputs)},
+            inputs={t.name: PortBinding(group=f'in{i + 1}', count=n_in) for i, t in enumerate(data_inputs)},
+            outputs={t.name: PortBinding(group=f'out{i + 1}', count=n_out) for i, t in enumerate(node.outputs)},
         )
+
+
+@register_variant
+class DenseOpImplVariant(_DenseVariantBase):
+    """Dense with the output features partitioned across cascade chains ('inner' contract)."""
+
+    variant_id = 'dense.b.r.v1'
+    contract = 'inner'
+
+    def kernel_outer_extent(self, lhs_view):
+        return lhs_view.compacted_full_outer
+
+    def lhs_port_count(self, config: DenseConfig) -> int:
+        # One LHS slice per cascade column, multicast across every chain.
+        return int(config.parallelism.cas_length)
+
+    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
+        return describe_inner_lhs_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
+        return describe_inner_output_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+
+    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+        # 'inner': cas_num slices the columns, so chain c owns weight/bias columns
+        # [c*N_slice, (c+1)*N_slice) -- which is exactly what the packers lay out.
+        p = inst.config
+        W, b, n_in, n_out = self._quantize_weight_bias(inst)
+        lhs_view = p.io_views[inst.node.inputs[0].name]
+        output_view = p.io_views[inst.node.outputs[0].name]
+
+        packed_W = pack_mmul_rhs_matrix(
+            W,
+            K=n_in,
+            N=n_out,
+            K_slice=lhs_view.tile_inner,
+            N_slice=output_view.tile_inner,
+            microtile_k=p.microtiling.microtile_k,
+            microtile_n=p.microtiling.microtile_n,
+            cas_length=p.parallelism.cas_length,
+            cas_num=p.parallelism.cas_num,
+            dtype=np_dtype_for_spec(p.precision['rhs']),
+        )
+        packed_B = (
+            pack_vector_by_n_slice(
+                b,
+                N=n_out,
+                N_slice=output_view.tile_inner,
+                cas_num=p.parallelism.cas_num,
+                dtype=np_bias_dtype_for_spec(p.precision['bias']),
+            )
+            if b is not None
+            else None
+        )
+        return {'packed_weights': packed_W, 'packed_bias': packed_B}
+
+
+@register_variant
+class DenseRowWiseOpImplVariant(_DenseVariantBase):
+    """Dense with the rows partitioned across cascade chains ('outer' contract)."""
+
+    variant_id = 'dense.b.r.row.v1'
+    contract = 'outer'
+    plevel = 10
+
+    def kernel_outer_extent(self, lhs_view):
+        return lhs_view.compacted_tile_outer
+
+    def lhs_port_count(self, config: DenseConfig) -> int:
+        # Every (chain, column) tile reads its own row slice, so the LHS port array is per-tile.
+        return int(config.parallelism.cas_length) * int(config.parallelism.cas_num)
+
+    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
+        return describe_outer_lhs_staging(
+            config.io_views[tensor_name], config.microtiling, config.parallelism, port, buf_dims
+        )
+
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
+        return describe_outer_output_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+
+    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+        # The packers slice columns as chain*N_slice; here N_slice is the whole N, so pack a
+        # single chain (offset 0, full width) and give every row-group that same copy.
+        p = inst.config
+        W, b, n_in, n_out = self._quantize_weight_bias(inst)
+        lhs_view = p.io_views[inst.node.inputs[0].name]
+        output_view = p.io_views[inst.node.outputs[0].name]
+        cas_num = int(p.parallelism.cas_num)
+
+        packed_W = pack_mmul_rhs_matrix(
+            W,
+            K=n_in,
+            N=n_out,
+            K_slice=lhs_view.tile_inner,
+            N_slice=output_view.tile_inner,
+            microtile_k=p.microtiling.microtile_k,
+            microtile_n=p.microtiling.microtile_n,
+            cas_length=p.parallelism.cas_length,
+            cas_num=1,
+            dtype=np_dtype_for_spec(p.precision['rhs']),
+        )
+        packed_W = np.repeat(packed_W, cas_num, axis=0)
+
+        packed_B = None
+        if b is not None:
+            packed_B = pack_vector_by_n_slice(
+                b,
+                N=n_out,
+                N_slice=output_view.tile_inner,
+                cas_num=1,
+                dtype=np_bias_dtype_for_spec(p.precision['bias']),
+            )
+            packed_B = np.repeat(packed_B, cas_num, axis=0)
+        return {'packed_weights': packed_W, 'packed_bias': packed_B}

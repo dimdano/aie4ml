@@ -10,14 +10,19 @@ from ...utils.precision import (
     aie_rounding_token,
     infer_accumulator_tag,
     resolve_accumulator_output_shift,
-    resolve_exact_storage_dtype,
 )
 from .common import (
-    describe_family_lhs_staging,
-    describe_family_rhs_staging,
+    bitwidths_supported,
+    describe_inner_lhs_staging,
+    describe_inner_output_staging,
+    describe_inner_rhs_staging,
+    describe_outer_lhs_staging,
+    describe_outer_output_staging,
+    describe_outer_rhs_staging,
+    requested_contract,
 )
 from .config import MatmulConfig, MatmulFlags
-from .dense import _SUPPORTED_INT_WIDTH_COMBOS, _BaseDenseMatmulVariant
+from .dense import _BaseDenseMatmulVariant
 from .resolver import (
     _build_matmul_io_views,
     _resolve_numeric,
@@ -27,9 +32,9 @@ from .resolver import (
 )
 
 
-@register_variant
-class MatmulOpImplVariant(_BaseDenseMatmulVariant):
-    variant_id = 'matmul.v1'
+class _MatmulVariantBase(_BaseDenseMatmulVariant):
+    """Everything the matmul variants share, independent of which contract they implement."""
+
     op_type = 'matmul'
     graph_header = 'matmul_graph.h'
     graph_name = 'matmul_graph'
@@ -37,21 +42,13 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
-            return False
-        lhs = input_tensor_for_role(node, 'lhs')
-        rhs = input_tensor_for_role(node, 'rhs')
-        if isinstance(lhs.precision, FloatIntent):
-            return True
-        lhs_p = resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name)
-        rhs_p = resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name)
-        return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS
+        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives=None) -> MatmulConfig:
         io_route, _, _ = parse_directives(directives)
         precision = _resolve_numeric(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision)
+        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -69,7 +66,9 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
 
         return MatmulConfig(
             precision=precision,
-            parallelism=ParallelismConfig(cas_length=tiling.cas_length, cas_num=tiling.cas_num),
+            parallelism=ParallelismConfig(
+                cas_length=tiling.cas_length, cas_num=tiling.cas_num, contract=tiling.contract
+            ),
             microtiling=microtiling,
             io_views=io_views,
             io_route=io_route,
@@ -81,13 +80,6 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
                 transpose_rhs=bool(rhs_perm is not None and rhs_perm[-1] != (len(rhs_perm) - 1)),
             ),
         )
-
-    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
-        view = config.io_views[tensor_name]
-        role = input_role(node, tensor_name)
-        if role == 'rhs':
-            return describe_family_rhs_staging(view, config.microtiling, config.parallelism, port, buf_dims)
-        return describe_family_lhs_staging(view, config.microtiling, port, buf_dims)
 
     def validate_config(self, node: OpNode, config: MatmulConfig, _device) -> None:
         rhs_tensor = input_tensor_for_role(node, 'rhs')
@@ -123,7 +115,7 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         return PortMap(
             inputs={
-                lhs_tensor.name: PortBinding(group='inA', count=int(config.parallelism.cas_length)),
+                lhs_tensor.name: PortBinding(group='inA', count=self.lhs_port_count(config)),
                 rhs_tensor.name: PortBinding(
                     group='inB',
                     count=int(config.parallelism.cas_length) * int(config.parallelism.cas_num),
@@ -131,3 +123,51 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
             },
             outputs={node.outputs[0].name: PortBinding(group='outC', count=int(config.parallelism.cas_num))},
         )
+
+
+@register_variant
+class MatmulOpImplVariant(_MatmulVariantBase):
+    """Matmul with the output features partitioned across cascade chains ('inner' contract)."""
+
+    variant_id = 'matmul.v1'
+    contract = 'inner'
+
+    def kernel_outer_extent(self, lhs_view):
+        return lhs_view.compacted_full_outer
+
+    def lhs_port_count(self, config: MatmulConfig) -> int:
+        # One lhs slice per cascade column, multicast across every chain.
+        return int(config.parallelism.cas_length)
+
+    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
+        view = config.io_views[tensor_name]
+        if input_role(node, tensor_name) == 'rhs':
+            return describe_inner_rhs_staging(view, config.microtiling, config.parallelism, port, buf_dims)
+        return describe_inner_lhs_staging(view, config.microtiling, port, buf_dims)
+
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
+        return describe_inner_output_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+
+
+@register_variant
+class MatmulRowWiseOpImplVariant(_MatmulVariantBase):
+    """Matmul with the rows partitioned across cascade chains ('outer' contract)."""
+
+    variant_id = 'matmul.row.v1'
+    contract = 'outer'
+
+    def kernel_outer_extent(self, lhs_view):
+        return lhs_view.compacted_tile_outer
+
+    def lhs_port_count(self, config: MatmulConfig) -> int:
+        # Every (chain, column) tile reads its own row slice, so the lhs port array is per-tile.
+        return int(config.parallelism.cas_length) * int(config.parallelism.cas_num)
+
+    def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
+        view = config.io_views[tensor_name]
+        if input_role(node, tensor_name) == 'rhs':
+            return describe_outer_rhs_staging(view, config.microtiling, config.parallelism, port, buf_dims)
+        return describe_outer_lhs_staging(view, config.microtiling, config.parallelism, port, buf_dims)
+
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
+        return describe_outer_output_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
