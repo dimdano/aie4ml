@@ -129,7 +129,7 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
 
         return SoftmaxConfig(
             precision=precision,
-            parallelism=ParallelismConfig(cas_num=int(cas_num)),
+            parallelism=ParallelismConfig(cas_num=int(cas_num), contract='outer'),
             param_sets=int(infer_hccs_param_sets(hccs)),
             vec_size=int(vec_size),
             inv_shift=int(hccs.get('inv_shift', DEFAULT_INV_SHIFT)),
@@ -175,8 +175,8 @@ class SoftmaxHccsI8OpImplVariant(OpImplVariant):
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
 
-    def output_staging_contract(self, _node, _config: SoftmaxConfig, _tensor_name: str):
-        return 'outer'
+    def output_staging_contract(self, _node, config: SoftmaxConfig, _tensor_name: str):
+        return str(config.parallelism.contract)
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         return {}

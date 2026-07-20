@@ -140,7 +140,7 @@ class LayerNormI8OpImplVariant(OpImplVariant):
 
         return LayerNormConfig(
             precision=precision,
-            parallelism=ParallelismConfig(cas_num=int(cas_num)),
+            parallelism=ParallelismConfig(cas_num=int(cas_num), contract='outer'),
             rows=int(outer_prefix * tile_outer),
             cols=int(full_inner),
             vec_size=int(vec_size),
@@ -171,8 +171,8 @@ class LayerNormI8OpImplVariant(OpImplVariant):
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
 
-    def output_staging_contract(self, _node, _config: LayerNormConfig, _tensor_name: str):
-        return 'outer'
+    def output_staging_contract(self, _node, config: LayerNormConfig, _tensor_name: str):
+        return str(config.parallelism.contract)
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         p = inst.config
