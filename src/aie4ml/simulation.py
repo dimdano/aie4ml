@@ -2,11 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
-import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple
 
 import numpy as np
 
@@ -19,148 +18,6 @@ log = logging.getLogger(__name__)
 
 def _is_float_format(fmt: str) -> bool:
     return (fmt or '') in FLOAT_FORMATS
-
-
-def read_aie_report(model_or_path: Union[object, str, Path]) -> Dict:
-    model = None
-    if hasattr(model_or_path, '_aie_backend_context'):
-        model = model_or_path
-        from .ir import get_backend_context
-
-        output_dir = get_backend_context(model).project_config.output_dir
-    else:
-        output_dir = Path(model_or_path)
-    output_dir = output_dir.resolve()
-
-    ii_info = _analyze_aie_out_interval(output_dir)
-    graph_info = _read_aie_graph_stats(output_dir)
-    report = {}
-
-    global_ii = ii_info.get('global', {})
-    if global_ii and model is not None:
-        ops_per_inf = compute_ops(model)
-        total_ops = ops_per_inf
-        report['throughput'] = {
-            'Avg_GOPs': round((total_ops / global_ii['avg_ns']), 3),
-            'Min_GOPs': round((total_ops / global_ii['min_ns']), 3),
-            'Max_GOPs': round((total_ops / global_ii['max_ns']), 3),
-        }
-
-    report['output_interval'] = ii_info
-    report['AIE_info'] = graph_info
-
-    return report
-
-
-def _read_aie_graph_stats(output_dir: Path) -> Dict:
-    report_path = output_dir / 'Work' / 'reports' / 'app_mapping_analysis_report.txt'
-
-    if report_path.exists():
-        try:
-            with open(report_path) as f:
-                text = f.read().strip('\n')
-            return text.splitlines()
-        except Exception as e:
-            return f'error Failed to read AIE graph report: {e} in {str(report_path)}'
-
-    return 'No AIE graph report found. Run AIE hardware compilation to generate it.'
-
-
-def _analyze_aie_out_interval(output_dir: Path) -> Dict:
-    data_dir = output_dir / 'aiesimulator_output' / 'data'
-
-    if not data_dir.exists():
-        return {}
-
-    per_file = {}
-    all_lat = []
-
-    for fp in sorted(data_dir.glob('y_p*.txt')):
-        lst = _parse_timing(fp)
-        if lst:
-            per_file[fp.name] = {
-                'min_ns': round(min(lst), 3),
-                'max_ns': round(max(lst), 3),
-                'avg_ns': round(sum(lst) / len(lst), 3),
-                'samples': len(lst),
-            }
-            all_lat.extend(lst)
-
-    if not all_lat:
-        return {}
-
-    return {
-        'global': {
-            'min_ns': round(min(all_lat), 3),
-            'max_ns': round(max(all_lat), 3),
-            'avg_ns': round(sum(all_lat) / len(all_lat), 3),
-            'samples': len(all_lat),
-        },
-        'per_port': per_file,
-    }
-
-
-def _parse_timing(path: Path) -> List[float]:
-    """Return TLAST-to-TLAST intervals (in nanoseconds)."""
-    regex = re.compile(r'^T\s+(\d+)\s*(ps|ns|us|ms|s)', re.IGNORECASE)
-
-    lat = []
-    last_tlast_time = None
-    current_time = None
-
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-
-            m = regex.match(line)
-            if m:
-                val, unit = m.groups()
-                current_time = _convert_to_ns(int(val), unit)
-                continue
-
-            if 'TLAST' in line.upper():
-                if last_tlast_time is not None and current_time is not None:
-                    dt = current_time - last_tlast_time
-                    if dt >= 0:
-                        lat.append(dt)
-                last_tlast_time = current_time
-
-    return lat
-
-
-def _convert_to_ns(value: int, unit: str) -> float:
-    if unit == 'ps':
-        return value / 1000
-    if unit == 'ns':
-        return value
-    if unit == 'us':
-        return value * 1000
-    if unit == 'ms':
-        return value * 1_000_000
-    if unit == 's':
-        return value * 1_000_000_000
-    raise ValueError(f'Unknown time unit: {unit}')
-
-
-def compute_ops(model):
-    ctx = get_backend_context(model)
-
-    ops = 0
-    for node in ctx.ir.logical:
-        if node.op_type not in ('dense', 'matmul'):
-            continue
-
-        n_in = int(node.metadata['n_in'])
-        n_out = int(node.metadata['n_out'])
-        out_shape = [int(x) for x in node.outputs[0].shape]
-
-        independent_extent = 1
-        for dim in out_shape[:-1]:
-            independent_extent *= int(dim)
-
-        ops += 2 * n_in * n_out * independent_extent
-
-    return ops
 
 
 @dataclass

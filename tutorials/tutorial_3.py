@@ -1,7 +1,7 @@
 import hls4ml
 import numpy as np
 import tensorflow as tf
-from aie4ml.simulation import read_aie_report
+from aie4ml.report import report
 from qkeras import QActivation, QDense, quantized_bits
 from tensorflow.keras import Model
 from tensorflow.keras.optimizers import Adam
@@ -67,24 +67,4 @@ aie_model.build()
 x = np.random.random((BATCH, N_IN)).astype(np.float32)
 y_aie = aie_model.predict(x, simulator='aie')[:BATCH]
 
-report = read_aie_report(aie_model)
-
-print('\n' + '=' * 60)
-print('AIE SIMULATION REPORT')
-print('=' * 60)
-
-if 'throughput' in report:
-    t = report['throughput']
-    print('\n[Throughput]')
-    print(f"  Avg : {t['Avg_GOPs']} GOPs")
-    print(f"  Min : {t['Min_GOPs']} GOPs")
-    print(f"  Max : {t['Max_GOPs']} GOPs")
-
-if 'output_interval' in report:
-    ii = report['output_interval']
-    print('\n[Output Interval (ns)]')
-    for name, vals in ii.items():
-        if isinstance(vals, dict):
-            print(f'  {name}:')
-            for k, v in vals.items():
-                print(f'    {k}: {v} ns')
+print(report(aie_model))

@@ -18,7 +18,6 @@ from .simulation import (
     collect_outputs,
     dequantize_outputs,
     prepare_inputs,
-    read_aie_report,
     run_simulation_target,
     write_input_files,
 )
@@ -128,7 +127,7 @@ class AIEModel:
         if sim_key == 'x86':
             make_target = 'x86sim'
         elif sim_key == 'aie':
-            make_target = 'aiesim'
+            make_target = 'profile'
         else:
             raise ValueError(f'Unknown simulator "{simulator}". Expected one of: x86, aie.')
 
@@ -148,7 +147,10 @@ class AIEModel:
         return {k: _flatten_iters(v) for k, v in final_out.items()}
 
     def report(self):
-        return read_aie_report(self)
+        """Resource, latency and per-kernel cycle report for this project."""
+        from .report import report
+
+        return report(self)
 
 
 def from_hls4ml(model) -> AIEModel:
