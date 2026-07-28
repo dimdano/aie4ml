@@ -46,6 +46,9 @@ testing = [
 Homepage = "https://github.com/dimdano/aie4ml"
 Issues = "https://github.com/dimdano/aie4ml/issues"
 
+[project.scripts]
+aie4ml-report = "aie4ml.report:main"
+
 [project.entry-points."hls4ml.backends"]
 AIE = "aie4ml.plugin:register"
 
