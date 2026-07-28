@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict
+from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
@@ -10,12 +10,15 @@ from ...base import OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
+    MicrotileShape,
     ParallelismConfig,
     build_io_views,
     describe_partition_staging,
     extract_inner_outer,
     find_tile_split,
+    inherited_microtile,
     parse_directives,
+    requested_layout,
     require_power_of_two,
 )
 from ...utils.io import view_shape
@@ -27,8 +30,6 @@ from ...utils.precision import (
 )
 from .common import (
     BETA_FRAC_BITS,
-    DEFAULT_ISQRT_NR_ITERS,
-    DEFAULT_USE_AIE_INVSQRT,
     GAMMA_FRAC_BITS,
     layernorm_vec_size,
     pack_layernorm_param,
@@ -60,9 +61,14 @@ def _resolve_eps_q0(node_name: str, metadata: dict, input_frac: int) -> int:
     return eps_q0
 
 
-@register_variant
-class LayerNormI8OpImplVariant(OpImplVariant):
-    variant_id = 'layer_norm.i8.v1'
+class _LayerNormVariantBase(OpImplVariant):
+    """Everything the LayerNorm variants share, independent of the layout they normalise in."""
+
+    #: The `layout:` directive name this variant answers to -- the sole selector between the
+    #: two. Only a selection key: the layout the op actually writes is its staging descriptor,
+    #: and the microtile it publishes for inheritance comes from output_microtile.
+    layout_name: ClassVar[str]
+
     op_type = 'layer_norm'
     graph_header = 'layer_norm_graph.h'
     graph_name = 'layer_norm_graph'
@@ -70,6 +76,8 @@ class LayerNormI8OpImplVariant(OpImplVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
+        if requested_layout(node) != self.layout_name:
+            return False
         if device.generation not in ('AIE-ML', 'AIE-MLV2'):
             return False
         in_tensor = input_tensor_for_role(node, 'lhs')
@@ -78,6 +86,10 @@ class LayerNormI8OpImplVariant(OpImplVariant):
         in_prec = resolve_exact_storage_dtype(in_tensor.precision, namespace='lhs', layer_name=node.name)
         out_prec = resolve_exact_storage_dtype(node.outputs[0].precision, namespace='output', layer_name=node.name)
         return int(in_prec.width) == 8 and bool(in_prec.signed) and int(out_prec.width) == 8 and bool(out_prec.signed)
+
+    def resolve_microtile(self, _node: OpNode, _input_contracts):
+        """The microtile this variant normalises in, or None when it works on whole rows."""
+        return None
 
     def resolve(self, node: OpNode, device, directives=None) -> LayerNormConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
@@ -124,6 +136,7 @@ class LayerNormI8OpImplVariant(OpImplVariant):
             descending=True,
         )
 
+        microtile = self.resolve_microtile(node, input_contracts)
         io_views = build_io_views(
             node,
             [in_tensor],
@@ -134,9 +147,8 @@ class LayerNormI8OpImplVariant(OpImplVariant):
             tile_outer=tile_outer,
             tile_inner_raw=full_inner,
             tile_outer_raw=tile_outer,
+            microtile=microtile,
         )
-
-        out_shift = int(to_quant_intent(out_tensor.precision).frac)
 
         return LayerNormConfig(
             precision=precision,
@@ -145,13 +157,13 @@ class LayerNormI8OpImplVariant(OpImplVariant):
             cols=int(full_inner),
             vec_size=int(vec_size),
             gamma_shift=int(GAMMA_FRAC_BITS),
-            out_shift=out_shift,
+            out_shift=int(to_quant_intent(out_tensor.precision).frac),
             eps_q0=_resolve_eps_q0(node.name, node.metadata, int(precision['lhs'].frac)),
-            isqrt_nr_iters=int(DEFAULT_ISQRT_NR_ITERS),
-            use_aie_invsqrt=bool(DEFAULT_USE_AIE_INVSQRT),
             rounding_mode=aie_rounding_token(precision['output']),
             io_views=io_views,
             io_route=io_route,
+            layout=self.layout_name,
+            microtile=microtile,
         )
 
     def validate_config(self, node: OpNode, config: LayerNormConfig, _device) -> None:
@@ -186,6 +198,7 @@ class LayerNormI8OpImplVariant(OpImplVariant):
                 full_inner=int(p.cols),
                 frac=int(p.precision['gamma'].frac),
                 cas_num=cas_num,
+                microtile=p.microtile,
             ),
             'packed_beta': pack_layernorm_param(
                 beta_tensor.data,
@@ -193,6 +206,7 @@ class LayerNormI8OpImplVariant(OpImplVariant):
                 full_inner=int(p.cols),
                 frac=int(p.precision['beta'].frac),
                 cas_num=cas_num,
+                microtile=p.microtile,
             ),
         }
 
@@ -232,3 +246,56 @@ class LayerNormI8OpImplVariant(OpImplVariant):
             inputs={in_tensor.name: PortBinding(group='in1', count=n)},
             outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )
+
+
+@register_variant
+class LayerNormLinearOpImplVariant(_LayerNormVariantBase):
+    """LayerNorm over row-contiguous data -- the layout every non-matmul op reads and writes."""
+
+    variant_id = 'layer_norm.i8.v1'
+    layout_name = 'linear'
+
+
+@register_variant
+class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
+    """LayerNorm over microtiles, so a matmul on either side needs no memtile to reorder.
+
+    A block holds one lane group per row, which also lets the reduction be segmented (once
+    per row band) instead of a full cross-lane reduce per row.
+    """
+
+    variant_id = 'layer_norm.i8.tiled.v1'
+    layout_name = 'tiled'
+
+    def resolve_microtile(self, node: OpNode, input_contracts):
+        """Match the producer's microtile so the edge is direct; else choose our own."""
+        return inherited_microtile(node, input_contracts) or self.preferred_microtile(node)
+
+    def preferred_microtile(self, node: OpNode) -> MicrotileShape:
+        """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary)."""
+        return MicrotileShape(outer=4, inner=8)
+
+    def validate_config(self, node: OpNode, config: LayerNormConfig, device) -> None:
+        super().validate_config(node, config, device)
+        mt = config.microtile
+        if config.rows % mt.outer:
+            raise ValueError(
+                f'{node.name}: rows={config.rows} must be a whole number of {mt.outer}-row microtile '
+                f'bands. Partitioning across kernels chose this tile height, so adjust cas_num.'
+            )
+        if config.cols % mt.inner:
+            raise ValueError(f'{node.name}: cols={config.cols} must be a whole number of {mt.inner}-wide microtiles.')
+        block_bytes = mt.outer * mt.inner * storage_bytes_for_spec(config.precision['lhs'])
+        if block_bytes < 16:
+            raise ValueError(
+                f'{node.name}: a {mt.outer}x{mt.inner} microtile of '
+                f'{config.precision["lhs"].c_type} is {block_bytes} bytes, under the 16-byte minimum '
+                f'vector width. This layout needs a wider microtile or a wider dtype.'
+            )
+        if mt.inner < 8 or mt.outer < 2 or mt.outer > 8 or mt.outer * mt.inner > 64:
+            raise ValueError(
+                f'{node.name}: the tiled LayerNorm cannot normalise a {mt.outer}x{mt.inner} microtile. '
+                f'It needs 2 <= outer <= 8, inner >= 8, and outer*inner <= 64, because the gamma/beta '
+                f'lane group and the widened block each have to be a legal vector width. The producer '
+                f"chose this tiling; retile it, or run this LayerNorm as layout='linear'."
+            )

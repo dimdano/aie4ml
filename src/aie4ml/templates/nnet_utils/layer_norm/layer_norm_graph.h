@@ -49,7 +49,14 @@ public:
     layer_norm_graph()
     {
         for (int i = 0; i < CAS_NUM; ++i) {
-            kk[i] = kernel::create_object<layernorm_i8<ConfigT>>();
+            // The layout the op declares picks the kernel: 'tiled' reads and writes
+            // microtiles so a matmul on either side needs no memtile, 'linear' keeps rows
+            // contiguous, which is what every other op reads.
+            if constexpr (ConfigT::LAYOUT_TILED) {
+                kk[i] = kernel::create_object<layernorm_i8_tiled<ConfigT>>();
+            } else {
+                kk[i] = kernel::create_object<layernorm_i8<ConfigT>>();
+            }
             source(kk[i])         = "layer_norm.cpp";
             runtime<ratio>(kk[i]) = 1.0;
 

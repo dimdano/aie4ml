@@ -9,6 +9,7 @@ from ...aie_types import FloatFormat, FloatIntent, QuantIntent, RoundingMode, Sa
 from ...device_catalog import load_device_catalog
 from ...ir import BackendPolicies
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
+from ...ir.graph import TENSOR_LAYOUTS
 from ...system_plan import normalize_pl_config
 from ..common import register_default_traits
 
@@ -88,6 +89,12 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
         if not isinstance(io_route, dict):
             raise TypeError(f'{name}: io_route override must be a dict.')
         directives['io_route'] = dict(io_route)
+
+    if 'layout' in raw:
+        layout = str(raw['layout'])
+        if layout not in TENSOR_LAYOUTS:
+            raise ValueError(f'{name}: unknown layout {layout!r}; expected one of {sorted(TENSOR_LAYOUTS)}.')
+        directives['layout'] = layout
 
     if 'approximation' in raw:
         directives['approximation'] = str(raw['approximation'])

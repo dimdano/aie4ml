@@ -4,6 +4,9 @@ import math
 from dataclasses import dataclass
 from typing import Callable
 
+from ...ir.graph import TENSOR_LAYOUTS
+from .tensor_view import microtile_from_staging
+
 
 @dataclass(frozen=True)
 class ParallelismConfig:
@@ -45,6 +48,31 @@ def extract_inner_outer(shape: tuple[int, ...]) -> tuple[int, int, int]:
     last_outer = int(shape[-2]) if len(shape) >= 2 else 1
     outer_prefix = int(math.prod(shape[:-2])) if len(shape) > 2 else 1
     return full_inner, outer_prefix, last_outer
+
+
+def requested_layout(node) -> str:
+    """The layout a `layout:` directive asks of this node -- the selector between an op's
+    layout variants. Default keeps rows contiguous, what every non-matmul op reads."""
+    layout = str(node.directives.get('layout', 'linear'))
+    if layout not in TENSOR_LAYOUTS:
+        raise ValueError(f'{node.name}: unknown layout {layout!r}; expected one of {sorted(TENSOR_LAYOUTS)}.')
+    return layout
+
+
+def inherited_microtile(node, input_contracts):
+    """The microtile a producer already wrote one of this node's inputs in, or None.
+
+    The tiling counterpart of find_tile_split's partition inheritance: adopting the producer's
+    shape is what makes the hand-off direct.
+    """
+    for tensor in node.inputs:
+        tc = input_contracts.get(tensor.name)
+        if tc is None or not tc.port_staging:
+            continue
+        microtile = microtile_from_staging(tc.port_staging[0])
+        if microtile is not None:
+            return microtile
+    return None
 
 
 def find_tile_split(
@@ -121,8 +149,13 @@ def build_io_views(
     tile_outer: int,
     tile_inner_raw: int,
     tile_outer_raw: int,
+    microtile=None,
 ) -> dict:
-    """Build io_views for all tensors sharing the same partition geometry."""
+    """Build io_views for all tensors sharing the same partition geometry.
+
+    `microtile` blocks every view it builds. Pass it when the op reads and writes the same
+    tiling; a kernel that differs per tensor builds those views itself.
+    """
     from .tensor_view import build_tensor_view
 
     views = {}
@@ -137,6 +170,7 @@ def build_io_views(
             full_outer=full_outer,
             tile_outer=tile_outer,
             tile_outer_raw=tile_outer_raw,
+            microtile=microtile,
         )
     for tensor in tensors_out:
         views[tensor.name] = build_tensor_view(
@@ -149,5 +183,6 @@ def build_io_views(
             full_outer=full_outer,
             tile_outer=tile_outer,
             tile_outer_raw=tile_outer_raw,
+            microtile=microtile,
         )
     return views

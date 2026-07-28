@@ -6,13 +6,14 @@ from .common import (
     pack_layernorm_param,
 )
 from .config import LayerNormConfig
-from .layer_norm import LayerNormI8OpImplVariant
+from .layer_norm import LayerNormLinearOpImplVariant, LayerNormTiledOpImplVariant
 
 __all__ = [
     'BETA_FRAC_BITS',
     'GAMMA_FRAC_BITS',
     'LayerNormConfig',
-    'LayerNormI8OpImplVariant',
+    'LayerNormTiledOpImplVariant',
+    'LayerNormLinearOpImplVariant',
     'layernorm_vec_size',
     'pack_layernorm_param',
 ]

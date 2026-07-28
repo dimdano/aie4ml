@@ -10,8 +10,9 @@ struct {{L.struct_name}} {
   static constexpr int GAMMA_SHIFT = {{P.gamma_shift}};
   static constexpr int OUT_SHIFT   = {{P.out_shift}};
   static constexpr int EPS_Q0      = {{P.eps_q0}};
-  static constexpr int ISQRT_NR_ITERS  = {{P.isqrt_nr_iters}};
-  static constexpr bool USE_AIE_INVSQRT = {{ 'true' if P.use_aie_invsqrt else 'false' }};
+  static constexpr bool LAYOUT_TILED = {{ 'true' if P.layout == 'tiled' else 'false' }};
+  static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
+  static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
   static constexpr const char* SATURATION_TOKEN = "saturate";
 #if __cplusplus >= 202002L

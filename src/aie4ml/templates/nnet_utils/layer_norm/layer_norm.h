@@ -16,12 +16,7 @@ public:
         aie::set_saturation(ConfigT::SATURATION);
 #endif
     }
-};
 
-// layernorm_i8 — fully-integer LayerNorm, int8 → int8.
-template <typename ConfigT>
-class layernorm_i8 : public layernorm_base<ConfigT> {
-public:
     using in_t  = typename ConfigT::input_t;
     using out_t = typename ConfigT::output_t;
 
@@ -39,7 +34,53 @@ public:
         return c;
     }();
 
-    layernorm_i8();
+protected:
+    template <unsigned N>
+    static void row_statistics(const int32_t (&sum_x)[N],
+                               const int32_t (&sum_sq)[N],
+                               int16_t (&mu16)[N],
+                               int16_t (&inv_std16)[N]);
+};
+
+
+// layernorm_i8 -- fully-integer LayerNorm over row-contiguous data, int8 -> int8.
+//
+// Rows are processed a batch at a time in three phases: reductions, the statistics above,
+// then the normalise. Each phase's iterations are independent, so they pipeline; doing one
+// row end to end instead leaves the scalar statistics stranded between two vector blocks
+// with nothing to overlap them.
+template <typename ConfigT>
+class layernorm_i8 : public layernorm_base<ConfigT> {
+public:
+    using base  = layernorm_base<ConfigT>;
+    using in_t  = typename ConfigT::input_t;
+    using out_t = typename ConfigT::output_t;
+
+    static constexpr int ROWS        = base::ROWS;
+    static constexpr int COLS        = base::COLS;
+    static constexpr int VEC         = base::VEC;
+    static constexpr int VECS        = base::VECS;
+    static constexpr int GAMMA_SHIFT = base::GAMMA_SHIFT;
+    static constexpr int OUT_SHIFT   = base::OUT_SHIFT;
+    static constexpr int NORM_SHIFT  = base::NORM_SHIFT;
+    static constexpr int LOG2_COLS   = base::LOG2_COLS;
+
+    // Rows whose reductions are in flight together. Larger batches pipeline better, so take
+    // the biggest power of two up to 8 that divides the tile -- a tile of 6 rows batches 2 at
+    // a time, one of 9 batches singly. Capped at 8 so the batch never scales with the tile:
+    // it sizes the vectors below, and a lane count must stay a legal vector width.
+    static constexpr int ROWS_PER_BATCH =
+        (ROWS % 8 == 0) ? 8 : ((ROWS % 4 == 0) ? 4 : ((ROWS % 2 == 0) ? 2 : 1));
+
+    // Lanes the statistics vector carries. Independent of the batch: 4 x 32b = 128b is the
+    // narrowest legal vector, so a batch of 1 or 2 rows still computes on 4 lanes and leaves
+    // the surplus ones idle. Their variance reads as zero, which the epsilon floor makes safe
+    // to take an inverse square root of, and their results are simply never stored.
+    static constexpr int STAT_LANES = (ROWS_PER_BATCH < 4) ? 4 : ROWS_PER_BATCH;
+
+    static_assert(ROWS % ROWS_PER_BATCH == 0, "ROWS per tile must be a whole number of batches");
+
+    layernorm_i8() : base() {}
 
     void run(input_buffer<in_t>&           in,
              const int16_t (&gamma)[COLS],
@@ -49,37 +90,63 @@ public:
     static void registerKernelClass() {
         REGISTER_FUNCTION(layernorm_i8::run);
     }
+};
 
-private:
-    alignas(aie::vector_decl_align)
-    static constexpr uint16_t invsqrt_seed_even_lut[64] = {
-        32641, 32391, 32146, 31907, 31673, 31445, 31221, 31002,
-        30787, 30577, 30371, 30169, 29972, 29778, 29587, 29401,
-        29217, 29038, 28861, 28688, 28518, 28350, 28186, 28024,
-        27866, 27709, 27556, 27405, 27256, 27110, 26966, 26825,
-        26686, 26548, 26413, 26280, 26149, 26020, 25893, 25767,
-        25644, 25522, 25402, 25283, 25167, 25051, 24938, 24826,
-        24715, 24606, 24498, 24392, 24287, 24184, 24081, 23980,
-        23881, 23782, 23685, 23589, 23494, 23400, 23307, 23216
-    };
 
-    alignas(aie::vector_decl_align)
-    static constexpr uint16_t invsqrt_seed_odd_lut[64] = {
-        23080, 22904, 22731, 22562, 22396, 22235, 22077, 21922,
-        21770, 21621, 21476, 21333, 21193, 21056, 20921, 20789,
-        20660, 20533, 20408, 20285, 20165, 20047, 19930, 19816,
-        19704, 19594, 19485, 19378, 19273, 19170, 19068, 18968,
-        18870, 18773, 18677, 18583, 18490, 18399, 18309, 18220,
-        18133, 18047, 17962, 17878, 17795, 17714, 17634, 17554,
-        17476, 17399, 17323, 17248, 17174, 17100, 17028, 16957,
-        16886, 16817, 16748, 16680, 16613, 16546, 16481, 16416
-    };
+// layernorm_i8_tiled -- the same normalisation over microtiles.
+//
+// A block holds one lane group per row, so accumulating across the feature axis keeps the rows
+// separate and the totals need only a segmented reduce -- log2(inner) rounds once per row
+// band, against a full cross-lane reduce per row in the linear kernel.
+//
+// The per-row statistics are widened to lane groups with a concat of broadcasts, once per row
+// band. gamma/beta do not vary along rows at all, so they are widened once in ROM by the packer
+// and the innermost loop just loads a block.
+template <typename ConfigT>
+class layernorm_i8_tiled : public layernorm_base<ConfigT> {
+public:
+    using base  = layernorm_base<ConfigT>;
+    using in_t  = typename ConfigT::input_t;
+    using out_t = typename ConfigT::output_t;
 
-    static inline __attribute__((always_inline)) int32_t isqrt_q15(int32_t var);
+    static constexpr int MT_OUTER = ConfigT::MICROTILE_OUTER;   // rows per microtile
+    static constexpr int MT_INNER = ConfigT::MICROTILE_INNER;   // features per microtile
+    static constexpr int BLK      = MT_OUTER * MT_INNER;        // elements in one microtile
 
-    inline __attribute__((always_inline))
-    void layernorm_row(const in_t*    __restrict in_ptr,
-                             out_t*   __restrict out_ptr,
-                       const int16_t* __restrict gamma_ptr,
-                       const int16_t* __restrict beta_ptr);
+    static constexpr int ROWS        = base::ROWS;
+    static constexpr int COLS        = base::COLS;
+    static constexpr int GAMMA_SHIFT = base::GAMMA_SHIFT;
+    static constexpr int OUT_SHIFT   = base::OUT_SHIFT;
+    static constexpr int NORM_SHIFT  = base::NORM_SHIFT;
+    static constexpr int LOG2_COLS   = base::LOG2_COLS;
+
+    static constexpr int NB = COLS / MT_INNER;                  // microtiles across the features
+
+    // Lanes the statistics vector carries. The surplus lanes read zero variance, which the epsilon
+    // floor makes safe to invert, and their results are never stored.
+    static constexpr int STAT_LANES = (MT_OUTER < 4) ? 4 : MT_OUTER;
+
+    static_assert(ROWS % MT_OUTER == 0, "ROWS must be a whole number of microtile row bands");
+    static_assert(COLS % MT_INNER == 0, "COLS must be a whole number of microtiles");
+    static_assert(BLK * sizeof(in_t) >= 16, "a microtile must fill at least the 128b minimum vector");
+
+    static_assert(MT_INNER >= 8, "tiled LayerNorm needs MT_INNER >= 8 (int16 lane group must reach 128b)");
+    static_assert(MT_OUTER >= 2, "tiled LayerNorm needs at least 2 rows per microtile");
+    static_assert(MT_OUTER <= 8, "tiled LayerNorm supports at most 8 rows per microtile");
+    static_assert(BLK <= 64, "tiled LayerNorm needs BLK <= 64 (widened int16 vector must fit 1024b)");
+    static_assert((MT_INNER & (MT_INNER - 1)) == 0, "MT_INNER must be a power of two (segmented reduce halves it)");
+
+    layernorm_i8_tiled() : base() {}
+
+    // gamma/beta arrive pre-widened: NB blocks of BLK, each the microtile's feature slice
+    // repeated once per row. The packer builds this (pack_layernorm_param microtile=), so the
+    // innermost loop is a single block load with no broadcast or concat.
+    void run(input_buffer<in_t>&           in,
+             const int16_t (&gamma)[COLS * MT_OUTER],
+             const int16_t (&beta)[COLS * MT_OUTER],
+             output_buffer<out_t>&         out);
+
+    static void registerKernelClass() {
+        REGISTER_FUNCTION(layernorm_i8_tiled::run);
+    }
 };

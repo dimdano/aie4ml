@@ -7,8 +7,6 @@ from ...utils.precision import storage_bytes_for_spec
 __all__ = [
     'GAMMA_FRAC_BITS',
     'BETA_FRAC_BITS',
-    'DEFAULT_ISQRT_NR_ITERS',
-    'DEFAULT_USE_AIE_INVSQRT',
     'layernorm_vec_size',
     'pack_layernorm_param',
 ]
@@ -20,8 +18,6 @@ __all__ = [
 # is stored at frac=NORM_SHIFT (Q15).
 GAMMA_FRAC_BITS = 7
 BETA_FRAC_BITS = 15
-DEFAULT_ISQRT_NR_ITERS = 1
-DEFAULT_USE_AIE_INVSQRT = False
 
 
 def layernorm_vec_size(precision, device) -> int:
@@ -47,8 +43,15 @@ def pack_layernorm_param(
     width: int = 16,
     signed: bool = True,
     dtype=np.int16,
+    microtile=None,
 ) -> np.ndarray:
-    """Quantize a 1-D float param (gamma or beta) and replicate across cas_num kernels."""
+    """Quantize a 1-D float param (gamma or beta) and replicate across cas_num kernels.
+
+    With `microtile`, the result is pre-widened to the layout the tiled kernel consumes: each
+    microtile's `inner` slice repeated `outer` times, so the kernel loads one whole block
+    instead of loading a narrow slice and broadcasting it across lane groups every iteration.
+    Costs outer x the ROM; saves the widening from the innermost loop.
+    """
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     if int(arr.shape[0]) != int(full_inner):
         raise ValueError(
@@ -79,4 +82,12 @@ def pack_layernorm_param(
     packed = scaled.astype(dtype, copy=False)
 
     length = int(arr.shape[0])
+    if microtile is not None:
+        inner, outer = int(microtile.inner), int(microtile.outer)
+        if length % inner:
+            raise ValueError(
+                f'LayerNorm parameter {name!r} length {length} is not a multiple of microtile inner {inner}.'
+            )
+        packed = np.tile(packed.reshape(-1, 1, inner), (1, outer, 1)).reshape(-1)
+        length = int(packed.shape[0])
     return np.broadcast_to(packed.reshape(1, length), (int(cas_num), length)).copy()

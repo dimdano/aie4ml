@@ -5,149 +5,218 @@
 
 using namespace adf;
 
-template <typename ConfigT>
-layernorm_i8<ConfigT>::layernorm_i8()
-    : layernorm_base<ConfigT>()
-{}
 
+// Mean, variance and the Q15 reciprocal standard deviation for a batch of rows.
+//
+// AIE-ML/AIE-MLv2 has no scalar FPU: touching a float one element at a time pulls in the software
+// float32 routines, which cost far more than they save and overflow the kernel's stack.
+// Every float step here stays in the vector unit.
 template <typename ConfigT>
-inline __attribute__((always_inline))
-int32_t layernorm_i8<ConfigT>::isqrt_q15(int32_t var)
+template <unsigned N>
+void layernorm_base<ConfigT>::row_statistics(const int32_t (&sum_x)[N],
+                                             const int32_t (&sum_sq)[N],
+                                             int16_t (&mu16)[N],
+                                             int16_t (&inv_std16)[N])
 {
-    if (var <= 0) return (1 << NORM_SHIFT);
+    aie::vector<int32, N> var_i;
+    for (unsigned r = 0; r < N; ++r) {
+        const int32_t mu = (sum_x[r] + (1 << (LOG2_COLS - 1))) >> LOG2_COLS;
+        // sum((x-mu)^2) = sum_sq - 2*mu*sum_x + N*mu^2. The naive sum_sq/N - mu^2 loses
+        // precision catastrophically for shifted inputs.
+        const int32_t centered_sq = sum_sq[r] - 2 * mu * sum_x[r] + COLS * mu * mu;
+        int32_t var = centered_sq >> LOG2_COLS;
+        if (var < 0) var = 0;
+        mu16[r]  = (int16_t)mu;
+        var_i[r] = var + (int32_t)ConfigT::EPS_Q0;
+    }
 
-    if constexpr (ConfigT::USE_AIE_INVSQRT) {
-        const float inv_f = aie::invsqrt((float)var);
-        int32_t q15 = (int32_t)(inv_f * (float)(1 << NORM_SHIFT) + 0.5f);
-        if (q15 > (1 << NORM_SHIFT)) q15 = (1 << NORM_SHIFT);
-        if (q15 < 0) q15 = 0;
-        return q15;
-    } else {
-        const int lz = clb(var);
-        const int k  = 31 - lz;
-        const int m  = k >> 1;
+    const aie::vector<float, N> inv_f = aie::invsqrt(aie::to_float(var_i, 0));
+    const aie::vector<int32, N> inv_q = aie::to_fixed<int32>(inv_f, NORM_SHIFT);
 
-        uint32_t mant_q16;
-        if (k >= 16) {
-            mant_q16 = ((uint32_t)var) >> (k - 16);
-        } else {
-            mant_q16 = ((uint32_t)var) << (16 - k);
-        }
-
-        int idx = (int)((mant_q16 - (1u << 16)) >> 10);
-        if (idx > 63) idx = 63;
-
-        const uint16_t seed_u16 = (k & 1)
-            ? invsqrt_seed_odd_lut[idx]
-            : invsqrt_seed_even_lut[idx];
-
-        int32_t x = ((int32_t)seed_u16) >> m;
-
-        if constexpr (ConfigT::ISQRT_NR_ITERS >= 1) {
-            const int32_t x2_q15 = (int32_t)(((int64_t)x * (int64_t)x) >> NORM_SHIFT);
-            const int32_t t    = var * x2_q15;
-            const int32_t corr = (3 * (1 << NORM_SHIFT)) - t;
-            x = (int32_t)(((int64_t)x * (int64_t)corr) >> 16);
-        }
-
-        if constexpr (ConfigT::ISQRT_NR_ITERS >= 2) {
-            const int32_t x2_q15 = (int32_t)(((int64_t)x * (int64_t)x) >> NORM_SHIFT);
-            const int32_t t    = var * x2_q15;
-            const int32_t corr = (3 * (1 << NORM_SHIFT)) - t;
-            x = (int32_t)(((int64_t)x * (int64_t)corr) >> 16);
-        }
-
-        return x;
+    for (unsigned r = 0; r < N; ++r) {
+        const int32_t v = inv_q.get(r);
+        inv_std16[r] = (int16_t)(v > 32767 ? 32767 : (v < 0 ? 0 : v));
     }
 }
 
-template <typename ConfigT>
-inline __attribute__((always_inline))
-void layernorm_i8<ConfigT>::layernorm_row(
-    const in_t*    __restrict in_ptr,
-          out_t*   __restrict out_ptr,
-    const int16_t* __restrict gamma_ptr,
-    const int16_t* __restrict beta_ptr)
-{
-    auto vin_it = aie::cbegin_vector<VEC>(in_ptr);
 
-    const aie::vector<int8, VEC> ones8 = aie::broadcast<int8, VEC>(1);
-    aie::accum<acc32, VEC> acc_sum = aie::zeros<acc32, VEC>();
-    aie::accum<acc32, VEC> acc_sq  = aie::zeros<acc32, VEC>();
-
-    for (int i = 0; i < VECS; ++i)
-        chess_prepare_for_pipelining
-        chess_loop_range(VECS, VECS)
-    {
-        const aie::vector<int8, VEC> vx = *vin_it++;
-        acc_sum = aie::mac(acc_sum, vx, ones8);
-        acc_sq  = aie::mac_square(acc_sq,  vx);
-    }
-
-    const int32_t sum_x  = aie::reduce_add(acc_sum.template to_vector<int32>(0));
-    const int32_t sum_sq = aie::reduce_add(acc_sq .template to_vector<int32>(0));
-
-    const int32_t mu = (sum_x + (1 << (LOG2_COLS - 1))) >> LOG2_COLS;
-
-    // Numerically stable: sum((x-mu)^2) = sum_sq - 2*mu*sum_x + N*mu^2, then /N.
-    // The naive formula (sum_sq/N - mu^2) has catastrophic cancellation for shifted
-    // inputs: both floor-divisions accumulate independently, giving up to 2*|mu|
-    // units of variance error.
-    //
-    // Fits in int32: resolver enforces COLS*1B <= bank_bytes
-    // (16 KiB), so |sum_sq|, |2*mu*sum_x|, |COLS*mu*mu| each stay under ~512M.
-    // Worst-case partial sum < 1B, well below int32 max (2.1B).
-    const int32_t centered_sq = sum_sq - 2 * mu * sum_x + COLS * mu * mu;
-    int32_t var = centered_sq >> LOG2_COLS;
-    if (var < 0) var = 0;
-
-    const int32_t inv_std   = isqrt_q15(var + (int32_t)ConfigT::EPS_Q0);
-    const int16_t inv_std16 = (int16_t)std::min((int32_t)32767, inv_std);
-    const aie::vector<int16, VEC> inv_std_vec = aie::broadcast<int16, VEC>(inv_std16);
-    const aie::vector<int16, VEC> mu_vec      = aie::broadcast<int16, VEC>((int16_t)mu);
-
-    auto vgamma_it = aie::cbegin_vector<VEC>(gamma_ptr);
-    auto vbeta_it  = aie::cbegin_vector<VEC>(beta_ptr);
-    vin_it = aie::cbegin_vector<VEC>(in_ptr);
-    auto vout_it = aie::begin_vector<VEC>(out_ptr);
-
-    for (int i = 0; i < VECS; ++i)
-        chess_prepare_for_pipelining
-        chess_loop_range(VECS, VECS)
-    {
-        const aie::vector<int8,  VEC> vx      = *vin_it++;
-        const aie::vector<int16, VEC> gamma_v = *vgamma_it++;
-        const aie::vector<int16, VEC> beta_v  = *vbeta_it++;
-
-        const aie::vector<int16, VEC> vd16 =
-            aie::sub(aie::from_vector<acc32>(vx), mu_vec)
-                .template to_vector<int16>(0);
-
-        const aie::accum<acc32, VEC> acc_fs  = aie::mul(inv_std_vec, gamma_v);
-        const aie::vector<int16, VEC> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
-
-        aie::accum<acc32, VEC> acc_out = aie::mul(vd16, fscale);
-        acc_out = aie::add(acc_out, beta_v);
-
-        *vout_it++ = acc_out.template to_vector<out_t>(NORM_SHIFT - OUT_SHIFT);
-    }
-}
 
 template <typename ConfigT>
 void layernorm_i8<ConfigT>::run(input_buffer<in_t>&    in,
-                                 const int16_t (&gamma)[COLS],
-                                 const int16_t (&beta)[COLS],
-                                 output_buffer<out_t>&  out)
+                                const int16_t (&gamma)[COLS],
+                                const int16_t (&beta)[COLS],
+                                output_buffer<out_t>&  out)
 {
-    const in_t*    __restrict in_ptr    = in.data();
-          out_t*   __restrict out_ptr   = out.data();
-    const int16_t* __restrict gamma_ptr = gamma;
-    const int16_t* __restrict beta_ptr  = beta;
+    const in_t*  __restrict in_ptr  = in.data();
+          out_t* __restrict out_ptr = out.data();
 
-    for (int row = 0; row < ROWS; ++row) {
-        layernorm_row(in_ptr  + row * COLS,
-                      out_ptr + row * COLS,
-                      gamma_ptr,
-                      beta_ptr);
+    // gamma and beta do not vary with the row, so they are loaded once rather than per row.
+    aie::vector<int16, VEC> gamma_v[VECS];
+    aie::vector<int16, VEC> beta_v[VECS];
+    {
+        auto vgamma_it = aie::cbegin_vector<VEC>((const int16_t*)gamma);
+        auto vbeta_it  = aie::cbegin_vector<VEC>((const int16_t*)beta);
+        for (int v = 0; v < VECS; ++v) {
+            gamma_v[v] = *vgamma_it++;
+            beta_v[v]  = *vbeta_it++;
+        }
+    }
+
+    const aie::vector<int8, VEC> ones8 = aie::broadcast<int8, VEC>(1);
+
+    for (int base_row = 0; base_row < ROWS; base_row += ROWS_PER_BATCH) {
+
+        // Sized to the vector width, not the batch: any lane past the batch stays zero and its
+        // statistics are computed but never stored.
+        int32_t sum_x[STAT_LANES]  = {};
+        int32_t sum_sq[STAT_LANES] = {};
+
+        for (int r = 0; r < ROWS_PER_BATCH; ++r)
+            chess_prepare_for_pipelining
+            chess_loop_range(ROWS_PER_BATCH, ROWS_PER_BATCH)
+        {
+            auto vin_it = aie::cbegin_vector<VEC>(in_ptr + (base_row + r) * COLS);
+            aie::accum<acc32, VEC> acc_sum = aie::zeros<acc32, VEC>();
+            aie::accum<acc32, VEC> acc_sq  = aie::zeros<acc32, VEC>();
+            for (int v = 0; v < VECS; ++v) {
+                const aie::vector<int8, VEC> vx = *vin_it++;
+                acc_sum = aie::mac(acc_sum, vx, ones8);
+                acc_sq  = aie::mac_square(acc_sq, vx);
+            }
+            // A row spans the whole vector here, so the lanes collapse all the way down.
+            sum_x[r]  = aie::reduce_add(acc_sum.template to_vector<int32>(0));
+            sum_sq[r] = aie::reduce_add(acc_sq.template to_vector<int32>(0));
+        }
+
+        int16_t mu16[STAT_LANES];
+        int16_t inv_std16[STAT_LANES];
+        base::template row_statistics<STAT_LANES>(sum_x, sum_sq, mu16, inv_std16);
+
+        for (int r = 0; r < ROWS_PER_BATCH; ++r)
+            chess_prepare_for_pipelining
+            chess_loop_range(ROWS_PER_BATCH, ROWS_PER_BATCH)
+        {
+            const aie::vector<int16, VEC> inv_std_vec = aie::broadcast<int16, VEC>(inv_std16[r]);
+            const aie::vector<int16, VEC> mu_vec      = aie::broadcast<int16, VEC>(mu16[r]);
+
+            auto vin_it  = aie::cbegin_vector<VEC>(in_ptr + (base_row + r) * COLS);
+            auto vout_it = aie::begin_vector<VEC>(out_ptr + (base_row + r) * COLS);
+
+            for (int v = 0; v < VECS; ++v) {
+                const aie::vector<int8, VEC> vx = *vin_it++;
+
+                const aie::vector<int16, VEC> vd16 =
+                    aie::sub(aie::from_vector<acc32>(vx), mu_vec).template to_vector<int16>(0);
+
+                const aie::accum<acc32, VEC> acc_fs = aie::mul(inv_std_vec, gamma_v[v]);
+                const aie::vector<int16, VEC> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
+
+                aie::accum<acc32, VEC> acc_out = aie::mul(vd16, fscale);
+                acc_out = aie::add(acc_out, beta_v[v]);
+
+                *vout_it++ = acc_out.template to_vector<out_t>(NORM_SHIFT - OUT_SHIFT);
+            }
+        }
+    }
+}
+
+
+// Fill a BLK-lane vector where lane group m is broadcast(s[m]): the per-row statistics spread
+// to their lane groups. Concat of broadcasts, one shot instead of MT_OUTER inserts.
+template <unsigned R, unsigned W>
+static inline aie::vector<int16, R * W> spread_rows(const int16_t* s)
+{
+    if constexpr (R == 1)
+        return aie::broadcast<int16, W>(s[0]);
+    else if constexpr (R == 2)
+        return aie::concat(aie::broadcast<int16, W>(s[0]), aie::broadcast<int16, W>(s[1]));
+    else if constexpr (R == 4)
+        return aie::concat(aie::broadcast<int16, W>(s[0]), aie::broadcast<int16, W>(s[1]),
+                           aie::broadcast<int16, W>(s[2]), aie::broadcast<int16, W>(s[3]));
+    else
+        return aie::concat(aie::concat(aie::broadcast<int16, W>(s[0]), aie::broadcast<int16, W>(s[1]),
+                                       aie::broadcast<int16, W>(s[2]), aie::broadcast<int16, W>(s[3])),
+                           aie::concat(aie::broadcast<int16, W>(s[4]), aie::broadcast<int16, W>(s[5]),
+                                       aie::broadcast<int16, W>(s[6]), aie::broadcast<int16, W>(s[7])));
+}
+
+
+template <typename ConfigT>
+void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
+                                        const int16_t (&gamma)[COLS * MT_OUTER],
+                                        const int16_t (&beta)[COLS * MT_OUTER],
+                                        output_buffer<out_t>&  out)
+{
+    const in_t*  __restrict in_ptr  = in.data();
+          out_t* __restrict out_ptr = out.data();
+
+    const aie::vector<int8, BLK> ones8 = aie::broadcast<int8, BLK>(1);
+
+    for (int bm = 0; bm < ROWS / MT_OUTER; ++bm) {
+
+        const in_t*  __restrict band = in_ptr  + bm * NB * BLK;
+              out_t* __restrict dst  = out_ptr + bm * NB * BLK;
+
+        // Lane group m of every microtile belongs to row m, so accumulating along the
+        // feature axis keeps the rows' partial sums separate with no shuffling.
+        aie::accum<acc32, BLK> acc_sum = aie::zeros<acc32, BLK>();
+        aie::accum<acc32, BLK> acc_sq  = aie::zeros<acc32, BLK>();
+
+        for (int bn = 0; bn < NB; ++bn)
+            chess_prepare_for_pipelining
+            chess_loop_range(NB, NB)
+        {
+            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            acc_sum = aie::mac(acc_sum, vx, ones8);
+            acc_sq  = aie::mac_square(acc_sq, vx);
+        }
+
+        // Segmented reduce: halving rounds collapse each MT_INNER lane group and leave row
+        // m's total in lane m * MT_INNER. A full reduce would sum the rows together.
+        aie::vector<int32, BLK> s = acc_sum.template to_vector<int32>(0);
+        aie::vector<int32, BLK> q = acc_sq.template to_vector<int32>(0);
+        for (unsigned step = MT_INNER / 2; step >= 1; step >>= 1) {
+            s = aie::add(s, aie::shuffle_down(s, step));
+            q = aie::add(q, aie::shuffle_down(q, step));
+        }
+
+        // Padded to the vector width: lanes past MT_OUTER stay zero and are never stored.
+        int32_t sum_x[STAT_LANES]  = {};
+        int32_t sum_sq[STAT_LANES] = {};
+        for (int m = 0; m < MT_OUTER; ++m) {
+            sum_x[m]  = s.get(m * MT_INNER);
+            sum_sq[m] = q.get(m * MT_INNER);
+        }
+
+        int16_t mu16[STAT_LANES];
+        int16_t inv_std16[STAT_LANES];
+        base::template row_statistics<STAT_LANES>(sum_x, sum_sq, mu16, inv_std16);
+
+        // Widen the per-row statistics to the microtile's lane groups.
+        const aie::vector<int16, BLK> mu_v = spread_rows<MT_OUTER, MT_INNER>(mu16);
+        const aie::vector<int16, BLK> is_v = spread_rows<MT_OUTER, MT_INNER>(inv_std16);
+
+        for (int bn = 0; bn < NB; ++bn)
+            chess_prepare_for_pipelining
+            chess_loop_range(NB, NB)
+        {
+            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+
+            // Already widened in ROM: one block load, no broadcast or concat in the loop.
+            const aie::vector<int16, BLK> gamma_blk = *aie::cbegin_vector<BLK>((const int16_t*)gamma + bn * BLK);
+            const aie::vector<int16, BLK> beta_blk  = *aie::cbegin_vector<BLK>((const int16_t*)beta + bn * BLK);
+
+            const aie::vector<int16, BLK> vd16 =
+                aie::sub(aie::from_vector<acc32>(vx), mu_v).template to_vector<int16>(0);
+
+            const aie::accum<acc32, BLK> acc_fs = aie::mul(is_v, gamma_blk);
+            const aie::vector<int16, BLK> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
+
+            aie::accum<acc32, BLK> acc_out = aie::mul(vd16, fscale);
+            acc_out = aie::add(acc_out, beta_blk);
+
+            auto vout_it = aie::begin_vector<BLK>(dst + bn * BLK);
+            *vout_it = acc_out.template to_vector<out_t>(NORM_SHIFT - OUT_SHIFT);
+        }
     }
 }

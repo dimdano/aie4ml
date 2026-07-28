@@ -81,10 +81,10 @@ def requested_contract(node) -> str:
     return contract
 
 
-def describe_inner_lhs_staging(view: TensorView, microtiling, port: int, buf_dims=None):
+def describe_inner_lhs_staging(view: TensorView, port: int, buf_dims=None):
     """LHS staging for the 'inner' contract: the port selects a K-chain; the rows stay whole."""
-    microtile_m = int(microtiling.microtile_m)
-    microtile_k = int(microtiling.microtile_k)
+    microtile_m = int(view.microtile.outer)
+    microtile_k = int(view.microtile.inner)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -102,10 +102,10 @@ def describe_inner_lhs_staging(view: TensorView, microtiling, port: int, buf_dim
     )
 
 
-def describe_inner_output_staging(view: TensorView, microtiling, port: int, buf_dims=None):
+def describe_inner_output_staging(view: TensorView, port: int, buf_dims=None):
     """Output staging for the 'inner' contract: the port selects an N-slice; the rows stay whole."""
-    microtile_m = int(microtiling.microtile_m)
-    microtile_n = int(microtiling.microtile_n)
+    microtile_m = int(view.microtile.outer)
+    microtile_n = int(view.microtile.inner)
     out_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -122,10 +122,10 @@ def describe_inner_output_staging(view: TensorView, microtiling, port: int, buf_
     )
 
 
-def describe_outer_lhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
+def describe_outer_lhs_staging(view: TensorView, parallelism, port: int, buf_dims=None):
     """LHS staging for the 'outer' contract: the port selects a (row-group, K-chain) tile."""
-    microtile_m = int(microtiling.microtile_m)
-    microtile_k = int(microtiling.microtile_k)
+    microtile_m = int(view.microtile.outer)
+    microtile_k = int(view.microtile.inner)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -149,10 +149,10 @@ def describe_outer_lhs_staging(view: TensorView, microtiling, parallelism, port:
     )
 
 
-def describe_outer_output_staging(view: TensorView, microtiling, port: int, buf_dims=None):
+def describe_outer_output_staging(view: TensorView, port: int, buf_dims=None):
     """Output staging for the 'outer' contract: the port selects a row-group; N stays whole."""
-    microtile_m = int(microtiling.microtile_m)
-    microtile_n = int(microtiling.microtile_n)
+    microtile_m = int(view.microtile.outer)
+    microtile_n = int(view.microtile.inner)
     out_slice = view.tile_inner
     outer_slice = view.tile_outer
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -170,10 +170,10 @@ def describe_outer_output_staging(view: TensorView, microtiling, port: int, buf_
     )
 
 
-def describe_outer_rhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
+def describe_outer_rhs_staging(view: TensorView, parallelism, port: int, buf_dims=None):
     """RHS staging for the 'outer' contract: the port selects a K-chain; every row group shares it."""
-    microtile_k = int(microtiling.microtile_k)
-    microtile_n = int(microtiling.microtile_n)
+    microtile_k = int(view.microtile.outer)
+    microtile_n = int(view.microtile.inner)
     k_slice = view.tile_outer
     n_slice = view.tile_inner
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -199,10 +199,10 @@ def describe_outer_rhs_staging(view: TensorView, microtiling, parallelism, port:
     )
 
 
-def describe_inner_rhs_staging(view: TensorView, microtiling, parallelism, port: int, buf_dims=None):
+def describe_inner_rhs_staging(view: TensorView, parallelism, port: int, buf_dims=None):
     """RHS staging for the 'inner' contract: the port selects an (N-slice, K-chain) tile."""
-    microtile_k = int(microtiling.microtile_k)
-    microtile_n = int(microtiling.microtile_n)
+    microtile_k = int(view.microtile.outer)
+    microtile_n = int(view.microtile.inner)
     # The rhs view encodes both K and N slices: outer dim = K, inner dim = N.
     k_slice = view.tile_outer
     n_slice = view.tile_inner

@@ -266,15 +266,25 @@ ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'plio', 'auto'})
 """Compiler-wide vocabulary of valid IO route modes."""
 
 
+TENSOR_LAYOUTS: frozenset = frozenset({'linear', 'tiled'})
+"""Valid `layout:` directive names. Only a variant selector -- the layout itself is the
+staging descriptor, not a name."""
+
+
 @dataclass(frozen=True)
 class TensorContract:
     """Resolved execution contract for a single tensor edge.
 
-    Used by downstream resolvers to inherit compatible partitioning and staging.
+    `port_staging` is the layout: the DMA access pattern the producer wrote, and the sole
+    thing legality compares to decide direct-vs-memtile. A layout *name* could never be that
+    gate -- two 'tiled' descriptors still differ on microtile, tile height or transpose.
+
+    `contract` is the one scalar a consumer inherits directly -- the partition axis is not
+    recoverable from a single descriptor. Everything else it reads out of `port_staging`.
     """
 
-    contract: str  # 'outer' | 'inner'
-    port_staging: Tuple[Dict[str, Any], ...]
+    contract: str  # one of STAGING_CONTRACTS: which axis cas_num partitions
+    port_staging: Tuple[Dict[str, Any], ...] = ()
 
 
 @dataclass

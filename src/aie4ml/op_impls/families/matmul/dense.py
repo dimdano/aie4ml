@@ -243,10 +243,10 @@ class DenseOpImplVariant(_DenseVariantBase):
         return int(config.parallelism.cas_length)
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_inner_lhs_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+        return describe_inner_lhs_staging(config.io_views[tensor_name], port, buf_dims)
 
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_inner_output_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+        return describe_inner_output_staging(config.io_views[tensor_name], port, buf_dims)
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         # 'inner': cas_num slices the columns, so chain c owns weight/bias columns
@@ -298,12 +298,10 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
         return int(config.parallelism.cas_length) * int(config.parallelism.cas_num)
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_outer_lhs_staging(
-            config.io_views[tensor_name], config.microtiling, config.parallelism, port, buf_dims
-        )
+        return describe_outer_lhs_staging(config.io_views[tensor_name], config.parallelism, port, buf_dims)
 
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
-        return describe_outer_output_staging(config.io_views[tensor_name], config.microtiling, port, buf_dims)
+        return describe_outer_output_staging(config.io_views[tensor_name], port, buf_dims)
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         # The packers slice columns as chain*N_slice; here N_slice is the whole N, so pack a

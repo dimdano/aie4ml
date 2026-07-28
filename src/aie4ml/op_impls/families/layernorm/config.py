@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ...utils import ParallelismConfig, TensorView
+from ...utils import MicrotileShape, ParallelismConfig, TensorView
 
 
 @dataclass(frozen=True)
@@ -22,8 +22,10 @@ class LayerNormConfig:
     gamma_shift: int
     out_shift: int
     eps_q0: int
-    isqrt_nr_iters: int
-    use_aie_invsqrt: bool
     rounding_mode: Optional[str]
     io_views: Dict[str, TensorView]
     io_route: Dict[str, Any]
+    #: One of ir.graph.TENSOR_LAYOUTS; picks the kernel via the template's LAYOUT_TILED.
+    layout: str = 'linear'
+    #: Block a 'tiled' layout is stored in, inherited from the producer so the edge stays direct.
+    microtile: Optional[MicrotileShape] = None

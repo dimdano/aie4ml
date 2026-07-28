@@ -29,6 +29,7 @@ class TensorView:
     tile: tuple[int, ...]
     tile_raw: tuple[int, ...]
     perm: tuple[int, ...] | None = None
+    microtile: 'MicrotileShape | None' = None
 
     # Convenience accessors for the generic 2-D execution/hardware model.
     # inner = last axis [-1], outer = [-2] (1 on a rank-1 view).
@@ -253,7 +254,13 @@ def describe_partition_staging(view, port: int, access: str, contract: str, buf_
     """Partition pattern: split one axis across ports, stream the rest. Shared by
     row-wise/reduction ops. `contract` picks the partitioned axis:
     'inner' the kernel axis,'outer' the work axis.
+
+    A view carrying a `microtile` refines the traversal without changing the partition: each
+    axis is walked in microtile-sized chunks rather than one whole slice, which is the order
+    aie::mmul reads and writes. A tensor staged that way hands over to a matmul with no memtile
+    in between, since the transport layer compares descriptors.
     """
+    microtile = view.microtile
     inner_dim, outer_dim, _ = canonical_buffer_axes(view)
     is_inner = contract == 'inner'
     partition_dim = inner_dim if is_inner else outer_dim
@@ -264,21 +271,65 @@ def describe_partition_staging(view, port: int, access: str, contract: str, buf_
     trav_full = view.full_outer if is_inner else view.full_inner
     traverse_wrap = max(1, int(trav_full) // max(1, int(trav_raw))) if is_inner else 1
 
-    order = [partition_dim, traverse_dim] + [d for d in range(view.rank) if d not in (partition_dim, traverse_dim)]
+    lead, second = (inner_dim, outer_dim) if microtile is not None else (partition_dim, traverse_dim)
+    order = [lead, second] + [d for d in range(view.rank) if d not in (lead, second)]
 
     return build_staging_descriptor(
         view,
         access=access,
-        plans={
-            partition_dim: AxisPlan(int(part_raw), int(part_raw), 1, int(port) * int(part_raw)),
-            traverse_dim: AxisPlan(int(trav_raw), int(trav_raw), int(traverse_wrap)),
-        },
+        plans=(
+            {
+                partition_dim: AxisPlan(int(part_raw), int(part_raw), 1, int(port) * int(part_raw)),
+                traverse_dim: AxisPlan(int(trav_raw), int(trav_raw), int(traverse_wrap)),
+            }
+            if microtile is None
+            else {
+                inner_dim: AxisPlan(
+                    int(microtile.inner),
+                    int(microtile.inner),
+                    max(1, int(view.tile_raw_inner) // int(microtile.inner)),
+                ),
+                outer_dim: AxisPlan(
+                    int(microtile.outer),
+                    int(microtile.outer),
+                    max(1, int(part_raw) // int(microtile.outer)),
+                    int(port) * int(part_raw),
+                ),
+            }
+        ),
         order=order,
         io_tiling_base='tile_raw',
         slice_dim=partition_dim,
         buf_dims=buf_dims,
         boundary_shape='logical' if access == 'read' else None,
     )
+
+
+@dataclass(frozen=True)
+class MicrotileShape:
+    """Innermost block a tiled tensor is stored in, in the compiler's axis vocabulary:
+    `outer` along the work axis (matmul's M), `inner` along the feature axis (its N)."""
+
+    outer: int
+    inner: int
+
+
+def microtile_from_staging(desc: Mapping[str, Any]):
+    """Decode the microtile out of a staging descriptor, or None for whole rows.
+
+    Not how an op reads its own layout -- that is `view.microtile`. This is the edge decoder: a
+    TensorView never crosses, so a consumer only sees the producer's published descriptor.
+    Reads axis-neutral fields only, so it knows nothing about which family wrote the data.
+    """
+    tiling = desc.get('tiling_dimension')
+    buffer_dim = desc.get('buffer_dimension')
+    inner = desc.get('inner_dimension')
+    outer = desc.get('outer_dimension')
+    if tiling is None or buffer_dim is None or inner is None or outer is None:
+        return None
+    if int(tiling[int(inner)]) >= int(buffer_dim[int(inner)]):
+        return None  # whole rows, not microtiled
+    return MicrotileShape(outer=int(tiling[int(outer)]), inner=int(tiling[int(inner)]))
 
 
 def build_tensor_view(
@@ -292,6 +343,7 @@ def build_tensor_view(
     full_outer: int,
     tile_outer: int | None = None,
     tile_outer_raw: int | None = None,
+    microtile: 'MicrotileShape | None' = None,
 ) -> TensorView:
     """Build a rank-preserving TensorView from resolved IO layout and per-port extents.
 
@@ -330,6 +382,7 @@ def build_tensor_view(
         tile=tuple(tile),
         tile_raw=tuple(tile_raw),
         perm=None if layout.get('perm') is None else tuple(int(x) for x in layout['perm']),
+        microtile=microtile,
     )
 
 
@@ -351,4 +404,5 @@ def build_tensor_view_from_staging(node, tensor, direction: str, desc: Mapping[s
         tile=tile,
         tile_raw=tile,
         perm=perm,
+        microtile=microtile_from_staging(desc),
     )

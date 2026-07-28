@@ -8,7 +8,7 @@ from ....aie_types import AIEDataType, FloatIntent, legality_format
 from ....ir import input_role, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...registry import get_op_impl_registry
-from ...utils import TensorView, align_up, build_tensor_view, ceildiv
+from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
 from ...utils.precision import (
     element_bytes,
@@ -370,6 +370,10 @@ def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: Mat
     full_inner_out = tiling.tile_inner_rhs if row_wise else tiling.tile_inner_rhs * tiling.cas_num
     outer_granularity = 2 * microtiling.microtile_m
 
+    lhs_microtile = MicrotileShape(outer=int(microtiling.microtile_m), inner=int(microtiling.microtile_k))
+    rhs_microtile = MicrotileShape(outer=int(microtiling.microtile_k), inner=int(microtiling.microtile_n))
+    out_microtile = MicrotileShape(outer=int(microtiling.microtile_m), inner=int(microtiling.microtile_n))
+
     shapes: Dict[str, TensorView] = {}
 
     for tensor in node.inputs:
@@ -388,6 +392,7 @@ def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: Mat
                 full_outer=align_up(last_outer, outer_granularity),
                 tile_outer=tiling.tile_outer if row_wise else None,
                 tile_outer_raw=tiling.tile_outer_raw if row_wise else None,
+                microtile=lhs_microtile,
             )
         elif role == 'rhs' and not tensor.is_parameter:
             shapes[tensor.name] = build_tensor_view(
@@ -400,6 +405,7 @@ def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: Mat
                 full_outer=full_inner_lhs,
                 tile_outer=tiling.tile_inner_lhs,
                 tile_outer_raw=tiling.tile_inner_lhs_raw,
+                microtile=rhs_microtile,
             )
         else:
             shapes[tensor.name] = build_tensor_view(
@@ -425,6 +431,7 @@ def _build_matmul_io_views(node, microtiling: MatmulMicrotileConfig, tiling: Mat
             full_outer=align_up(last_outer, outer_granularity),
             tile_outer=tiling.tile_outer if row_wise else None,
             tile_outer_raw=tiling.tile_outer_raw if row_wise else None,
+            microtile=out_microtile,
         )
 
     return shapes
