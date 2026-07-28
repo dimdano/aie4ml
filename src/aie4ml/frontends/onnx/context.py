@@ -52,8 +52,13 @@ class OnnxImportContext:
         self.value_tensors: Dict[str, TensorVar] = {}
         # QuantizeLinear output name -> (kind, ref, intent, shape) pending a DequantizeLinear.
         self.q_aliases: Dict[str, Tuple[str, Any, QuantIntent, Tuple[int, ...]]] = {}
+        self.precision_mirrors: list[Tuple[str, str]] = []
 
     # -- directives ---------------------------------------------------------
+
+    def mirror_precision(self, target: str, source: str) -> None:
+        """Declare that `target` carries the same quantization intent as `source`."""
+        self.precision_mirrors.append((target, source))
 
     def take_directives(self, node_name: str) -> Dict[str, Any]:
         from .utils import normalize_directives

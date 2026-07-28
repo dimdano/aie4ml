@@ -109,6 +109,7 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
 
     # Gemm with bias: dense -> add(bias); FoldBias re-fuses the add into the dense.
     prebias_name = f'{node_name}_prebias'
+    ctx.mirror_precision(prebias_name, out_name)
     ctx.emit(
         'dense',
         node_name,

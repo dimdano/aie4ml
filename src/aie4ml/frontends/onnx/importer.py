@@ -97,6 +97,12 @@ def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
         if role_names:
             set_input_roles(node, node.inputs, role_names)
 
+    for target, source in ctx.precision_mirrors:
+        tensor = graph.tensors.get(target)
+        origin = graph.tensors.get(source)
+        if tensor is not None and tensor.precision is None and origin is not None:
+            tensor.precision = origin.precision
+
     for tensor in graph.tensors.values():
         if tensor.is_parameter:
             continue
