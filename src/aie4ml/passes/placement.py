@@ -331,8 +331,12 @@ def _boxes_conflict(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) 
 
 
 def _direct_left_bank_reuse(producer: Placed, consumer: Placed, graph: GraphSpec) -> bool:
-    if consumer.rect.h != 1:
-        return False
+    """Whether a face-adjacent pair may share the consumer's left-bank keepout.
+
+    Most ops (like dense/matmul) use banks 0/3 of the tile to its left, which is why every such op 
+    reserves a keepout column. When the left neighbour is the direct, exclusive producer, 
+    those banks are exactly where it wrote its output, so only one buffer is used for read/write.
+    """
     if producer.rect.output_face.side != 'right' or consumer.rect.input_face.side != 'left':
         return False
     if producer.x + producer.rect.w != consumer.x:
