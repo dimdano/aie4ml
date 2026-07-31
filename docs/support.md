@@ -9,7 +9,7 @@
 | Dynamic MatMul | Int8/int16, BF16, FP8 | Rank-2 GEMM ABI. A rank-2 RHS may be broadcast across compacted independent LHS axes; batched RHS MatMul with non-broadcast leading axes is rejected. |
 | Elementwise Add | Quantized integer | Exact-shape inputs for residual and elementwise connections; broadcasting is not supported. |
 | LayerNorm | Quantized integer | Last-axis normalization using integer mean/variance and reciprocal-square-root approximation. Requires supported static quantization and kernel legality constraints. |
-| Softmax (approx.) | Int8 to uint8/int16 | Calibrated clipped-linear Softmax surrogate, not exponential Softmax. Requires explicit parameters, offline calibration, and typically QAT. |
+| Softmax | Int8 to uint8/int16 | Accurate integer exponential or an opt-in surrogate (needs explicit parameters + QAT). Linear or microtile layout; the exp variant is not yet perf-optimized. |
 | Transpose / Permute | Memtile-backed view | Permutation of the final two axes only. |
 | Split / Slice | Direct or per-slice memtile | No Split/Slice kernel. A slice must be an exact union of complete producer-port regions; crossing producer ports, graph-boundary slices, and chained views are not supported. |
 | Concat | Direct or per-input memtile | No Concat kernel. Each consumer port must read entirely from one input slice; graph-input-backed Concat and chained views are not supported. |

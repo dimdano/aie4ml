@@ -14,7 +14,7 @@
 
 ## Current Support
 
-aie4ml currently supports Dense/GEMM, dynamic MatMul, Elementwise Add, quantized LayerNorm, quantized Softmax (approx.), last-two-axis Permute, Split/Slice, Concat, fanout, and fused ReLU across AIE-ML and AIE-MLv2 devices.
+aie4ml currently supports Dense/GEMM, dynamic MatMul, Elementwise Add, quantized LayerNorm, quantized Softmax (accurate and approx.), last-two-axis Permute, Split/Slice, Concat, fanout, and fused ReLU across AIE-ML and AIE-MLv2 devices.
 
 See the [operator support matrix](docs/support.md) for coverage, tensor and transport contracts, and current limitations.
 
@@ -32,6 +32,12 @@ The ONNX path is the recommended route for operator-level compiler development a
 
 ```bash
 pip install aie4ml
+```
+
+For the ONNX frontend (recommended path), also install ONNX and onnxruntime:
+
+```bash
+pip install onnx
 ```
 
 Install hls4ml only if you need the hls4ml frontend/backend integration:
