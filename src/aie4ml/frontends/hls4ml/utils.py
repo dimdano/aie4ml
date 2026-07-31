@@ -103,8 +103,15 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
             parallelism[key] = int(parallel_cfg[key])
     if 'parallel_factor' in parallel_cfg:
         parallelism['parallel_factor'] = int(parallel_cfg['parallel_factor'])
+    contract = cfg(layer, 'contract') or parallel_cfg.get('contract')
+    if contract is not None:
+        parallelism['contract'] = str(contract)
     if parallelism:
         directives['parallelism'] = parallelism
+
+    layout = cfg(layer, 'layout')
+    if layout is not None:
+        directives['layout'] = str(layout)
 
     io_route_cfg = cfg(layer, 'io_route', {})
     if io_route_cfg:
