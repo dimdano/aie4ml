@@ -272,7 +272,14 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
         return inherited_microtile(node, input_contracts) or self.preferred_microtile(node)
 
     def preferred_microtile(self, node: OpNode) -> MicrotileShape:
-        """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary)."""
+        """This kernel's own microtile when nothing upstream constrains it (e.g., a graph boundary).
+
+        A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
+        otherwise 4x8.
+        """
+        mt = node.directives.get('microtiling') if node.directives else None
+        if isinstance(mt, dict) and 'microtile_m' in mt and 'microtile_n' in mt:
+            return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
         return MicrotileShape(outer=4, inner=8)
 
     def validate_config(self, node: OpNode, config: LayerNormConfig, device) -> None:

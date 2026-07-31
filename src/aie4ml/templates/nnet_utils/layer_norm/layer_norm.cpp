@@ -171,21 +171,30 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
             acc_sq  = aie::mac_square(acc_sq, vx);
         }
 
-        // Segmented reduce: halving rounds collapse each MT_INNER lane group and leave row
-        // m's total in lane m * MT_INNER. A full reduce would sum the rows together.
-        aie::vector<int32, BLK> s = acc_sum.template to_vector<int32>(0);
-        aie::vector<int32, BLK> q = acc_sq.template to_vector<int32>(0);
-        for (unsigned step = MT_INNER / 2; step >= 1; step >>= 1) {
-            s = aie::add(s, aie::shuffle_down(s, step));
-            q = aie::add(q, aie::shuffle_down(q, step));
-        }
-
+        // Segmented reduce: halving rounds collapse each MT_INNER lane group and leave row m's
+        // total in lane m * MT_INNER (a full reduce would sum the rows together). Done in
+        // <=32-lane pieces because a shuffle_down across a 64-lane int32 vector (2048-bit) does
+        // not compose into a full logical shift, but a 32-lane (1024-bit) one does.
         // Padded to the vector width: lanes past MT_OUTER stay zero and are never stored.
         int32_t sum_x[STAT_LANES]  = {};
         int32_t sum_sq[STAT_LANES] = {};
-        for (int m = 0; m < MT_OUTER; ++m) {
-            sum_x[m]  = s.get(m * MT_INNER);
-            sum_sq[m] = q.get(m * MT_INNER);
+        {
+            const aie::vector<int32, BLK> s_full = acc_sum.template to_vector<int32>(0);
+            const aie::vector<int32, BLK> q_full = acc_sq.template to_vector<int32>(0);
+            constexpr int SUB = (BLK < 32) ? BLK : 32;
+            for (int sb = 0; sb < BLK / SUB; ++sb) {
+                aie::vector<int32, SUB> s = s_full.template extract<SUB>(sb);
+                aie::vector<int32, SUB> q = q_full.template extract<SUB>(sb);
+                for (unsigned step = MT_INNER / 2; step >= 1; step >>= 1) {
+                    s = aie::add(s, aie::shuffle_down(s, step));
+                    q = aie::add(q, aie::shuffle_down(q, step));
+                }
+                for (int g = 0; g < SUB / MT_INNER; ++g) {
+                    const int m = sb * (SUB / MT_INNER) + g;
+                    sum_x[m]  = s.get(g * MT_INNER);
+                    sum_sq[m] = q.get(g * MT_INNER);
+                }
+            }
         }
 
         int16_t mu16[STAT_LANES];
