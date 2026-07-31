@@ -45,10 +45,19 @@ public:
     softmax_hccs_graph()
     {
         for (int i = 0; i < CAS_NUM; ++i) {
-            kk[i] = kernel::create_object<softmax_i8<ConfigT>>(
-                ConfigT::B[i],
-                ConfigT::S[i],
-                ConfigT::Dmax[i]);
+            if constexpr (ConfigT::APPROX_EXP) {
+                if constexpr (ConfigT::LAYOUT_TILED) {
+                    kk[i] = kernel::create_object<softmax_exp_i8_tiled<ConfigT>>();
+                } else {
+                    kk[i] = kernel::create_object<softmax_exp_i8<ConfigT>>();
+                }
+            } else if constexpr (ConfigT::LAYOUT_TILED) {
+                kk[i] = kernel::create_object<softmax_i8_tiled<ConfigT>>(
+                    ConfigT::B[i], ConfigT::S[i], ConfigT::Dmax[i]);
+            } else {
+                kk[i] = kernel::create_object<softmax_i8<ConfigT>>(
+                    ConfigT::B[i], ConfigT::S[i], ConfigT::Dmax[i]);
+            }
             source(kk[i])         = "softmax.cpp";
             runtime<ratio>(kk[i]) = 1.0;
 

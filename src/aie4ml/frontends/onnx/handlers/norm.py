@@ -61,11 +61,6 @@ def _layer_norm(ctx: OnnxImportContext, node, node_name: str, directives: dict) 
 def _softmax(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
     if len(node.input) != 1:
         raise ValueError(f'{node_name}: Softmax must have exactly 1 input.')
-    if 'hccs' not in directives:
-        raise ValueError(
-            f'{node_name}: ONNX Softmax lowering requires explicit HCCS directives; '
-            'this is a calibrated surrogate, not normal exponential softmax.'
-        )
     src = ctx.source_for(node.input[0], node_name)
     in_shape = ctx.output_shape(node.input[0], node_name)
     axis = normalize_axis(int(attr(node, 'axis', -1)), len(in_shape), node_name, 'Softmax')

@@ -2,10 +2,11 @@
 
 from .config import SoftmaxConfig
 from .resolver import SoftmaxFamilyResolver
-from .softmax import SoftmaxHccsI8OpImplVariant
+from .softmax import SoftmaxHccsLinearOpImplVariant, SoftmaxHccsTiledOpImplVariant
 
 __all__ = [
     'SoftmaxConfig',
     'SoftmaxFamilyResolver',
-    'SoftmaxHccsI8OpImplVariant',
+    'SoftmaxHccsLinearOpImplVariant',
+    'SoftmaxHccsTiledOpImplVariant',
 ]

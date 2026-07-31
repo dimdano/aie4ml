@@ -9,6 +9,17 @@ struct {{L.struct_name}} {
   static constexpr int VEC  = {{P.vec_size}};
   static constexpr int INV_SHIFT = {{P.inv_shift}};
   static constexpr bool USE_CLB = {{ 'true' if P.use_clb else 'false' }};
+  static constexpr bool LAYOUT_TILED = {{ 'true' if P.layout == 'tiled' else 'false' }};
+  static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
+  static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
+  // Accurate integer exp variant. APPROX_EXP picks the exp kernel; EXP_KQ = log2(e)*input_scale
+  // in Q(EXP_ZF); the poly coeffs are fixed (2^(-f) ~= A2 f^2 + B1 f + C0 in Q14).
+  static constexpr bool    APPROX_EXP = {{ 'true' if P.approximation == 'exp' else 'false' }};
+  static constexpr int16_t EXP_KQ = {{ P.exp_kq }};
+  static constexpr int16_t EXP_A2 = 2811;
+  static constexpr int16_t EXP_B1 = -11004;
+  static constexpr int16_t EXP_C0 = 16384;
+  static constexpr int     EXP_ZF = 8;
   static constexpr const char* ROUNDING_TOKEN = "floor";
   static constexpr const char* SATURATION_TOKEN = "saturate";
 #if __cplusplus >= 202002L
