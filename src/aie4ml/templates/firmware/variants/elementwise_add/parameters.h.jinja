@@ -8,6 +8,10 @@ struct {{L.struct_name}} {
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}};
   static constexpr int VEC_SIZE = {{P.vec_size}};
   static constexpr int TILE_ELEMENTS = {{P.tile_elements}};
+  static constexpr bool TRANSPOSE_LHS = {{ 'true' if P.flags.transpose_lhs else 'false' }};
+  static constexpr bool TRANSPOSE_RHS = {{ 'true' if P.flags.transpose_rhs else 'false' }};
+  static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
+  static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
   static constexpr int SHIFT = {{P.shift}};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
   static constexpr const char* SATURATION_TOKEN = "saturate";

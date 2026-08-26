@@ -22,12 +22,20 @@ void elementwise_add_kernel<ConfigT>::run(
   constexpr int VEC = ConfigT::VEC_SIZE;
   constexpr int iters = ConfigT::TILE_ELEMENTS / VEC;
 
+  static_assert(!(ConfigT::TRANSPOSE_LHS || ConfigT::TRANSPOSE_RHS)
+                    || VEC == MT_OUTER * MT_INNER,
+                "transposed elementwise operands require one microtile per vector load");
+
   for (int i = 0; i < iters; ++i)
     chess_prepare_for_pipelining
   {
     aie::vector<lhs_t, VEC> va = aie::load_v<VEC>(lhs_ptr);
+    if constexpr (ConfigT::TRANSPOSE_LHS)
+      va = aie::transpose(va, MT_INNER, MT_OUTER);
     lhs_ptr += VEC;
     aie::vector<rhs_t, VEC> vb = aie::load_v<VEC>(rhs_ptr);
+    if constexpr (ConfigT::TRANSPOSE_RHS)
+      vb = aie::transpose(vb, MT_INNER, MT_OUTER);
     rhs_ptr += VEC;
     auto acc = aie::add(aie::from_vector<acc_scalar_t>(va), vb);
 

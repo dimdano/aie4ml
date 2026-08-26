@@ -24,6 +24,9 @@ public:
   using result_t = typename ConfigT::result_t;
   using acc_scalar_t = typename elementwise_add_base<ConfigT>::acc_scalar_t;
 
+  static constexpr int MT_OUTER = ConfigT::MICROTILE_OUTER;
+  static constexpr int MT_INNER = ConfigT::MICROTILE_INNER;
+
   void run(input_buffer<lhs_t>& lhs, input_buffer<rhs_t>& rhs, output_buffer<result_t>& out);
 
   static void registerKernelClass() {

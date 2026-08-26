@@ -19,6 +19,7 @@ class SoftmaxConfig:
     hccs: Dict[str, Any]
     layout: str = 'linear'
     microtile: Optional[MicrotileShape] = None
+    transpose_input: bool = False
     #: 'hccs' (calibrated clipped-linear surrogate) or 'exp' (accurate integer exp, no calibration).
     approximation: str = 'hccs'
     #: For the exp variant: log2(e) * input_scale in Q(EXP_ZF). 0 for HCCS.

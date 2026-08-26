@@ -156,6 +156,15 @@ softmax_i8_tiled<ConfigT>::softmax_i8_tiled(int16_t B_i, int8_t S_i, uint8_t DMA
       DMAX_param(DMAX_i)
 {}
 
+template <typename ConfigT, int N, int MTI, int MTO, typename T>
+static inline aie::vector<T, N> load_microtile(const T* p)
+{
+    const aie::vector<T, N> v = *aie::cbegin_vector<N>(p);
+    if constexpr (ConfigT::TRANSPOSE_INPUT) return aie::transpose(v, MTI, MTO);
+    return v;
+}
+
+
 template <typename ConfigT>
 void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
 {
@@ -175,7 +184,7 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
         // ---- pass 1: per-row max, segmented over the MT_INNER lane groups ----
         aie::vector<int8, BLK> vmax = aie::broadcast<int8, BLK>(-128);
         for (int bn = 0; bn < NB; ++bn)
-            vmax = aie::max(vmax, *aie::cbegin_vector<BLK>(band + bn * BLK));
+            vmax = aie::max(vmax, load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK));
         for (int step = MT_INNER / 2; step >= 1; step >>= 1)
             vmax = aie::max(vmax, aie::shuffle_down(vmax, step));
 
@@ -189,7 +198,7 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
         // ---- pass 2: scores and per-row sum (segmented add) ----
         aie::vector<int32, BLK> ssum = aie::zeros<int32, BLK>();
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
             const aie::vector<int16, BLK> vx16 = aie::from_vector<acc32>(vx).template to_vector<int16>(0);
             aie::vector<int16, BLK> d = aie::min(aie::sub(max16, vx16), dmax_v);   // min(max-x, DMAX)
             aie::accum<acc32, BLK> acc;
@@ -223,7 +232,7 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
 
         // ---- pass 3: normalise (recompute the score, then scale) ----
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
             const aie::vector<int16, BLK> vx16 = aie::from_vector<acc32>(vx).template to_vector<int16>(0);
             aie::vector<int16, BLK> d = aie::min(aie::sub(max16, vx16), dmax_v);
             aie::accum<acc32, BLK> acc;
@@ -288,7 +297,7 @@ void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<ou
 
         aie::vector<int8, BLK> vmax = aie::broadcast<int8, BLK>(-128);
         for (int bn = 0; bn < NB; ++bn)
-            vmax = aie::max(vmax, *aie::cbegin_vector<BLK>(band + bn * BLK));
+            vmax = aie::max(vmax, load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK));
         for (int step = MT_INNER / 2; step >= 1; step >>= 1)
             vmax = aie::max(vmax, aie::shuffle_down(vmax, step));
         int16_t row_max[STAT_LANES] = {};
@@ -297,7 +306,7 @@ void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<ou
 
         aie::vector<int32, BLK> ssum = aie::zeros<int32, BLK>();
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
             const aie::vector<int16, BLK> e = exp_score16<ConfigT, BLK>(vx, max16);
             ssum = aie::add(ssum, aie::from_vector<acc32>(e).template to_vector<int32>(0));
         }
@@ -320,7 +329,7 @@ void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<ou
         const aie::vector<int16, BLK> inv_v = spread_rows<int16, MT_OUTER, MT_INNER>(inv16);
 
         for (int bn = 0; bn < NB; ++bn) {
-            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
             const aie::vector<int16, BLK> e = exp_score16<ConfigT, BLK>(vx, max16);
             aie::accum<acc32, BLK> prod = aie::mul(e, inv_v);
             *aie::begin_vector<BLK>(dst + bn * BLK) = prod.template to_vector<out_t>(OUT_SHIFT);

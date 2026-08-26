@@ -36,6 +36,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
     """Everything the matmul variants share, independent of which contract they implement."""
 
     op_type = 'matmul'
+    kernel_transposes_microtile = True
     graph_header = 'matmul_graph.h'
     graph_name = 'matmul_graph'
     param_template = 'matmul'
@@ -53,8 +54,6 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
-        lhs_perm = io_views[lhs_tensor.name].perm
-        rhs_perm = io_views[rhs_tensor.name].perm
         is_float = isinstance(rhs_tensor.precision, FloatIntent)
 
         shift = (
@@ -76,8 +75,8 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
             accumulator_tag=infer_accumulator_tag(device, None, None, precision['acc']),
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
             flags=MatmulFlags(
-                transpose_lhs=bool(lhs_perm is not None and lhs_perm[-1] != (len(lhs_perm) - 1)),
-                transpose_rhs=bool(rhs_perm is not None and rhs_perm[-1] != (len(rhs_perm) - 1)),
+                transpose_lhs=io_views[lhs_tensor.name].is_transposed,
+                transpose_rhs=io_views[rhs_tensor.name].is_transposed,
             ),
         )
 

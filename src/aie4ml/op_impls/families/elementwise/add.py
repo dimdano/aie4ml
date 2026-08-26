@@ -28,24 +28,27 @@ from ...utils.precision import (
     storage_bytes_for_spec,
 )
 from .common import elementwise_vec_size
-from .config import AddConfig
+from .config import AddConfig, AddFlags
 
 
 def _select_preserved_staging(tensor_names, input_contracts):
+    """Pick the producer staging this add inherits its geometry from, and the name it came from."""
+
     primary_name = next((n for n in tensor_names if n in input_contracts), None)
     if primary_name is None:
-        return None, {}
+        return None, None, {}
     primary = input_contracts[primary_name].port_staging
     patches = {
         n: 'memtile' for n in tensor_names if n in input_contracts and input_contracts[n].port_staging != primary
     }
-    return primary, patches
+    return primary, primary_name, patches
 
 
 @register_variant
 class AddOpImplVariant(OpImplVariant):
     variant_id = 'add.v1'
     op_type = 'add'
+    kernel_transposes_microtile = True
     graph_header = 'elementwise_add_graph.h'
     graph_name = 'elementwise_add_graph'
     param_template = 'elementwise_add'
@@ -64,10 +67,24 @@ class AddOpImplVariant(OpImplVariant):
             input_contracts,
             [lhs_tensor.name, rhs_tensor.name],
         )
-        preserved_staging, staging_patches = _select_preserved_staging(
+        preserved_staging, geometry_tensor, staging_patches = _select_preserved_staging(
             (lhs_tensor.name, rhs_tensor.name),
             input_contracts,
         )
+        # BUFFER-order data for `geometry_tensor`; its view decodes the shared VIEW-order geometry.
+        inherited_view = None
+        if preserved_staging is not None:
+            inherited_view = build_tensor_view_from_staging(
+                node,
+                lhs_tensor if geometry_tensor == lhs_tensor.name else rhs_tensor,
+                'inputs',
+                preserved_staging[0],
+            )
+        if inherited_view is not None and inherited_view.is_transposed:
+            # A transpose swaps inner and outer: the producer's partition is the opposite contract
+            # here and its block is the wrong way round, so re-derive the read off the memtile.
+            staging_contract = 'inner' if staging_contract == 'outer' else 'outer'
+            staging_patches = {**staging_patches, geometry_tensor: 'memtile'}
         route_patches = {**conflict_patches, **staging_patches}
         if route_patches:
             io_route = {**io_route, 'inputs': {**io_route.get('inputs', {}), **route_patches}}
@@ -86,11 +103,20 @@ class AddOpImplVariant(OpImplVariant):
         max_rows = max(1, int(device.rows))
         elem_bytes = storage_bytes_for_spec(precision['lhs'])
 
-        if preserved_staging is not None:
-            port0 = preserved_staging[0]
+        if inherited_view is not None:
             cas_num = len(preserved_staging)
-            io_views = {t.name: build_tensor_view_from_staging(node, t, 'inputs', port0) for t in node.inputs}
-            io_views.update({t.name: build_tensor_view_from_staging(node, t, 'outputs', port0) for t in node.outputs})
+            io_views = build_io_views(
+                node,
+                list(node.inputs),
+                list(node.outputs),
+                full_inner=inherited_view.full_inner,
+                full_outer=inherited_view.full_outer,
+                tile_inner=inherited_view.tile_inner,
+                tile_outer=inherited_view.tile_outer,
+                tile_inner_raw=inherited_view.tile_raw_inner,
+                tile_outer_raw=inherited_view.tile_raw_outer,
+                microtile=inherited_view.microtile,
+            )
         elif staging_contract == 'inner':
             full_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
             full_inner = align_up(full_inner, vec_size)
@@ -144,6 +170,27 @@ class AddOpImplVariant(OpImplVariant):
                 tile_outer_raw=tile_outer,
             )
 
+        # The DMA walks a transposed operand's grid in view order; the kernel does the block.
+        flags = AddFlags(
+            transpose_lhs=io_views[lhs_tensor.name].is_transposed,
+            transpose_rhs=io_views[rhs_tensor.name].is_transposed,
+        )
+        microtile = io_views[lhs_tensor.name].microtile
+        # Re-deriving a descriptor does not always reproduce the producer's byte for byte -- a
+        # padded inner dim decodes as a spurious microtile and reorders the traversal. So the
+        # inherited descriptor stays authoritative for the inputs it actually describes: same
+        # staging as the primary, and not transposed (a transposed leg derives its own read).
+        preserved_tensors = tuple(
+            t.name
+            for t in (lhs_tensor, rhs_tensor)
+            if preserved_staging is not None
+            and t.name in input_contracts
+            and input_contracts[t.name].port_staging == preserved_staging
+            and not io_views[t.name].is_transposed
+        )
+        if (flags.transpose_lhs or flags.transpose_rhs) and microtile is not None:
+            vec_size = int(microtile.outer) * int(microtile.inner)
+
         if is_float:
             shift, accumulator_tag, rounding_mode = 0, 'accfloat', 'conv_even'
         else:
@@ -161,6 +208,9 @@ class AddOpImplVariant(OpImplVariant):
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,
             preserved_staging=preserved_staging,
+            preserved_tensors=preserved_tensors,
+            flags=flags,
+            microtile=microtile,
         )
 
     def validate_config(self, node: OpNode, config: AddConfig, _device) -> None:
@@ -179,17 +229,23 @@ class AddOpImplVariant(OpImplVariant):
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        if config.preserved_staging is not None:
+        if tensor_name in config.preserved_tensors:
             return dict(config.preserved_staging[int(port)])
         return describe_partition_staging(
-            config.io_views[tensor_name], port, 'read', config.parallelism.contract, buf_dims
+            config.io_views[tensor_name],
+            port,
+            'read',
+            config.parallelism.contract,
+            buf_dims,
         )
 
     def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
-        if config.preserved_staging is not None:
-            return dict(config.preserved_staging[int(port)])
         return describe_partition_staging(
-            config.io_views[tensor_name], port, 'write', config.parallelism.contract, buf_dims
+            config.io_views[tensor_name],
+            port,
+            'write',
+            config.parallelism.contract,
+            buf_dims,
         )
 
     def output_staging_contract(self, node, config: AddConfig, tensor_name: str):

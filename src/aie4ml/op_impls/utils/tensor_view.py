@@ -39,6 +39,11 @@ class TensorView:
         return len(self.logical)
 
     @property
+    def is_transposed(self) -> bool:
+        """True when `perm` moves the inner axis, so VIEW and BUFFER disagree on what is fastest."""
+        return self.perm is not None and int(self.perm[-1]) != self.rank - 1
+
+    @property
     def buffer_order(self) -> tuple[int, ...]:
         """LOGICAL axis per buffer position — the fixed axis-reversal convention."""
         return tuple(reversed(range(self.rank)))
@@ -259,6 +264,10 @@ def describe_partition_staging(view, port: int, access: str, contract: str, buf_
     axis is walked in microtile-sized chunks rather than one whole slice, which is the order
     aie::mmul reads and writes. A tensor staged that way hands over to a matmul with no memtile
     in between, since the transport layer compares descriptors.
+
+    A transposed view is only half-realized here -- the grid is walked in view order, but each
+    microtile is still stored the other way round. Resolve refuses that unless the variant
+    declares `kernel_transposes_microtile`.
     """
     microtile = view.microtile
     inner_dim, outer_dim, _ = canonical_buffer_axes(view)
@@ -288,12 +297,13 @@ def describe_partition_staging(view, port: int, access: str, contract: str, buf_
                     int(microtile.inner),
                     int(microtile.inner),
                     max(1, int(view.tile_raw_inner) // int(microtile.inner)),
+                    int(port) * int(part_raw) if is_inner else 0,
                 ),
                 outer_dim: AxisPlan(
                     int(microtile.outer),
                     int(microtile.outer),
-                    max(1, int(part_raw) // int(microtile.outer)),
-                    int(port) * int(part_raw),
+                    max(1, int(view.tile_raw_outer) // int(microtile.outer)),
+                    0 if is_inner else int(port) * int(part_raw),
                 ),
             }
         ),

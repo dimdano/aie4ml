@@ -29,3 +29,4 @@ class LayerNormConfig:
     layout: str = 'linear'
     #: Block a 'tiled' layout is stored in, inherited from the producer so the edge stays direct.
     microtile: Optional[MicrotileShape] = None
+    transpose_input: bool = False

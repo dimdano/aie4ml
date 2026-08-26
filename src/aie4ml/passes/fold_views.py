@@ -38,6 +38,13 @@ class FoldViewOps(AIEPass):
         in_tv = node.inputs[0]
         out_tv = node.outputs[0]
 
+        if out_tv.name in graph.output_tensor_names:
+            raise NotImplementedError(
+                f'{node.name}: transpose feeds graph output {out_tv.name!r}. A transpose folds into '
+                'its consumers as an io_view; a graph output has no consumer kernel to carry the view, '
+                'and the output boundary emits the producer buffer order as-is.'
+            )
+
         perm = node.metadata.get('perm')
         if perm is None:
             raise ValueError(f'{node.name}: missing transpose permutation metadata.')

@@ -12,6 +12,7 @@ struct {{L.struct_name}} {
   static constexpr bool LAYOUT_TILED = {{ 'true' if P.layout == 'tiled' else 'false' }};
   static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
   static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
+  static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.transpose_input else 'false' }};
   // Accurate integer exp variant. APPROX_EXP picks the exp kernel; EXP_KQ = log2(e)*input_scale
   // in Q(EXP_ZF); the poly coeffs are fixed (2^(-f) ~= A2 f^2 + B1 f + C0 in Q14).
   static constexpr bool    APPROX_EXP = {{ 'true' if P.approximation == 'exp' else 'false' }};

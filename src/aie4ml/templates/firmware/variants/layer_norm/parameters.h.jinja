@@ -13,6 +13,7 @@ struct {{L.struct_name}} {
   static constexpr bool LAYOUT_TILED = {{ 'true' if P.layout == 'tiled' else 'false' }};
   static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
   static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
+  static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.transpose_input else 'false' }};
   static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
   static constexpr const char* SATURATION_TOKEN = "saturate";
 #if __cplusplus >= 202002L

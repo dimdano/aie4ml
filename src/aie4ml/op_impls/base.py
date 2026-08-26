@@ -30,6 +30,7 @@ class OpImplVariant:
     graph_name: ClassVar[str] = ''
     param_template: ClassVar[str] = ''
     plevel: ClassVar[int] = 10  # higher value = higher selection priority
+    kernel_transposes_microtile: ClassVar[bool] = False
 
     def matches(self, _node: OpNode, _device: Any) -> bool:
         raise NotImplementedError

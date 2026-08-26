@@ -153,6 +153,7 @@ class _SoftmaxVariantBase(OpImplVariant):
             io_route=io_route,
             layout=self.layout_name,
             microtile=microtile,
+            transpose_input=io_views[in_tensor.name].is_transposed,
             approximation=self.approximation,
             **params,
         )
@@ -173,7 +174,13 @@ class _SoftmaxVariantBase(OpImplVariant):
         raise NotImplementedError
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_partition_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
+        return describe_partition_staging(
+            config.io_views[tensor_name],
+            port,
+            'read',
+            'outer',
+            buf_dims,
+        )
 
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
@@ -304,6 +311,7 @@ class SoftmaxHccsTiledOpImplVariant(_SoftmaxTiledMixin, _SoftmaxHccsBase):
 
     variant_id = 'softmax.hccs.i8.tiled.v1'
     layout_name = 'tiled'
+    kernel_transposes_microtile = True
 
 
 def _exp_kq(input_scale: float) -> int:
@@ -369,3 +377,4 @@ class SoftmaxExpTiledOpImplVariant(_SoftmaxTiledMixin, _SoftmaxExpBase):
 
     variant_id = 'softmax.exp.i8.tiled.v1'
     layout_name = 'tiled'
+    kernel_transposes_microtile = True

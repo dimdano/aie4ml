@@ -83,6 +83,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
     """Everything the dense variants share, independent of which contract they implement."""
 
     op_type = 'dense'
+    kernel_transposes_microtile = True
     graph_header = 'dense_bias_relu_graph.h'
     graph_name = 'dense_bias_relu_graph'
     param_template = 'dense_bias_relu'
@@ -101,7 +102,6 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
 
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
-        lhs_perm = io_views[lhs_tensor.name].perm
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
 
         shift = (
@@ -127,7 +127,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
             flags=DenseFlags(
                 use_relu=use_relu,
-                transpose_lhs=bool(lhs_perm is not None and lhs_perm[-1] != (len(lhs_perm) - 1)),
+                transpose_lhs=io_views[lhs_tensor.name].is_transposed,
                 use_bias=bool(node.metadata.get('use_bias')),
             ),
         )

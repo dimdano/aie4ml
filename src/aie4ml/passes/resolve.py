@@ -38,6 +38,26 @@ def _same_execution_entry(inst, variant, ports, config) -> bool:
     return inst.variant is variant and inst.ports == ports and inst.config == config
 
 
+def _check_transposed_views(node, config, variant) -> None:
+    """A folded transpose needs both halves: the DMA walks the microtile grid in view order and
+    the kernel transposes each block on load. Refuse rather than feed a kernel permuted data.
+    """
+
+    for name, view in (getattr(config, 'io_views', None) or {}).items():
+        if not view.is_transposed:
+            continue
+        if not variant.kernel_transposes_microtile:
+            raise NotImplementedError(
+                f'{node.name}: {name!r} is a transposed view, but {variant.variant_id} does not '
+                'transpose the microtile on load, so the kernel would read permuted data.'
+            )
+        if view.microtile is None:
+            raise NotImplementedError(
+                f'{node.name}: {name!r} is a transposed view staged in whole rows; the DMA needs a '
+                'microtiled staging to walk the grid in view order.'
+            )
+
+
 class Resolve(AIEPass):
     """Resolve logical nodes into family-owned execution entries."""
 
@@ -65,6 +85,7 @@ class Resolve(AIEPass):
             resolved_directives['input_contracts'] = _resolved_input_contracts(ctx, node)
 
             config, variant = resolver.resolve(node, ctx.device, resolved_directives)
+            _check_transposed_views(node, config, variant)
             variant.validate_config(node, config, ctx.device)
             ports = variant.build_ports(node, config)
 

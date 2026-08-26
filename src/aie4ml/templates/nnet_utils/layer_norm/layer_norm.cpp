@@ -166,7 +166,8 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
             chess_prepare_for_pipelining
             chess_loop_range(NB, NB)
         {
-            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            if constexpr (ConfigT::TRANSPOSE_INPUT) vx = aie::transpose(vx, MT_INNER, MT_OUTER);
             acc_sum = aie::mac(acc_sum, vx, ones8);
             acc_sq  = aie::mac_square(acc_sq, vx);
         }
@@ -209,7 +210,8 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
             chess_prepare_for_pipelining
             chess_loop_range(NB, NB)
         {
-            const aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            aie::vector<int8, BLK> vx = *aie::cbegin_vector<BLK>(band + bn * BLK);
+            if constexpr (ConfigT::TRANSPOSE_INPUT) vx = aie::transpose(vx, MT_INNER, MT_OUTER);
 
             // Already widened in ROM: one block load, no broadcast or concat in the loop.
             const aie::vector<int16, BLK> gamma_blk = *aie::cbegin_vector<BLK>((const int16_t*)gamma + bn * BLK);

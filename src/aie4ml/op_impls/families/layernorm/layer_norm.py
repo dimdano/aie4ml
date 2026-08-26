@@ -164,6 +164,7 @@ class _LayerNormVariantBase(OpImplVariant):
             io_route=io_route,
             layout=self.layout_name,
             microtile=microtile,
+            transpose_input=io_views[in_tensor.name].is_transposed,
         )
 
     def validate_config(self, node: OpNode, config: LayerNormConfig, _device) -> None:
@@ -178,7 +179,13 @@ class _LayerNormVariantBase(OpImplVariant):
         return {f: getattr(config, f) for f in config.__dataclass_fields__}
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
-        return describe_partition_staging(config.io_views[tensor_name], port, 'read', 'outer', buf_dims)
+        return describe_partition_staging(
+            config.io_views[tensor_name],
+            port,
+            'read',
+            'outer',
+            buf_dims,
+        )
 
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_partition_staging(config.io_views[tensor_name], port, 'write', 'outer', buf_dims)
@@ -266,6 +273,7 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
 
     variant_id = 'layer_norm.i8.tiled.v1'
     layout_name = 'tiled'
+    kernel_transposes_microtile = True
 
     def resolve_microtile(self, node: OpNode, input_contracts):
         """Match the producer's microtile so the edge is direct; else choose our own."""
