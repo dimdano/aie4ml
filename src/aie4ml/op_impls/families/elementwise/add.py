@@ -80,11 +80,14 @@ class AddOpImplVariant(OpImplVariant):
                 'inputs',
                 preserved_staging[0],
             )
+        # A transposed operand crosses a memtile anyway, and a memtile can re-shard. Inheriting
+        # would express the partition in the producer's axes, costing a second memtile at the
+        # next row-wise reduction. Re-shard here: keep the microtile, drop the partition.
+        microtile_override = None
         if inherited_view is not None and inherited_view.is_transposed:
-            # A transpose swaps inner and outer: the producer's partition is the opposite contract
-            # here and its block is the wrong way round, so re-derive the read off the memtile.
-            staging_contract = 'inner' if staging_contract == 'outer' else 'outer'
             staging_patches = {**staging_patches, geometry_tensor: 'memtile'}
+            microtile_override = inherited_view.microtile
+            inherited_view = None
         route_patches = {**conflict_patches, **staging_patches}
         if route_patches:
             io_route = {**io_route, 'inputs': {**io_route.get('inputs', {}), **route_patches}}
@@ -131,7 +134,7 @@ class AddOpImplVariant(OpImplVariant):
                 input_contracts=input_contracts,
                 primary_tensor_name=lhs_tensor.name,
                 contract='inner',
-                require_match=True,
+                require_match=microtile_override is None,
             )
             io_views = build_io_views(
                 node,
@@ -143,6 +146,7 @@ class AddOpImplVariant(OpImplVariant):
                 tile_outer=last_outer,
                 tile_inner_raw=ceildiv(raw_inner, cas_num),
                 tile_outer_raw=last_outer,
+                microtile=microtile_override,
             )
         else:
             full_inner, outer_prefix, last_outer = extract_inner_outer(lhs_shape)
@@ -168,6 +172,7 @@ class AddOpImplVariant(OpImplVariant):
                 tile_outer=tile_outer,
                 tile_inner_raw=raw_inner,
                 tile_outer_raw=tile_outer,
+                microtile=microtile_override,
             )
 
         # The DMA walks a transposed operand's grid in view order; the kernel does the block.

@@ -397,11 +397,22 @@ def build_tensor_view(
 
 
 def build_tensor_view_from_staging(node, tensor, direction: str, desc: Mapping[str, Any]) -> TensorView:
-    """Build a TensorView whose per-port tile matches an inherited staging descriptor."""
+    """Build a TensorView whose per-port tile matches an inherited staging descriptor.
+
+    `desc` is BUFFER-order data, so it only decodes against a tensor of that same buffer
+    order. Share geometry across a transpose by decoding once and rebuilding the rest with
+    `build_io_views`.
+    """
 
     from .io import view_layout
 
     logical = tuple(int(x) for x in tensor.shape)
+    buffer_logical = tuple(reversed(desc['buffer_dimension']))
+    if len(buffer_logical) != len(logical) or any(b < s for b, s in zip(buffer_logical, logical)):
+        raise ValueError(
+            f'{node.name}: staging descriptor {buffer_logical} does not describe {tensor.name!r} '
+            f'{logical} -- it belongs to a tensor with a different buffer order.'
+        )
     layout = view_layout(node, tensor, direction)
     perm = None if layout.get('perm') is None else tuple(int(x) for x in layout['perm'])
     # BUFFER order is LOGICAL reversed; undo it, then relabel LOGICAL -> VIEW.
