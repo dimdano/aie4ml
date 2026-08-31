@@ -14,7 +14,7 @@ from hls4ml.model.optimizer import layer_optimizer, model_optimizer
 from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 from hls4ml.writer import get_writer
 
-from ...device_catalog import load_device_catalog
+from ...device_catalog import PART_HELP, known_boards, lookup_device
 from ...ir import get_backend_context
 from ...model import AIEModel
 from ...system_plan import normalize_pl_config
@@ -160,15 +160,12 @@ class AIEBackend(Backend):
         return _FPGABackendHelper.convert_precision_string(precision)
 
     def _get_device_info(self, part):
-        catalog = load_device_catalog()
         if part is None:
-            available = ', '.join(sorted(catalog)) or '<none>'
-            raise ValueError(f'No AIE part specified. Available catalog entries: {available}.')
-        try:
-            return catalog[part]
-        except KeyError as exc:
-            available = ', '.join(sorted(catalog)) or '<none>'
-            raise ValueError(f'Unknown part "{part}". Available catalog entries: {available}.') from exc
+            raise ValueError(f'No AIE part specified. {PART_HELP.format(boards=known_boards())}')
+        entry = lookup_device(part)
+        if not entry:
+            raise ValueError(f'Unknown part "{part}". {PART_HELP.format(boards=known_boards())}')
+        return entry
 
     def create_initial_config(
         self,

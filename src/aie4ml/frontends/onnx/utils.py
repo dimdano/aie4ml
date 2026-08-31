@@ -6,9 +6,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from ...aie_types import FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
-from ...device_catalog import load_device_catalog
+from ...device_catalog import resolve_device
 from ...ir import BackendPolicies
-from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
+from ...ir.context import AIEBackendContext, ProjectConfig
 from ...ir.graph import TENSOR_LAYOUTS
 from ...system_plan import normalize_pl_config
 from ..common import register_default_traits
@@ -125,14 +125,7 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
     if not part_name:
         raise KeyError('ONNX frontend requires Part or AIEConfig.Part in the config dict.')
 
-    catalog = load_device_catalog()
-    device_entry = catalog.get(part_name, {}) or catalog.get(str(part_name).lower(), {})
-    merged = dict(device_entry)
-    merged.update(aie_cfg)
-    if 'Generation' not in merged:
-        merged['Generation'] = device_entry.get('Generation', '')
-
-    device = DeviceSpec.from_config(str(part_name), merged)
+    device, merged = resolve_device(part_name, aie_cfg)
     policies = BackendPolicies(
         fusion=dict(config.get('AIEFusionPolicy', {}) or {}),
         decomposition=dict(config.get('AIEDecompositionPolicy', {}) or {}),

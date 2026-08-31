@@ -10,8 +10,9 @@ tiers -- the report gathers whatever is present and says what is missing:
     make aiesim     aiesimulator_output/    output interval, PLIO throughput
     make profile    profile_funct_*.txt     per-kernel cycles
 
-`make aiesim` alone does not profile, so a plain `predict(simulator='aie')` run yields
-latency and throughput but no per-kernel breakdown. Re-run `make profile` for that.
+`predict(simulator='aie')` runs `make profile`, so it covers all three tiers. Bare
+`make aiesim` does not profile -- that yields latency and throughput but no per-kernel
+breakdown, and needs `make profile` re-run for it.
 
     from aie4ml.report import report        # notebook: report(model) or report(project_dir)
     aie4ml-report path/to/project-folder    # terminal
