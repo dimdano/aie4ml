@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Tuple
 
 from .base import OpImplVariant
 
@@ -18,14 +17,6 @@ class OpImplRegistry:
     def candidates(self, op_type: str) -> list[OpImplVariant]:
         """Return registered variants for op_type sorted by descending plevel."""
         return sorted(self._variants.get(op_type, []), key=lambda v: v.plevel, reverse=True)
-
-    def supported_microtilings(self, op_type: str, generation: str, query) -> List[Tuple[int, int, int]]:
-        for variant in self.candidates(op_type):
-            try:
-                return variant.microtiling_options(generation, query)
-            except NotImplementedError:
-                continue
-        return []
 
 
 _GLOBAL_OP_IMPL_REGISTRY = OpImplRegistry()

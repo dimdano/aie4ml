@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict, List, Tuple
+from typing import Any, ClassVar, Dict
 
 import numpy as np
 
@@ -17,7 +17,6 @@ from ...utils.precision import (
     resolve_accumulator_output_shift,
 )
 from .common import (
-    MICROTILE_OPTIONS,
     bitwidths_supported,
     describe_inner_lhs_staging,
     describe_inner_output_staging,
@@ -30,7 +29,6 @@ from .common import (
     pack_vector_by_n_slice,
     quantize_to_int,
     requested_contract,
-    select_generation_key,
 )
 from .config import DenseConfig, DenseFlags
 from .resolver import (
@@ -71,9 +69,6 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     def lhs_port_count(self, config) -> int:
         """LHS ports this variant needs. Contract-specific: declared by each variant."""
         raise NotImplementedError
-
-    def microtiling_options(self, generation: str, query) -> List[Tuple[int, int, int]]:
-        return list(MICROTILE_OPTIONS.get(select_generation_key(generation), {}).get(tuple(query), []))
 
     def output_staging_contract(self, _node, config, _tensor_name: str):
         return str(config.parallelism.contract)

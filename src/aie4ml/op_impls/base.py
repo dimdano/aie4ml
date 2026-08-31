@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Optional
 
 from ..ir.graph import OpImplInstance, OpNode
 from .common_types import PortMap
@@ -49,9 +49,6 @@ class OpImplVariant:
 
     def output_port_count(self, _node: OpNode, config: Any) -> Optional[int]:
         return int(config.parallelism.cas_num)
-
-    def microtiling_options(self, generation: str, query: Any) -> List[Tuple[int, int, int]]:
-        raise NotImplementedError
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
         raise NotImplementedError

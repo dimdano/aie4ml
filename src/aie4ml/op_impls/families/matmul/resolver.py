@@ -7,7 +7,6 @@ from typing import Any, Dict, Optional
 from ....aie_types import AIEDataType, FloatIntent, legality_format
 from ....ir import input_role, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
-from ...registry import get_op_impl_registry
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
 from ...utils.precision import (
@@ -16,6 +15,7 @@ from ...utils.precision import (
     resolve_exact_storage_dtype,
     to_quant_intent,
 )
+from .common import MICROTILE_OPTIONS, select_generation_key
 from .config import MatmulMicrotileConfig
 
 
@@ -74,10 +74,9 @@ def _tile_bank_usage(
     }
 
 
-def _supported_microtile_options(op_type: str, generation: str, lhs_dtype, rhs_dtype):
-    return get_op_impl_registry().supported_microtilings(
-        op_type, generation, (legality_format(lhs_dtype.format), legality_format(rhs_dtype.format))
-    )
+def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
+    key = (legality_format(lhs_dtype.format), legality_format(rhs_dtype.format))
+    return list(MICROTILE_OPTIONS.get(select_generation_key(generation), {}).get(key, []))
 
 
 def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConfig:
@@ -86,7 +85,7 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConf
         key: int(microtiling_cfg[key]) if key in microtiling_cfg else 0
         for key in ('microtile_m', 'microtile_n', 'microtile_k')
     }
-    options = _supported_microtile_options(node.op_type, device.generation, lhs_dtype, rhs_dtype)
+    options = _supported_microtile_options(device.generation, lhs_dtype, rhs_dtype)
     if not options:
         raise ValueError(
             f'{node.name}: no supported tile configs are registered for Generation={device.generation} and '
