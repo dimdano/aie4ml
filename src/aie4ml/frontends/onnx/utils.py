@@ -219,13 +219,25 @@ def dequantize_data(
     return (np.asarray(data, dtype=np.float64) - float(zero)) * scale
 
 
+def _narrow_float_name(dtype) -> str:
+    """Name of a sub-fp32 float dtype, across both onnx representations.
+
+    onnx >= 1.18 returns real ml_dtypes scalars ('bfloat16', 'float8_e4m3fn'); older onnx
+    returns a structured view over the raw integer, whose single field carries the name
+    ('bfloat16', 'e4m3fn').
+    """
+
+    return dtype.names[0] if dtype.names else str(dtype)
+
+
 def intent_from_initializer(data: np.ndarray, node_name: str):
     dtype = np.asarray(data).dtype
     if dtype == np.dtype(np.float32):
         return FloatIntent(width=32, format=FloatFormat.FP32)
-    if str(dtype) == 'bfloat16':
+    name = _narrow_float_name(dtype)
+    if name == 'bfloat16':
         return FloatIntent(width=16, format=FloatFormat.BF16)
-    if str(dtype) == 'float8_e4m3fn':
+    if name in ('float8_e4m3fn', 'e4m3fn'):
         return FloatIntent(width=8, format=FloatFormat.FP8_E4M3)
     raise ValueError(
         f'{node_name}: direct initializer inputs must be float32/bfloat16/fp8_e4m3, '
