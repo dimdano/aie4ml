@@ -252,7 +252,9 @@ def _op_edges(vitis: Dict[str, Any]) -> List[tuple]:
                 continue
             seen.add(node)
             if node in inst_op:
-                edges.add((inst_op[src], inst_op[node]))
+                # Skip self-edges: Drop the self-edges that result from a cascaded op's tiles
+                if inst_op[src] != inst_op[node]:
+                    edges.add((inst_op[src], inst_op[node]))
             else:
                 stack.extend(succ.get(node, []))
     return sorted(edges)
