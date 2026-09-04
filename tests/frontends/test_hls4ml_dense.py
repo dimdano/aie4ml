@@ -1,7 +1,18 @@
+"""hls4ml/QKeras frontend: a QDense stack converted through the AIE backend."""
+
 import os
+import random
 from pathlib import Path
 
+import numpy as np
 import pytest
+
+tf = pytest.importorskip('tensorflow')
+
+SEED = 123
+random.seed(SEED)
+np.random.seed(SEED)
+tf.keras.utils.set_random_seed(SEED)
 
 
 def _require_vitis():
@@ -139,7 +150,8 @@ def test_aie_compile_x86_sim(tmp_path: Path, cfg: dict):
 
     aie_model.compile()
 
-    x = (np.random.random((cfg['batch'], 384)).astype('float32') * 2.0) - 1.0
+    rng = np.random.default_rng(SEED)
+    x = (rng.random((cfg['batch'], 384), dtype=np.float32) * 2.0) - 1.0
 
     y_ref = qmodel.predict(x, verbose=0)
     y_aie = aie_model.predict(x, simulator='x86')

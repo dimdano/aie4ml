@@ -1,3 +1,5 @@
+"""hls4ml/QKeras frontend: one producer feeding several consumers (fan-out routing)."""
+
 import os
 from pathlib import Path
 
@@ -69,6 +71,57 @@ def _build_qkeras_fanout(qkeras, input_shape, bits_in, bits_w, hidden, mode):
     return model
 
 
+def _build_qkeras_fanout3(qkeras, input_shape, bits_in, bits_w, hidden, mode):
+    from keras.layers import Input
+    from keras.models import Model
+    from qkeras import QActivation, QDense, quantized_bits, quantized_relu
+
+    q_in = quantized_bits(bits_in, 2)
+    q_w = quantized_bits(bits_w, 2, alpha=1)
+    q_b = quantized_bits(bits_w, 2, alpha=1)
+
+    x0 = Input(shape=input_shape, name='input_layer')
+    x = QActivation(q_in, name='input_quant')(x0)
+    if mode == 'io':
+        b1 = QDense(
+            hidden, name='qfc1_branch1', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'
+        )(x)
+        b2 = QDense(
+            hidden, name='qfc1_branch2', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'
+        )(x)
+        b3 = QDense(
+            hidden, name='qfc1_branch3', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'
+        )(x)
+    elif mode == 'internal':
+        s = QDense(
+            hidden,
+            name='shared_internal_dense',
+            kernel_quantizer=q_w,
+            bias_quantizer=q_b,
+            bias_initializer='random_uniform',
+        )(x)
+        s = QActivation(quantized_relu(bits_in, 0), name='shared_internal_quant')(s)
+        b1 = QDense(
+            hidden, name='qfc2_branch1', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'
+        )(s)
+        b2 = QDense(
+            hidden, name='qfc2_branch2', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'
+        )(s)
+        b3 = QDense(
+            hidden, name='qfc2_branch3', kernel_quantizer=q_w, bias_quantizer=q_b, bias_initializer='random_uniform'
+        )(s)
+    else:
+        raise ValueError(f'Unknown fanout mode "{mode}"')
+
+    y1 = QActivation(quantized_relu(bits_in, 6), name='output_quant_1')(b1)
+    y2 = QActivation(quantized_relu(bits_in, 6), name='output_quant_2')(b2)
+    y3 = QActivation(quantized_relu(bits_in, 6), name='output_quant_3')(b3)
+
+    model = Model(inputs=x0, outputs=[y1, y2, y3])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
+
 def _make_cfg(hls4ml, model, layer_parallelism):
     cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
     cfg.setdefault('LayerName', {})
@@ -96,6 +149,26 @@ def _make_aie_model(tmp_path, input_shape, cfg_layers, bits_in, bits_w, hidden, 
     cfg = _make_cfg(hls4ml, qmodel, cfg_layers)
     tag = '1d' if len(input_shape) == 1 else f'nd{len(input_shape)}'
     outdir = tmp_path / f'aie_fanout_{mode}_{tag}_h{hidden}_{_par_summary(cfg_layers)}'
+    aie_model = hls4ml.converters.convert_from_keras_model(
+        qmodel,
+        hls_config=cfg,
+        output_dir=str(outdir),
+        backend='aie',
+        project_name='proj_aie',
+        batch_size=BATCH,
+        iterations=ITERATIONS,
+    )
+    return qmodel, aie_model
+
+
+def _make_aie_model_fanout3(tmp_path, input_shape, cfg_layers, bits_in, bits_w, hidden, mode):
+    _np, hls4ml, _keras, qkeras = _imports()
+    qmodel = _build_qkeras_fanout3(
+        qkeras, input_shape=input_shape, bits_in=bits_in, bits_w=bits_w, hidden=hidden, mode=mode
+    )
+    cfg = _make_cfg(hls4ml, qmodel, cfg_layers)
+    tag = '1d' if len(input_shape) == 1 else f'nd{len(input_shape)}'
+    outdir = tmp_path / f'aie_fanout3_{mode}_{tag}_h{hidden}_{_par_summary(cfg_layers)}'
     aie_model = hls4ml.converters.convert_from_keras_model(
         qmodel,
         hls_config=cfg,
@@ -199,6 +272,84 @@ def test_aie_fanout_compile_x86_sim(tmp_path: Path, case_name, nd_case):
     if len(input_shape) == 1:
         np.testing.assert_equal(y_ref_0, y_aie_0)
         np.testing.assert_equal(y_ref_1, y_aie_1)
-    else:
-        np.testing.assert_equal(y_ref_0, y_aie_0)
-        np.testing.assert_equal(y_ref_1, y_aie_1)
+
+
+@pytest.mark.aie_ir
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize(
+    ('case_name', 'input_shape', 'bits_in', 'bits_w', 'hidden', 'cfg_layers'),
+    [
+        (
+            'io_3way',
+            (384,),
+            8,
+            8,
+            256,
+            {
+                'qfc1_branch1': {'cas_num': 2, 'cas_length': 4},
+                'qfc1_branch2': {'cas_num': 2, 'cas_length': 4},
+                'qfc1_branch3': {'cas_num': 2, 'cas_length': 4},
+            },
+        ),
+        (
+            'internal_3way',
+            (384,),
+            8,
+            8,
+            256,
+            {
+                'shared_internal_dense': {'cas_num': 2, 'cas_length': 4},
+                'qfc2_branch1': {'cas_num': 2, 'cas_length': 4},
+                'qfc2_branch2': {'cas_num': 2, 'cas_length': 4},
+                'qfc2_branch3': {'cas_num': 2, 'cas_length': 4},
+            },
+        ),
+    ],
+)
+def test_aie_fanout3_compile_x86_sim(tmp_path: Path, case_name, input_shape, bits_in, bits_w, hidden, cfg_layers):
+    _require_vitis()
+    np, _hls4ml, _keras, _qkeras = _imports()
+
+    mode = 'io' if case_name == 'io_3way' else 'internal'
+    qmodel, aie_model = _make_aie_model_fanout3(
+        tmp_path, input_shape, cfg_layers, bits_in=bits_in, bits_w=bits_w, hidden=hidden, mode=mode
+    )
+    aie_model.compile()
+
+    x = (np.random.random((BATCH, *input_shape)).astype('float32') * 2.0) - 1.0
+    y_ref = qmodel.predict(x, verbose=0)
+    y_aie = aie_model.predict(x, simulator='x86')
+
+    for idx in range(3):
+        y_ref_i = y_ref[idx]
+        y_aie_i = _match_output(y_aie, idx)[:BATCH]
+        assert y_ref_i.shape == y_aie_i.shape
+        np.testing.assert_equal(y_ref_i, y_aie_i)
+
+
+@pytest.mark.aie_ir
+@pytest.mark.requires_vitis
+def test_aie_fanout3_compile_x86_sim_nd_input(tmp_path: Path):
+    _require_vitis()
+    np, _hls4ml, _keras, _qkeras = _imports()
+
+    input_shape = (8, 16, 384)
+    cfg_layers = {
+        'qfc1_branch1': {'cas_num': 2, 'cas_length': 4},
+        'qfc1_branch2': {'cas_num': 2, 'cas_length': 4},
+        'qfc1_branch3': {'cas_num': 2, 'cas_length': 4},
+    }
+    qmodel, aie_model = _make_aie_model_fanout3(
+        tmp_path, input_shape, cfg_layers, bits_in=8, bits_w=8, hidden=256, mode='io'
+    )
+    aie_model.compile()
+
+    x = (np.random.random((BATCH, *input_shape)).astype('float32') * 2.0) - 1.0
+    y_ref = qmodel.predict(x, verbose=0)
+    y_aie = aie_model.predict(x, simulator='x86')
+
+    for idx in range(3):
+        y_ref_i = y_ref[idx]
+        y_aie_i = _match_output(y_aie, idx)[:BATCH]
+        assert y_ref_i.shape == y_aie_i.shape
+        np.testing.assert_equal(y_ref_i, y_aie_i)
