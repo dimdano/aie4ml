@@ -79,6 +79,8 @@ fixable = ["ALL"]
 unfixable = []
 
 [tool.pytest.ini_options]
+pythonpath = ["tests"]
+addopts = ["--import-mode=importlib"]
 markers = [
   "aie_ir: tests that exercise the hls4ml AIE backend",
   "requires_vitis: requires AMD Vitis installation",

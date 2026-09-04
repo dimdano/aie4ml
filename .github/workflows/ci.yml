@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -e . pytest onnx onnxruntime
+      - name: pre-commit
+        uses: pre-commit/action@v3.0.1
+        with:
+          extra_args: --all-files
+      - name: test
+        run: pytest tests -q -p no:randomly
