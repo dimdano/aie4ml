@@ -170,6 +170,7 @@ class AIEProjectEmitter:
         context = {
             'project_name': ctx.project_config.project_name,
             'platform': ctx.device.platform,
+            'aie_compiler_target': ctx.device.aie_compiler_target,
             'stamp': ctx.project_config.stamp,
             'is_hardware': pl_plan is not None,
             'pl_plan': pl_plan,

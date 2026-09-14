@@ -11,10 +11,12 @@ class PortBinding:
 
     `group` is the ADF port array name (for example `in1` or `out2`).
     `count` is the number of physical ports in that group.
+    `kind` is the ADF transport kind; existing implementations use buffers.
     """
 
     group: str
     count: int
+    kind: str = 'buffer'
 
 
 @dataclass(frozen=True)

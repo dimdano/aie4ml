@@ -15,10 +15,9 @@ from ...utils.precision import resolve_exact_storage_dtype
 # Float formats: 'bfloat16', 'float32', 'fp8_e4m3'.
 MICROTILE_OPTIONS: Dict[str, Dict[Tuple[str, str], List[Tuple[int, int, int]]]] = {
     'AIE': {
-        ('int8', 'int8'): [(2, 8, 8), (2, 16, 8), (4, 8, 4), (4, 8, 8), (4, 16, 4), (4, 16, 8), (8, 8, 4)],
-        ('int16', 'int8'): [(4, 4, 4), (4, 4, 8), (4, 8, 4), (8, 4, 4)],
-        ('int8', 'int16'): [(4, 4, 8), (4, 4, 4), (8, 8, 1)],
-        ('int16', 'int16'): [(4, 4, 8), (2, 4, 8), (4, 2, 8), (4, 4, 4), (8, 8, 1)],
+        ('int8', 'int8'): [(2, 8, 8), (4, 8, 4), (1, 16, 8)],
+        ('int16', 'int8'): [(4, 4, 4)],
+        ('int8', 'int16'): [(4, 4, 8)],
         ('float32', 'float32'): [(2, 4, 4)],
     },
     'AIE-ML': {
@@ -42,27 +41,32 @@ MICROTILE_OPTIONS: Dict[str, Dict[Tuple[str, str], List[Tuple[int, int, int]]]] 
 
 
 def select_generation_key(generation: str) -> str:
-    norm = (generation or '').upper()
-    for key in sorted(MICROTILE_OPTIONS.keys(), key=len, reverse=True):
-        if key in norm:
-            return key
-    return 'AIE'
+    norm = (generation or '').strip().upper()
+    if norm not in MICROTILE_OPTIONS:
+        raise ValueError(f'Unknown AIE generation {generation!r}; expected one of {", ".join(MICROTILE_OPTIONS)}.')
+    return norm
 
 
-_SUPPORTED_INT_WIDTH_COMBOS = frozenset({(8, 8), (16, 8), (16, 16)})
+_SUPPORTED_INT_WIDTH_COMBOS = {
+    'AIE': frozenset({(8, 8), (16, 8), (8, 16)}),
+    'AIE-ML': frozenset({(8, 8), (16, 8), (16, 16)}),
+    'AIE-MLV2': frozenset({(8, 8), (16, 8), (16, 16)}),
+}
 
 
 def bitwidths_supported(node, device) -> bool:
     """Whether this device can run the node's lhs/rhs storage widths."""
-    if device.generation not in ('AIE-ML', 'AIE-MLV2'):
-        return False
+    generation = select_generation_key(device.generation)
     lhs = input_tensor_for_role(node, 'lhs')
     rhs = input_tensor_for_role(node, 'rhs')
     if isinstance(lhs.precision, FloatIntent):
-        return True
+        lhs_format = lhs.precision.format.value
+        rhs_format = getattr(getattr(rhs, 'precision', None), 'format', None)
+        rhs_format = getattr(rhs_format, 'value', rhs_format)
+        return (lhs_format, rhs_format) in MICROTILE_OPTIONS[generation]
     lhs_p = resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name)
     rhs_p = resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name)
-    return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS
+    return (lhs_p.width, rhs_p.width) in _SUPPORTED_INT_WIDTH_COMBOS[generation]
 
 
 # Policy, not a law: the contract used when nothing asks for one. A global partition

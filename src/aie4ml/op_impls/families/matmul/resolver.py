@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ....aie_types import AIEDataType, FloatIntent, legality_format
+from ....aie_types import FLOAT_FORMATS, AIEDataType, FloatIntent, legality_format
 from ....ir import input_role, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
@@ -106,7 +106,7 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConf
     return MatmulMicrotileConfig(microtile_m=default_m, microtile_k=default_k, microtile_n=default_n)
 
 
-def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
+def _resolve_numeric(node, device) -> tuple[Dict[str, AIEDataType], str]:
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     rhs_tensor = input_tensor_for_role(node, 'rhs')
     out_tensor = node.outputs[0]
@@ -122,30 +122,21 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
     if isinstance(lhs_tensor.precision, FloatIntent):
         if not all(isinstance(t.precision, FloatIntent) for t in (lhs_tensor, rhs_tensor, out_tensor)):
             raise ValueError(f'{node.name}: float {node.op_type} requires lhs/rhs/output to share float precision.')
-        resolved['acc'] = AIEDataType(format='accfloat', frac=0)
-        return resolved
-
-    lhs_intent = to_quant_intent(lhs_tensor.precision)
-    rhs_intent = to_quant_intent(rhs_tensor.precision)
+        return resolved, 'accfloat'
 
     if int(resolved['lhs'].width) <= 8 and int(resolved['rhs'].width) > 8:
         raise RuntimeError(
-            f'{node.name}: unsupported int8 x int16 precision mix for AIE implementations; '
-            'no implementation variant available.'
+            f'{node.name}: unsupported int8 x int16 precision mix; its accumulator output shift '
+            'may be negative, which the current kernels do not support.'
         )
 
     acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'], None)
-    acc_width = {'acc32': 32, 'acc48': 48, 'acc64': 64}[acc_tag]
-    resolved['acc'] = AIEDataType(
-        format=f'int{acc_width}',
-        frac=int(lhs_intent.frac + rhs_intent.frac),
-    )
-    return resolved
+    return resolved, acc_tag
 
 
 def _resolve_bias_dtype(node, precision: Dict[str, AIEDataType]) -> AIEDataType:
     """Resolve the bias accumulator dtype for dense-family ops."""
-    is_float = precision['acc'].format == 'accfloat'
+    is_float = precision['lhs'].format in FLOAT_FORMATS
     if is_float:
         return AIEDataType(format='float32', frac=0)
     bias_tensor = next((t for t in node.inputs if t.is_parameter and input_role(node, t.name) == 'bias'), None)

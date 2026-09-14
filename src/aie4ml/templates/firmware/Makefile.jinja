@@ -25,9 +25,18 @@ ifeq ($(strip $(VITIS_HOME)),)
   $(error Unable to auto-detect Vitis installation. Ensure 'vitis' is on PATH or set VITIS_HOME manually.)
 endif
 
+{% if aie_compiler_target == 'part' %}
+AIE_PART      ?= {{ platform }}
+AIE_TARGET    := --part=$(AIE_PART)
+{% else %}
 PLATFORM_USE  ?= {{ platform }}
 PLATFORM      ?= $(VITIS_HOME)/base_platforms/$(PLATFORM_USE)/$(PLATFORM_USE).xpfm
+AIE_TARGET    := --platform=$(PLATFORM)
+{% endif %}
 {% if is_hardware %}
+{% if aie_compiler_target == 'part' %}
+$(error Hardware system linking requires a Vitis .xpfm platform; {{ platform }} is a raw AIE part target.)
+{% endif %}
 SDK_VER          := 2025.2
 ROOTFS           ?= ${PLATFORM_REPO_PATHS}/host/versal/xilinx-versal-common-v$(SDK_VER)/rootfs.ext4
 IMAGE            ?= ${PLATFORM_REPO_PATHS}/host/versal/xilinx-versal-common-v$(SDK_VER)/Image
@@ -46,7 +55,7 @@ MY_SOURCES    := $(APP_NAME).cpp $(KERNEL_SOURCES)
 
 AIE_FLAGS_BASE := $(DSPLIB_OPTS) \
   $(addprefix --include=,$(KERNEL_INC_DIRS)) --include=$(WTS_DIR) --include=$(CFG_DIR) \
-  --platform=$(PLATFORM) $(APP_NAME).cpp
+  $(AIE_TARGET) $(APP_NAME).cpp
 
 AIE_FLAGS_HW   := $(AIE_FLAGS_BASE) \
   --aie.workdir=$(AIE_WORKDIR) --aie.output-archive=$(LIBADF)

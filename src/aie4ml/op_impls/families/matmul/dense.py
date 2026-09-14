@@ -13,7 +13,6 @@ from ...registry import register_variant
 from ...utils import ParallelismConfig, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
-    infer_accumulator_tag,
     resolve_accumulator_output_shift,
 )
 from .common import (
@@ -89,7 +88,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, _, _ = parse_directives(directives)
-        precision = _resolve_numeric(node, device)
+        precision, accumulator_tag = _resolve_numeric(node, device)
         precision['bias'] = _resolve_bias_dtype(node, precision)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
         tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
@@ -118,7 +117,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             io_views=io_views,
             io_route=io_route,
             shift=shift,
-            accumulator_tag=infer_accumulator_tag(device, None, None, precision['acc']),
+            accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
             flags=DenseFlags(
                 use_relu=use_relu,
