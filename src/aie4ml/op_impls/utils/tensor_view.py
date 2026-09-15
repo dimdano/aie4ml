@@ -116,7 +116,7 @@ def ordered_view_shape(view: TensorView, kind: str) -> list[int]:
     return [int(shape[index]) for index in view.buffer_order]
 
 
-def _staging_tile_shape(desc: Mapping[str, Any]) -> tuple[int, ...]:
+def staging_tile_shape(desc: Mapping[str, Any]) -> tuple[int, ...]:
     if 'tiling_dimension' not in desc:
         raise ValueError('staging descriptor is missing tiling_dimension.')
     shape = [int(x) for x in desc['tiling_dimension']]
@@ -417,7 +417,7 @@ def build_tensor_view_from_staging(node, tensor, direction: str, desc: Mapping[s
     perm = None if layout.get('perm') is None else tuple(int(x) for x in layout['perm'])
     # BUFFER order is LOGICAL reversed; undo it, then relabel LOGICAL -> VIEW.
     full = _logical_to_view(tuple(reversed(desc['buffer_dimension'])), perm)
-    tile = _logical_to_view(tuple(reversed(_staging_tile_shape(desc))), perm)
+    tile = _logical_to_view(tuple(reversed(staging_tile_shape(desc))), perm)
 
     return TensorView(
         logical=logical,

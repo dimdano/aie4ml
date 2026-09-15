@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from aie4ml.device_catalog import resolve_device
-from aie4ml.frontends.onnx import lower_onnx_model
+from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
 from aie4ml.op_impls.common_types import PortBinding, to_plain
 from aie4ml.op_impls.families.matmul.common import select_generation_key
 from aie4ml.op_impls.utils.precision import infer_accumulator_tag
@@ -25,7 +25,11 @@ def _qparams(prefix: str, elem_type: int) -> list:
     ]
 
 
-def _dense_model(lhs_type: int = TensorProto.INT8, rhs_type: int = TensorProto.INT8):
+def _dense_model(
+    lhs_type: int = TensorProto.INT8,
+    rhs_type: int = TensorProto.INT8,
+    out_features: int = 8,
+):
     np_type = {TensorProto.INT8: np.int8, TensorProto.INT16: np.int16}
     nodes = [
         helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),
@@ -38,12 +42,12 @@ def _dense_model(lhs_type: int = TensorProto.INT8, rhs_type: int = TensorProto.I
         'aie1_dense',
         nodes=nodes,
         inputs=[('x_q', lhs_type, [8, 16])],
-        outputs=[('y', TensorProto.FLOAT, [8, 8])],
+        outputs=[('y', TensorProto.FLOAT, [8, out_features])],
         initializers=[
             *_qparams('x', lhs_type),
             *_qparams('w', rhs_type),
             *_qparams('y', TensorProto.INT8),
-            numpy_helper.from_array(np.ones((16, 8), dtype=np_type[rhs_type]), 'w_q'),
+            numpy_helper.from_array(np.ones((16, out_features), dtype=np_type[rhs_type]), 'w_q'),
         ],
     )
 
@@ -64,11 +68,95 @@ def _resolve_dense(model, tmp_path, *, part=AIE1_PART, directives=None):
     return ctx, ctx.ir.execution.get('dense_aie').config
 
 
+def _run_pipeline(model, tmp_path, *, part=AIE1_PART, directives=None, project='aie1_dense'):
+    aie_model = from_onnx(
+        model,
+        {
+            'Part': part,
+            'AIEConfig': {'BatchSize': 8, 'Iterations': 1},
+            'LayerDirectives': dict(directives or {}),
+        },
+        output_dir=tmp_path / project,
+        project_name=project,
+    )
+    aie_model.run_pipeline()
+    return aie_model
+
+
+def _fanout_dense_model():
+    nodes = [
+        helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),
+        helper.make_node('DequantizeLinear', ['w0_q', 'w0_scale', 'w0_zp'], ['w0'], name='w0_dq'),
+        helper.make_node('MatMul', ['x', 'w0'], ['root_mm'], name='root'),
+        helper.make_node('QuantizeLinear', ['root_mm', 'root_scale', 'root_zp'], ['root_q'], name='root_q'),
+        helper.make_node('DequantizeLinear', ['root_q', 'root_scale', 'root_zp'], ['root_out'], name='root_dq'),
+        helper.make_node('DequantizeLinear', ['w1_q', 'w1_scale', 'w1_zp'], ['w1'], name='w1_dq'),
+        helper.make_node('MatMul', ['root_out', 'w1'], ['left_mm'], name='left'),
+        helper.make_node('QuantizeLinear', ['left_mm', 'left_scale', 'left_zp'], ['left_q'], name='left_q'),
+        helper.make_node('DequantizeLinear', ['left_q', 'left_scale', 'left_zp'], ['left_y'], name='left_dq'),
+        helper.make_node('DequantizeLinear', ['w2_q', 'w2_scale', 'w2_zp'], ['w2'], name='w2_dq'),
+        helper.make_node('MatMul', ['root_out', 'w2'], ['right_mm'], name='right'),
+        helper.make_node('QuantizeLinear', ['right_mm', 'right_scale', 'right_zp'], ['right_q'], name='right_q'),
+        helper.make_node('DequantizeLinear', ['right_q', 'right_scale', 'right_zp'], ['right_y'], name='right_dq'),
+    ]
+    initializers = [
+        *_qparams('x', TensorProto.INT8),
+        *_qparams('w0', TensorProto.INT8),
+        *_qparams('root', TensorProto.INT8),
+        *_qparams('w1', TensorProto.INT8),
+        *_qparams('left', TensorProto.INT8),
+        *_qparams('w2', TensorProto.INT8),
+        *_qparams('right', TensorProto.INT8),
+        numpy_helper.from_array(np.ones((16, 16), dtype=np.int8), 'w0_q'),
+        numpy_helper.from_array(np.ones((16, 16), dtype=np.int8), 'w1_q'),
+        numpy_helper.from_array(np.ones((16, 16), dtype=np.int8), 'w2_q'),
+    ]
+    return make_model(
+        'aie1_dense_fanout',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [8, 16])],
+        outputs=[('left_y', TensorProto.FLOAT, [8, 16]), ('right_y', TensorProto.FLOAT, [8, 16])],
+        initializers=initializers,
+    )
+
+
+def _dense_stack_model():
+    nodes = [
+        helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),
+        helper.make_node('DequantizeLinear', ['w0_q', 'w0_scale', 'w0_zp'], ['w0'], name='w0_dq'),
+        helper.make_node('MatMul', ['x', 'w0'], ['hidden'], name='dense0'),
+        helper.make_node('QuantizeLinear', ['hidden', 'hidden_scale', 'hidden_zp'], ['hidden_q'], name='hidden_q'),
+        helper.make_node(
+            'DequantizeLinear', ['hidden_q', 'hidden_scale', 'hidden_zp'], ['hidden_dq'], name='hidden_dq'
+        ),
+        helper.make_node('DequantizeLinear', ['w1_q', 'w1_scale', 'w1_zp'], ['w1'], name='w1_dq'),
+        helper.make_node('MatMul', ['hidden_dq', 'w1'], ['output'], name='dense1'),
+        helper.make_node('QuantizeLinear', ['output', 'y_scale', 'y_zp'], ['y_q'], name='y_q'),
+        helper.make_node('DequantizeLinear', ['y_q', 'y_scale', 'y_zp'], ['y'], name='y_dq'),
+    ]
+    return make_model(
+        'aie1_dense_stack',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [8, 128])],
+        outputs=[('y', TensorProto.FLOAT, [8, 64])],
+        initializers=[
+            *_qparams('x', TensorProto.INT8),
+            *_qparams('w0', TensorProto.INT8),
+            *_qparams('hidden', TensorProto.INT8),
+            *_qparams('w1', TensorProto.INT8),
+            *_qparams('y', TensorProto.INT8),
+            numpy_helper.from_array(np.ones((128, 256), dtype=np.int8), 'w0_q'),
+            numpy_helper.from_array(np.ones((256, 64), dtype=np.int8), 'w1_q'),
+        ],
+    )
+
+
 def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     device, _ = resolve_device(AIE1_PART, {})
 
     assert device.generation == 'AIE'
     assert device.columns == 59
+    assert device.column_start == 7
     assert device.rows == 8
     assert device.has_memtile is False
     assert device.bank_count == 4
@@ -102,7 +190,8 @@ def test_aie1_onnx_int8_dense_prefers_direct_compatible_microtile(tmp_path):
 
     got = (config.microtiling.microtile_m, config.microtiling.microtile_k, config.microtiling.microtile_n)
     assert got == (2, 8, 8)
-    assert config.accumulator_tag == 'acc32'
+    assert config.accumulator_tag == 'acc48'
+    assert config.alternating_horizontal is True
 
 
 @pytest.mark.parametrize('microtile', [(4, 8, 4), (1, 16, 8)])
@@ -115,7 +204,7 @@ def test_aie1_onnx_int8_dense_accepts_other_native_microtiles(tmp_path, microtil
     )
 
     assert (config.microtiling.microtile_m, config.microtiling.microtile_k, config.microtiling.microtile_n) == microtile
-    assert config.accumulator_tag == 'acc32'
+    assert config.accumulator_tag == 'acc48'
 
 
 def test_aie1_onnx_int16_int8_dense_uses_compile_proven_shape_and_acc48(tmp_path):
@@ -160,6 +249,7 @@ def test_existing_ml_generation_default_resolution_is_unchanged(tmp_path, part, 
     _ctx, config = _resolve_dense(_dense_model(), tmp_path, part=part)
     got = (config.microtiling.microtile_m, config.microtiling.microtile_k, config.microtiling.microtile_n)
     assert got == expected_microtile
+    assert config.alternating_horizontal is False
 
 
 def test_port_binding_default_is_an_explicit_buffer_in_serialization():
@@ -167,3 +257,154 @@ def test_port_binding_default_is_an_explicit_buffer_in_serialization():
 
     assert implicit == PortBinding(group='in1', count=2, kind='buffer')
     assert to_plain(implicit) == {'group': 'in1', 'count': 2, 'kind': 'buffer'}
+
+
+def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):
+    aie_model = _run_pipeline(_dense_model(out_features=16), tmp_path)
+    plan = aie_model.context.ir.physical.plan
+
+    assert plan['buffers'] == []
+    assert plan['graph_input_count'] == 1
+    assert plan['graph_output_count'] == 1
+    assert {(edge['source'], edge['target']) for edge in plan['direct_edges']} == {
+        ('ifm[0]', 'dense_aie.in1[0]'),
+        ('dense_aie.out1[0]', 'ofm[0]'),
+    }
+    assert [(port['direction'], port['tensor'], port['port']) for port in plan['io_ports']] == [
+        ('input', 'x_q', 0),
+        ('output', 'y', 0),
+    ]
+    assert [item['endpoint'] for item in plan['kernel_write_accesses']] == ['dense_aie.kk[0].in[0]']
+    assert [item['endpoint'] for item in plan['kernel_read_accesses']] == ['dense_aie.kk[0].out[0]']
+    for access in (plan['kernel_write_accesses'][0], plan['kernel_read_accesses'][0]):
+        descriptor = access['descriptor']
+        assert descriptor['buffer_dimension'] == [16, 2, 4]
+        assert descriptor['tiling_dimension'] == [8, 1, 1]
+        assert descriptor['tile_traversal'] == [
+            {'dimension': 1, 'stride': 1, 'wrap': 2},
+            {'dimension': 0, 'stride': 8, 'wrap': 2},
+            {'dimension': 2, 'stride': 1, 'wrap': 4},
+        ]
+
+    AIEProjectEmitter().emit(aie_model.context)
+    graph_plan = (aie_model.context.project_config.output_dir / 'src' / 'graph_plan.h').read_text()
+    assert 'write_access(self.dense_aie.kk[0].in[0])' in graph_plan
+    assert 'read_access(self.dense_aie.kk[0].out[0])' in graph_plan
+    assert 'connect<>(self.ifm[0], self.dense_aie.in1[0]);' in graph_plan
+    assert 'connect<>(self.dense_aie.out1[0], self.ofm[0]);' in graph_plan
+
+    parameters = (aie_model.context.project_config.output_dir / 'src' / 'parameters.h').read_text()
+    assert 'static constexpr bool ALTERNATING_HORIZONTAL = true;' in parameters
+
+
+def test_aie1_outer_parallel_dense_uses_direct_boundary_ports(tmp_path):
+    aie_model = _run_pipeline(
+        _dense_model(out_features=16),
+        tmp_path,
+        directives={'dense': {'parallelism': {'contract': 'outer', 'cas_num': 2, 'cas_length': 1}}},
+    )
+    plan = aie_model.context.ir.physical.plan
+
+    assert plan['buffers'] == []
+    assert plan['graph_input_count'] == 2
+    assert plan['graph_output_count'] == 2
+    assert [item['endpoint'] for item in plan['kernel_write_accesses']] == [
+        'dense_aie.kk[0].in[0]',
+        'dense_aie.kk[1].in[0]',
+    ]
+    assert [item['endpoint'] for item in plan['kernel_read_accesses']] == [
+        'dense_aie.kk[0].out[0]',
+        'dense_aie.kk[1].out[0]',
+    ]
+
+
+def test_aie1_dense_cascade_ports_follow_logical_snake_order(tmp_path):
+    aie_model = _run_pipeline(
+        _dense_model(out_features=32),
+        tmp_path,
+        directives={'dense': {'parallelism': {'contract': 'inner', 'cas_num': 2, 'cas_length': 2}}},
+        project='aie1_cascade',
+    )
+    plan = aie_model.context.ir.physical.plan
+
+    assert [item['endpoint'] for item in plan['kernel_write_accesses']] == [
+        'dense_aie.kk[0].in[0]',
+        'dense_aie.kk[2].in[0]',
+        'dense_aie.kk[1].in[0]',
+        'dense_aie.kk[3].in[0]',
+    ]
+    assert [item['endpoint'] for item in plan['kernel_read_accesses']] == [
+        'dense_aie.kk[1].out[0]',
+        'dense_aie.kk[3].out[0]',
+    ]
+
+    AIEProjectEmitter().emit(aie_model.context)
+    graph = (
+        aie_model.context.project_config.output_dir
+        / 'src'
+        / 'kernels'
+        / 'dense_bias_relu'
+        / 'dense_bias_relu_graph.h'
+    ).read_text()
+    assert 'reverse ? CAS_LENGTH - 1 - pos : pos' in graph
+    assert 'const int inputMemoryCol = reverse ? tileCol + 1 : tileCol - 1;' in graph
+
+
+def test_aie1_dense_stack_inherits_direct_producer_partition(tmp_path):
+    aie_model = _run_pipeline(_dense_stack_model(), tmp_path, project='aie1_dense_stack')
+    first = aie_model.context.ir.execution.get('dense0_aie').config
+    second = aie_model.context.ir.execution.get('dense1_aie').config
+
+    assert (first.parallelism.cas_num, first.parallelism.cas_length) == (4, 1)
+    assert (second.parallelism.cas_num, second.parallelism.cas_length) == (1, 4)
+    assert first.microtiling == second.microtiling
+
+    internal = [
+        edge
+        for edge in aie_model.context.ir.physical.plan['direct_edges']
+        if edge['source'].startswith('dense0_aie.') and edge['target'].startswith('dense1_aie.')
+    ]
+    assert [(edge['source'], edge['target']) for edge in internal] == [
+        (f'dense0_aie.out1[{port}]', f'dense1_aie.in1[{port}]') for port in range(4)
+    ]
+
+
+def test_aie1_direct_buffer_fanout_keeps_each_compatible_leg(tmp_path):
+    aie_model = _run_pipeline(_fanout_dense_model(), tmp_path, project='aie1_fanout')
+    plan = aie_model.context.ir.physical.plan
+    edges = {(edge['source'], edge['target']) for edge in plan['direct_edges']}
+
+    assert plan['buffers'] == []
+    assert ('root_aie.out1[0]', 'left_aie.in1[0]') in edges
+    assert ('root_aie.out1[0]', 'right_aie.in1[0]') in edges
+    assert sum(edge['source'] == 'root_aie.out1[0]' for edge in plan['direct_edges']) == 2
+
+
+def test_aie1_staging_mismatch_requires_an_explicit_relayout(tmp_path):
+    with pytest.raises(ValueError, match=r'no supported microtiling accepts producer output microtile'):
+        _run_pipeline(
+            _fanout_dense_model(),
+            tmp_path,
+            directives={
+                'root': {'microtiling': {'microtile_m': 4, 'microtile_k': 8, 'microtile_n': 4}},
+            },
+            project='aie1_mismatch',
+        )
+
+
+def test_memtile_device_keeps_default_boundaries_and_publishes_io_ports(tmp_path):
+    aie_model = _run_pipeline(
+        _dense_model(),
+        tmp_path,
+        part='xilinx_vek280_base_202520_1',
+        project='aieml_dense',
+    )
+    plan = aie_model.context.ir.physical.plan
+
+    assert len(plan['buffers']) == 2
+    assert [(port['direction'], port['port']) for port in plan['io_ports']] == [('input', 0), ('output', 0)]
+
+
+def test_aie1_padded_direct_output_requires_relayout_adapter(tmp_path):
+    with pytest.raises(NotImplementedError, match=r'direct graph output requires 128.*exposes 64.*adapter'):
+        _run_pipeline(_dense_model(), tmp_path, project='aie1_padded_output')

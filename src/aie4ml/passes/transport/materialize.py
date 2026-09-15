@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+from math import prod
 from typing import Any, Dict, List
 
 from ...aie_types import AIEDataType
 from ...ir import get_backend_context, input_role
+from ...op_impls.utils import staging_tile_shape
 from ..base import AIEPass
 from ..utils import sanitize_identifier
 from .boundary import (
@@ -58,6 +60,9 @@ class _MemoryPlanMaterializer:
 
         self.buffers = []
         self.direct_edges = []
+        self.io_ports = []
+        self.kernel_read_accesses = []
+        self.kernel_write_accesses = []
         self.layer_indices = {}
         self._next_graph_output_port = 0
         self._max_graph_input_port = -1
@@ -82,6 +87,9 @@ class _MemoryPlanMaterializer:
     def materialize(self, state):
         self.buffers = []
         self.direct_edges = []
+        self.io_ports = []
+        self.kernel_read_accesses = []
+        self.kernel_write_accesses = []
         self.layer_indices = dict(state['layer_indices'])
         self._next_graph_output_port = 0
         self._max_graph_input_port = -1
@@ -93,6 +101,9 @@ class _MemoryPlanMaterializer:
         return {
             'buffers': self.buffers,
             'direct_edges': self.direct_edges,
+            'io_ports': self.io_ports,
+            'kernel_read_accesses': self.kernel_read_accesses,
+            'kernel_write_accesses': self.kernel_write_accesses,
             'graph_input_count': self._max_graph_input_port + 1,
             'graph_output_count': self._next_graph_output_port,
         }
@@ -114,15 +125,20 @@ class _MemoryPlanMaterializer:
         c_ports = [int(x) for x in entry.unit.consumer_ports]
         realization = self._route(entry)
         if realization == 'direct':
-            if (
-                entry.unit.count != 1
-                or entry.producer.node is None
-                or entry.graph_output
-                or len(entry.consumers) != 1
-                or len(p_ports) != len(c_ports)
-            ):
+            if entry.unit.count != 1:
                 raise RuntimeError(f'{entry.logical_tensor}: direct realization invariant violated.')
-            self._emit_direct(entry, p_ports, c_ports)
+            if entry.producer.node is None:
+                if entry.graph_input is None or len(entry.consumers) != 1 or len(p_ports) != len(c_ports):
+                    raise RuntimeError(f'{entry.logical_tensor}: direct graph-input invariant violated.')
+                self._emit_direct_graph_input(entry, p_ports, c_ports)
+            elif entry.graph_output:
+                if entry.consumers or c_ports:
+                    raise RuntimeError(f'{entry.logical_tensor}: direct graph-output invariant violated.')
+                self._emit_direct_graph_output(entry, p_ports)
+            elif len(entry.consumers) == 1 and len(p_ports) == len(c_ports):
+                self._emit_direct_internal(entry, p_ports, c_ports)
+            else:
+                raise RuntimeError(f'{entry.logical_tensor}: direct internal-edge invariant violated.')
             return
         if realization != 'memtile':
             raise RuntimeError(f'{entry.logical_tensor}: unsupported transport realization {realization!r}.')
@@ -142,7 +158,7 @@ class _MemoryPlanMaterializer:
     # Direct
     # ------------------------------------------------------------------
 
-    def _emit_direct(self, entry, p_ports, c_ports):
+    def _emit_direct_internal(self, entry, p_ports, c_ports):
         p = entry.producer
         c = entry.single_consumer()
 
@@ -152,6 +168,102 @@ class _MemoryPlanMaterializer:
                     'source': f'{sanitize_identifier(p.node.name)}.{p.group}[{int(p_port)}]',
                     'target': f'{sanitize_identifier(c.node.name)}.{c.group}[{int(c_port)}]',
                     'tensor': entry.logical_tensor,
+                }
+            )
+
+    def _emit_direct_graph_input(self, entry, graph_ports, consumer_ports):
+        consumer = entry.single_consumer()
+        consumer_id = sanitize_identifier(consumer.node.name)
+        inst = self._kernel_inst(consumer.node)
+        dtype = self._graph_input_dtype(entry).to_dict()
+
+        for graph_port, consumer_port in zip(graph_ports, consumer_ports):
+            endpoint = f'{consumer_id}.{consumer.group}[{int(consumer_port)}]'
+            staging = graph_input_writer_port_descriptor(entry, int(graph_port))
+            descriptor = graph_input_port_descriptor(entry, int(graph_port))
+            self._localize_direct_descriptor(descriptor)
+            if not self.device.has_memtile:
+                descriptor = _logical_stream_microtiled_2d_descriptor(descriptor)
+
+            self.direct_edges.append(
+                {
+                    'source': f'ifm[{int(graph_port)}]',
+                    'target': endpoint,
+                    'tensor': entry.logical_tensor,
+                }
+            )
+            # Vitis accepts access constraints on hierarchical ports but does not apply their buffer reorder;
+            # bind read/write access to the concrete kk[...].in/out[...] port instead.
+            access_endpoints = inst.variant.boundary_input_access_endpoints(inst.config, int(consumer_port))
+            if not access_endpoints:
+                raise RuntimeError(f'{entry.logical_tensor}: direct graph input has no concrete kernel endpoint.')
+            self.kernel_write_accesses.extend(
+                {'endpoint': f'{consumer_id}.{access_endpoint}', 'descriptor': descriptor}
+                for access_endpoint in access_endpoints
+            )
+            self.io_ports.append(
+                {
+                    'direction': 'input',
+                    'port': int(graph_port),
+                    'tensor': entry.logical_tensor,
+                    'endpoint': endpoint,
+                    'descriptor': descriptor,
+                    'staging': staging,
+                    'dtype': dtype,
+                }
+            )
+            self._max_graph_input_port = max(self._max_graph_input_port, int(graph_port))
+
+    def _emit_direct_graph_output(self, entry, producer_ports):
+        producer = entry.producer
+        producer_id = sanitize_identifier(producer.node.name)
+        inst = self._kernel_inst(producer.node)
+        dtype = self._graph_output_dtype(entry).to_dict()
+
+        for producer_port in producer_ports:
+            endpoint = f'{producer_id}.{producer.group}[{int(producer_port)}]'
+            base = inst.variant.describe_output_staging(
+                producer.node, inst.config, producer.tensor, int(producer_port), None
+            )
+            staging = _host_visible_output_staging(base)
+            descriptor = dict(base)
+            self._localize_direct_descriptor(descriptor)
+            elements = int(prod(staging_tile_shape(descriptor)))
+            logical_elements = int(prod(int(value) for value in staging['io_tiling_dimension']))
+            if logical_elements != elements:
+                raise NotImplementedError(
+                    f'{entry.logical_tensor}: direct graph output requires {elements} kernel-buffer elements '
+                    f'but exposes {logical_elements} logical elements; an output relayout adapter is required.'
+                )
+            if not self.device.has_memtile:
+                descriptor = _logical_stream_microtiled_2d_descriptor(descriptor)
+            graph_port = self._next_graph_output_port
+            self._next_graph_output_port += 1
+
+            self.direct_edges.append(
+                {
+                    'source': endpoint,
+                    'target': f'ofm[{graph_port}]',
+                    'tensor': entry.logical_tensor,
+                }
+            )
+            access_endpoints = inst.variant.boundary_output_access_endpoints(inst.config, int(producer_port))
+            if len(access_endpoints) != 1:
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: direct graph output requires exactly one concrete kernel endpoint.'
+                )
+            self.kernel_read_accesses.append(
+                {'endpoint': f'{producer_id}.{access_endpoints[0]}', 'descriptor': descriptor}
+            )
+            self.io_ports.append(
+                {
+                    'direction': 'output',
+                    'port': int(graph_port),
+                    'tensor': entry.logical_tensor,
+                    'endpoint': endpoint,
+                    'descriptor': descriptor,
+                    'staging': staging,
+                    'dtype': dtype,
                 }
             )
 
@@ -233,6 +345,18 @@ class _MemoryPlanMaterializer:
                     'dtype': self._graph_input_dtype(entry).to_dict() if entry.producer.node is None else None,
                 }
             )
+            if entry.producer.node is None:
+                self.io_ports.append(
+                    {
+                        'direction': 'input',
+                        'port': int(p),
+                        'tensor': entry.logical_tensor,
+                        'endpoint': f'{name}.in[{slot}]',
+                        'descriptor': desc,
+                        'staging': buffer['writers'][-1]['staging'],
+                        'dtype': buffer['writers'][-1]['dtype'],
+                    }
+                )
 
         if entry.consumers:
             consumer = entry.single_consumer()
@@ -284,6 +408,17 @@ class _MemoryPlanMaterializer:
                         'descriptor': desc,
                         'staging': self._graph_output_staging(entry, int(local_port)),
                         'dtype': self._graph_output_dtype(entry).to_dict(),
+                    }
+                )
+                self.io_ports.append(
+                    {
+                        'direction': 'output',
+                        'port': int(graph_port),
+                        'tensor': entry.logical_tensor,
+                        'endpoint': f'{name}.out[{reader_base + slot}]',
+                        'descriptor': desc,
+                        'staging': buffer['readers'][-1]['staging'],
+                        'dtype': buffer['readers'][-1]['dtype'],
                     }
                 )
 
@@ -423,6 +558,12 @@ class _MemoryPlanMaterializer:
         stem = f'buffer_{base}{suffix}'
         return stem if idx == 1 else f'{stem}_{idx}'
 
+    @staticmethod
+    def _localize_direct_descriptor(descriptor: Dict[str, Any]) -> None:
+        dimensions = staging_tile_shape(descriptor)
+        offset = tuple(int(value) for value in descriptor['offset'])
+        localize_descriptor(descriptor, offset, dimensions)
+
 
 def _legalize_collected_entries(ctx, state):
     ctx.ir.physical.plan = {'_memory_plan_state': state}
@@ -479,4 +620,43 @@ def _host_visible_output_staging(base: Dict[str, Any]) -> Dict[str, Any]:
     desc['buffer_dimension'] = list(io_boundary)
     desc['offset'] = host_offsets
     desc['tiling_dimension'] = list(io_tile)
+    return desc
+
+
+def _logical_stream_microtiled_2d_descriptor(base: Dict[str, Any]) -> Dict[str, Any]:
+    """Access a packed 2-D microtile buffer in logical row-major stream order."""
+
+    dimensions = [int(value) for value in base['buffer_dimension']]
+    tile = [int(value) for value in base['tiling_dimension']]
+    if len(dimensions) != 2 or len(tile) != 2:
+        raise NotImplementedError('AIE1 direct boundary DMA currently requires a 2-D kernel buffer.')
+
+    inner = int(base['inner_dimension'])
+    outer = int(base['outer_dimension'])
+    micro_n = tile[inner]
+    micro_m = tile[outer]
+    if micro_m == 1:
+        return base
+    if inner != 0 or outer != 1 or any(int(value) != 0 for value in base['offset']):
+        raise NotImplementedError('AIE1 direct boundary DMA requires a local, inner-contiguous 2-D buffer.')
+
+    cols, rows = dimensions
+    if cols % micro_n or rows % micro_m:
+        raise ValueError(
+            f'AIE1 direct boundary shape {(rows, cols)} is not divisible by microtile {(micro_m, micro_n)}.'
+        )
+
+    block = micro_m * micro_n
+    desc = dict(base)
+    # Physical storage is [row-block, column-block, row-in-block, column-in-block].
+    # Splitting it into three DMA dimensions exposes logical rows without a tiler kernel.
+    desc['buffer_dimension'] = [block, cols // micro_n, rows // micro_m]
+    desc['tiling_dimension'] = [micro_n, 1, 1]
+    desc['offset'] = [0, 0, 0]
+    desc['tile_traversal'] = [
+        {'dimension': 1, 'stride': 1, 'wrap': cols // micro_n},
+        {'dimension': 0, 'stride': micro_n, 'wrap': micro_m},
+        {'dimension': 2, 'stride': 1, 'wrap': rows // micro_m},
+    ]
+    desc.pop('boundary_dimension', None)
     return desc

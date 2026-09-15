@@ -11,6 +11,7 @@ from .tensor_view import (
     make_staging_descriptor,
     map_view_axis,
     ordered_view_shape,
+    staging_tile_shape,
 )
 from .tiling import (
     ParallelismConfig,
@@ -44,4 +45,5 @@ __all__ = [
     'parse_directives',
     'require_power_of_two',
     'requested_layout',
+    'staging_tile_shape',
 ]

@@ -57,7 +57,7 @@
     "AIECompilerTarget": "part",
     "Columns": 59,
     "Rows": 8,
-    "ColumnStart": 0,
+    "ColumnStart": 7,
     "RowStart": 0,
     "PLIOWidthBits": 32,
     "PLClockFreqMHz": 312.5,

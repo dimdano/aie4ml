@@ -10,7 +10,7 @@ from ....passes.utils import sanitize_identifier
 from ...base import OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, parse_directives
+from ...utils import ParallelismConfig, inherited_microtile, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
     resolve_accumulator_output_shift,
@@ -87,14 +87,45 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return requested_contract(node) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
-        io_route, _, _ = parse_directives(directives)
+        io_route, input_contracts, parallel_cfg = parse_directives(directives)
         precision, accumulator_tag = _resolve_numeric(node, device)
         precision['bias'] = _resolve_bias_dtype(node, precision)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
+        lhs_tensor = input_tensor_for_role(node, 'lhs')
+        required_microtile = None
+        producer_contract = input_contracts.get(lhs_tensor.name)
+        if not device.has_memtile and self.contract == 'inner' and producer_contract is not None:
+            if producer_contract.contract != 'inner':
+                raise ValueError(
+                    f'{node.name}: AIE1 dense inner contract cannot directly consume producer '
+                    f'{producer_contract.contract!r} staging.'
+                )
+            required_cas_length = len(producer_contract.port_staging)
+            requested_cas_length = parallel_cfg.get('cas_length')
+            if requested_cas_length is not None and int(requested_cas_length) != required_cas_length:
+                raise ValueError(
+                    f'{node.name}: cas_length={requested_cas_length} conflicts with the producer port count '
+                    f'{required_cas_length} required for direct AIE1 transport.'
+                )
+            parallel_cfg['cas_length'] = required_cas_length
+            required_microtile = inherited_microtile(node, input_contracts)
+
+        microtiling = _resolve_tile_cfg(
+            node,
+            device,
+            precision['lhs'],
+            precision['rhs'],
+            required_lhs_microtile=required_microtile,
+        )
+        tiling = _resolve_parallelism(
+            node,
+            device,
+            microtiling,
+            precision,
+            self.contract,
+            parallel_cfg=parallel_cfg,
+        )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 
-        lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
 
@@ -119,6 +150,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
+            bank_mem_bytes=int(device.bank_mem_bytes),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             flags=DenseFlags(
                 use_relu=use_relu,
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
@@ -165,10 +198,13 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return W, b, int(W.shape[-2]), int(W.shape[-1])
 
     def footprint(self, _node, config) -> OpImplFootprint:
+        extras = {'keepout_left': 1}
+        if config.alternating_horizontal:
+            extras['keepout_right'] = 1
         return OpImplFootprint(
             width=config.parallelism.cas_length,
             height=config.parallelism.cas_num,
-            extras={'keepout_left': 1},
+            extras=extras,
         )
 
     def get_artifacts(self, inst: OpImplInstance):
@@ -220,6 +256,18 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             inputs={t.name: PortBinding(group=f'in{i + 1}', count=n_in) for i, t in enumerate(data_inputs)},
             outputs={t.name: PortBinding(group=f'out{i + 1}', count=n_out) for i, t in enumerate(node.outputs)},
         )
+
+    def boundary_input_access_endpoints(self, config: DenseConfig, port: int) -> tuple[str, ...]:
+        port = int(port)
+        cas_length = int(config.parallelism.cas_length)
+        cas_num = int(config.parallelism.cas_num)
+        if config.parallelism.contract == 'outer':
+            return (f'kk[{port}].in[0]',)
+        return tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(cas_num))
+
+    def boundary_output_access_endpoints(self, config: DenseConfig, port: int) -> tuple[str, ...]:
+        index = int(port) * int(config.parallelism.cas_length) + int(config.parallelism.cas_length) - 1
+        return (f'kk[{index}].out[0]',)
 
 
 @register_variant

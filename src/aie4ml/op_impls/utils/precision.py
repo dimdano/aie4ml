@@ -106,7 +106,7 @@ def infer_accumulator_tag(
 
     if not is_ml:
         if lhs_w <= 8 and rhs_w <= 8:
-            return 'acc32'
+            return 'acc48'
         if lhs_w <= 16 and rhs_w <= 16:
             return 'acc48'
         if lhs_w <= 32 and rhs_w <= 32:

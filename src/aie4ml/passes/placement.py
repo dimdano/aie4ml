@@ -363,7 +363,12 @@ def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
 
 
 def _in_bounds(p: Placed, W: int, H: int) -> bool:
-    return p.x >= 0 and p.y >= 0 and p.x + p.rect.w <= W and p.y + p.rect.h <= H
+    return (
+        p.x >= 0
+        and p.y >= 0
+        and p.x + p.rect.w + p.rect.keepout_right <= W
+        and p.y + p.rect.h + p.rect.keepout_bottom <= H
+    )
 
 
 def _feasible(p: Placed, placed: Dict[str, Placed], graph: GraphSpec, W: int, H: int) -> bool:
@@ -390,8 +395,8 @@ def _possible_face_domain(
         ax, ay = spec.anchor
         return _face_abs_box(Placed(spec.name, ax, ay, rect), face)
 
-    max_x = W - rect.w
-    max_y = H - rect.h
+    max_x = W - rect.w - rect.keepout_right
+    max_y = H - rect.h - rect.keepout_bottom
     if max_x < 0 or max_y < 0:
         raise RuntimeError(f'Node {spec.name} footprint ({rect.w}x{rect.h}) does not fit device ({W}x{H}).')
 
@@ -750,9 +755,9 @@ def _enumerate_candidate_positions(
         return
 
     min_x = 0 if spec.x_range is None else spec.x_range[0]
-    max_x = (W - spec.rect.w) if spec.x_range is None else spec.x_range[1]
+    max_x = (W - spec.rect.w - spec.rect.keepout_right) if spec.x_range is None else spec.x_range[1]
     min_y = 0 if spec.y_range is None else spec.y_range[0]
-    max_y = (H - spec.rect.h) if spec.y_range is None else spec.y_range[1]
+    max_y = (H - spec.rect.h - spec.rect.keepout_bottom) if spec.y_range is None else spec.y_range[1]
     if max_x < 0 or max_y < 0:
         return
     if max_x < min_x or max_y < min_y:
@@ -1243,10 +1248,15 @@ class PlaceKernels(AIEPass):
         ctx = get_backend_context(model_or_ctx)
         device = ctx.device
 
-        W = int(device.columns)
-        H = int(device.rows)
         col_offset = int(device.column_start)
         row_offset = int(device.row_start)
+        W = int(device.columns) - col_offset
+        H = int(device.rows) - row_offset
+        if W <= 0 or H <= 0:
+            raise ValueError(
+                f'Device placement origin ({col_offset}, {row_offset}) is outside '
+                f'the {device.columns}x{device.rows} AIE array.'
+            )
 
         graph = _build_graph(ctx, col_offset, row_offset)
         if not graph.specs:
