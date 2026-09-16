@@ -2,6 +2,7 @@
 struct {{L.struct_name}} {
   using input_t  = {{P.precision.lhs.c_type}};
   using output_t = {{P.precision.output.c_type}};
+  using acc_scalar_t = {{P.accumulator_tag}};
   static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}};
   static constexpr int ROWS = {{P.rows}};

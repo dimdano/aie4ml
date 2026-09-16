@@ -186,10 +186,16 @@ def _coerce_rect(footprint: Any) -> Rect:
       input_side:  "left" | "right" | "top" | "bottom"
       output_side: "left" | "right" | "top" | "bottom"
       keepout_left / keepout_right / keepout_top / keepout_bottom
+      row_parity: 0 for even starting rows or 1 for odd starting rows
     """
     w = int(getattr(footprint, 'width'))
     h = int(getattr(footprint, 'height'))
     extras = dict(getattr(footprint, 'extras', {}) or {})
+    if extras.get('row_parity') is not None:
+        row_parity = int(extras['row_parity'])
+        if row_parity not in (0, 1):
+            raise ValueError(f'Invalid row_parity: {row_parity}; expected 0 or 1.')
+        extras['row_parity'] = row_parity
 
     input_face = _parse_face(
         extras.get('input_face'),
@@ -535,6 +541,8 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
             raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
 
         rect = _coerce_rect(footprint)
+        if rect.extras.get('row_parity') is not None:
+            rect.extras['row_parity'] = (int(rect.extras['row_parity']) - row_offset) % 2
 
         placement_hint = node.directives.get('placement', {})
         anchor: Optional[Tuple[int, int]] = None
@@ -554,6 +562,24 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         stable_index[node.name] = idx
 
     edges = _transport_edges(ctx, list(specs))
+
+    parity_queue = [name for name, spec in specs.items() if spec.rect.extras.get('row_parity') is not None]
+    direct_neighbors = {name: [] for name in specs}
+    for edge in edges:
+        if edge.direct:
+            direct_neighbors[edge.src].append(edge.dst)
+            direct_neighbors[edge.dst].append(edge.src)
+    while parity_queue:
+        name = parity_queue.pop()
+        parity = int(specs[name].rect.extras['row_parity'])
+        for neighbor in direct_neighbors[name]:
+            neighbor_extras = specs[neighbor].rect.extras
+            existing = neighbor_extras.get('row_parity')
+            if existing is not None and int(existing) != parity:
+                raise ValueError(f'Conflicting direct-buffer row parity between {name} and {neighbor}.')
+            if existing is None:
+                neighbor_extras['row_parity'] = parity
+                parity_queue.append(neighbor)
 
     preds = {name: [] for name in specs}
     succs = {name: [] for name in specs}
@@ -764,11 +790,15 @@ def _enumerate_candidate_positions(
         return
 
     ideal_x, ideal_y = _ideal_anchor_from_neighbors(spec, graph, placed)
+    row_parity = spec.rect.extras.get('row_parity')
+
+    def eligible_row(y: int) -> bool:
+        return row_parity is None or y % 2 == int(row_parity)
 
     # Exact mode: enumerate all legal coordinates, biased toward the ideal.
     if candidate_limit is None:
         xs = list(range(min_x, max_x + 1))
-        ys = list(range(min_y, max_y + 1))
+        ys = [y for y in range(min_y, max_y + 1) if eligible_row(y)]
         xs.sort(key=lambda x: (abs(x - ideal_x), x))
         ys.sort(key=lambda y: (abs(y - ideal_y), y))
         for y in ys:
@@ -779,6 +809,8 @@ def _enumerate_candidate_positions(
     # Heuristic mode: score the full domain and keep the best N.
     scored: List[Tuple[float, int, int, int]] = []
     for y in range(min_y, max_y + 1):
+        if not eligible_row(y):
+            continue
         for x in range(min_x, max_x + 1):
             score = abs(x - ideal_x) + abs(y - ideal_y)
             score += heuristics.low_row_weight * y

@@ -18,9 +18,19 @@ from jinja2 import Environment, FileSystemLoader
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 
 
-def _qparams(prefix: str, elem_type: int) -> list:
+@pytest.mark.parametrize(
+    ('part', 'expected_width'),
+    [(AIE1_PART, 32), ('xilinx_vek280_base_202520_1', 32), ('vek385_base', 64)],
+)
+def test_device_stream_switch_width(part, expected_width):
+    device, _ = resolve_device(part, {})
+
+    assert device.stream_switch_width_bits == expected_width
+
+
+def _qparams(prefix: str, elem_type: int, *, frac: int = 4) -> list:
     return [
-        helper.make_tensor(f'{prefix}_scale', TensorProto.FLOAT, [], [2.0**-4]),
+        helper.make_tensor(f'{prefix}_scale', TensorProto.FLOAT, [], [2.0**-frac]),
         helper.make_tensor(f'{prefix}_zp', elem_type, [], [0]),
     ]
 
@@ -151,6 +161,77 @@ def _dense_stack_model():
     )
 
 
+def _add_model():
+    nodes = [
+        helper.make_node('DequantizeLinear', ['lhs_q', 'lhs_scale', 'lhs_zp'], ['lhs'], name='lhs_dq'),
+        helper.make_node('DequantizeLinear', ['rhs_q', 'rhs_scale', 'rhs_zp'], ['rhs'], name='rhs_dq'),
+        helper.make_node('Add', ['lhs', 'rhs'], ['sum'], name='add'),
+        helper.make_node('QuantizeLinear', ['sum', 'y_scale', 'y_zp'], ['y_q'], name='y_q'),
+        helper.make_node('DequantizeLinear', ['y_q', 'y_scale', 'y_zp'], ['y'], name='y_dq'),
+    ]
+    return make_model(
+        'aie1_add',
+        nodes=nodes,
+        inputs=[
+            ('lhs_q', TensorProto.INT8, [8, 16]),
+            ('rhs_q', TensorProto.INT8, [8, 16]),
+        ],
+        outputs=[('y', TensorProto.FLOAT, [8, 16])],
+        initializers=[
+            *_qparams('lhs', TensorProto.INT8),
+            *_qparams('rhs', TensorProto.INT8),
+            *_qparams('y', TensorProto.INT8),
+        ],
+    )
+
+
+def _normalization_chain_model():
+    nodes = [
+        helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),
+        helper.make_node('DequantizeLinear', ['w_q', 'w_scale', 'w_zp'], ['w'], name='w_dq'),
+        helper.make_node('MatMul', ['x', 'w'], ['mm'], name='dense'),
+        helper.make_node('QuantizeLinear', ['mm', 'dense_scale', 'dense_zp'], ['dense_q'], name='dense_q'),
+        helper.make_node('DequantizeLinear', ['dense_q', 'dense_scale', 'dense_zp'], ['dense_out'], name='dense_dq'),
+        helper.make_node('DequantizeLinear', ['skip_q', 'skip_scale', 'skip_zp'], ['skip'], name='skip_dq'),
+        helper.make_node('MatMul', ['skip', 'w'], ['skip_mm'], name='skip_dense'),
+        helper.make_node(
+            'QuantizeLinear', ['skip_mm', 'dense_scale', 'dense_zp'], ['skip_dense_q'], name='skip_dense_q'
+        ),
+        helper.make_node(
+            'DequantizeLinear', ['skip_dense_q', 'dense_scale', 'dense_zp'], ['skip_dense_out'], name='skip_dense_dq'
+        ),
+        helper.make_node('Add', ['dense_out', 'skip_dense_out'], ['sum'], name='add'),
+        helper.make_node('QuantizeLinear', ['sum', 'add_scale', 'add_zp'], ['add_q'], name='add_q'),
+        helper.make_node('DequantizeLinear', ['add_q', 'add_scale', 'add_zp'], ['add_out'], name='add_dq'),
+        helper.make_node(
+            'LayerNormalization', ['add_out', 'gamma', 'beta'], ['normalized'], name='layernorm', epsilon=2.0**-8
+        ),
+        helper.make_node('QuantizeLinear', ['normalized', 'norm_scale', 'norm_zp'], ['norm_q'], name='norm_q'),
+        helper.make_node('DequantizeLinear', ['norm_q', 'norm_scale', 'norm_zp'], ['norm_out'], name='norm_dq'),
+        helper.make_node('Softmax', ['norm_out'], ['probabilities'], name='softmax', axis=-1),
+        helper.make_node('QuantizeLinear', ['probabilities', 'y_scale', 'y_zp'], ['y_q'], name='y_q'),
+        helper.make_node('DequantizeLinear', ['y_q', 'y_scale', 'y_zp'], ['y'], name='y_dq'),
+    ]
+    return make_model(
+        'aie1_normalization_chain',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [8, 32]), ('skip_q', TensorProto.INT8, [8, 32])],
+        outputs=[('y', TensorProto.FLOAT, [8, 32])],
+        initializers=[
+            *_qparams('x', TensorProto.INT8),
+            *_qparams('w', TensorProto.INT8),
+            *_qparams('dense', TensorProto.INT8),
+            *_qparams('skip', TensorProto.INT8),
+            *_qparams('add', TensorProto.INT8),
+            *_qparams('norm', TensorProto.INT8),
+            *_qparams('y', TensorProto.UINT8, frac=8),
+            numpy_helper.from_array(np.eye(32, dtype=np.int8), 'w_q'),
+            numpy_helper.from_array(np.ones(32, dtype=np.float32), 'gamma'),
+            numpy_helper.from_array(np.zeros(32, dtype=np.float32), 'beta'),
+        ],
+    )
+
+
 def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     device, _ = resolve_device(AIE1_PART, {})
 
@@ -158,6 +239,11 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     assert device.columns == 59
     assert device.column_start == 7
     assert device.rows == 8
+    assert device.plio_width_bits == 128
+    assert device.core_stream_inputs == 2
+    assert device.core_stream_outputs == 2
+    assert device.stream_switch_width_bits == 32
+    assert device.cascade_width_bits == 384
     assert device.has_memtile is False
     assert device.bank_count == 4
     assert device.bank_mem_bytes == 8 * 1024
@@ -177,6 +263,7 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     assert f'AIE_PART      ?= {AIE1_PART}' in makefile
     assert 'AIE_TARGET    := --part=$(AIE_PART)' in makefile
     assert '--platform=$(PLATFORM) $(APP_NAME).cpp' not in makefile
+    assert makefile.count('set -o pipefail; v++ --compile') == 2
 
 
 @pytest.mark.parametrize('generation', ['', 'AIE-ML3', 'not-a-device'])
@@ -297,6 +384,57 @@ def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):
     assert 'static constexpr bool ALTERNATING_HORIZONTAL = true;' in parameters
 
 
+def test_aie1_add_maps_both_direct_inputs_to_concrete_kernel_ports(tmp_path):
+    aie_model = _run_pipeline(_add_model(), tmp_path, project='aie1_add')
+    inst = aie_model.context.ir.execution.get('add_aie')
+    plan = aie_model.context.ir.physical.plan
+
+    assert inst.config.accumulator_tag == 'acc48'
+    assert plan['buffers'] == []
+    assert [item['endpoint'] for item in plan['kernel_write_accesses']] == [
+        'add_aie.kk[0].in[0]',
+        'add_aie.kk[0].in[1]',
+    ]
+    assert [item['endpoint'] for item in plan['kernel_read_accesses']] == ['add_aie.kk[0].out[0]']
+
+
+def test_aie1_tiled_normalization_chain_uses_direct_acc48_kernels(tmp_path):
+    directives = {
+        'layernorm': {'layout': 'tiled', 'parallelism': {'cas_num': 1}},
+        'softmax': {'parallelism': {'cas_num': 1}},
+    }
+    aie_model = _run_pipeline(
+        _normalization_chain_model(), tmp_path, directives=directives, project='aie1_normalization_chain'
+    )
+    execution = aie_model.context.ir.execution
+    plan = aie_model.context.ir.physical.plan
+
+    assert aie_model.context.ir.physical.placements['dense_aie']['row'] % 2 == 0
+    assert aie_model.context.ir.physical.placements['skip_dense_aie']['row'] % 2 == 0
+    assert aie_model.context.ir.physical.placements['add_aie']['row'] % 2 == 0
+    assert aie_model.context.ir.physical.placements['layernorm_aie']['row'] % 2 == 0
+    assert aie_model.context.ir.physical.placements['softmax_aie']['row'] % 2 == 0
+    assert execution.get('layernorm_aie').config.accumulator_tag == 'acc48'
+    assert execution.get('softmax_aie').config.accumulator_tag == 'acc48'
+    assert execution.get('layernorm_aie').variant.variant_id == 'layer_norm.i8.tiled.v1'
+    assert execution.get('softmax_aie').variant.variant_id == 'softmax.exp.i8.tiled.v1'
+    assert plan['buffers'] == []
+    assert ('dense_aie.out1[0]', 'add_aie.in1[0]') in {
+        (edge['source'], edge['target']) for edge in plan['direct_edges']
+    }
+    assert ('skip_dense_aie.out1[0]', 'add_aie.in2[0]') in {
+        (edge['source'], edge['target']) for edge in plan['direct_edges']
+    }
+    assert ('add_aie.out1[0]', 'layernorm_aie.in1[0]') in {
+        (edge['source'], edge['target']) for edge in plan['direct_edges']
+    }
+    assert ('layernorm_aie.out1[0]', 'softmax_aie.in1[0]') in {
+        (edge['source'], edge['target']) for edge in plan['direct_edges']
+    }
+    assert all('.kk[' in item['endpoint'] for item in plan['kernel_write_accesses'])
+    assert all('.kk[' in item['endpoint'] for item in plan['kernel_read_accesses'])
+
+
 def test_aie1_outer_parallel_dense_uses_direct_boundary_ports(tmp_path):
     aie_model = _run_pipeline(
         _dense_model(out_features=16),
@@ -340,11 +478,7 @@ def test_aie1_dense_cascade_ports_follow_logical_snake_order(tmp_path):
 
     AIEProjectEmitter().emit(aie_model.context)
     graph = (
-        aie_model.context.project_config.output_dir
-        / 'src'
-        / 'kernels'
-        / 'dense_bias_relu'
-        / 'dense_bias_relu_graph.h'
+        aie_model.context.project_config.output_dir / 'src' / 'kernels' / 'dense_bias_relu' / 'dense_bias_relu_graph.h'
     ).read_text()
     assert 'reverse ? CAS_LENGTH - 1 - pos : pos' in graph
     assert 'const int inputMemoryCol = reverse ? tileCol + 1 : tileCol - 1;' in graph

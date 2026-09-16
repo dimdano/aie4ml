@@ -34,6 +34,9 @@ public:
     // result is bit-identical to the linear kernel's (255<<INV_SHIFT)/sum.
     template <unsigned N>
     static void batched_reciprocal(const int32_t (&sum)[N], int32_t (&invq)[N]);
+
+    template <unsigned N>
+    static void batched_clb_reciprocal(const int32_t* sum, int32_t* invq);
 };
 
 // HCCS is a calibrated clipped-linear surrogate for attention softmax.

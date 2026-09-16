@@ -17,13 +17,14 @@ from ...utils import (
     extract_inner_outer,
     find_tile_split,
     inherited_microtile,
+    layout_variant_matches,
     parse_directives,
-    requested_layout,
     require_power_of_two,
 )
 from ...utils.io import view_shape
 from ...utils.precision import (
     aie_rounding_token,
+    infer_accumulator_tag,
     resolve_exact_storage_dtype,
     storage_bytes_for_spec,
     to_quant_intent,
@@ -76,9 +77,9 @@ class _LayerNormVariantBase(OpImplVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        if requested_layout(node) != self.layout_name:
+        if not layout_variant_matches(node, self.layout_name):
             return False
-        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
+        if device.generation not in ('AIE', 'AIE-ML', 'AIE-MLV2'):
             return False
         in_tensor = input_tensor_for_role(node, 'lhs')
         if isinstance(in_tensor.precision, FloatIntent):
@@ -121,7 +122,7 @@ class _LayerNormVariantBase(OpImplVariant):
 
         cas_num, tile_outer = find_tile_split(
             partition_size=last_outer,
-            max_rows=max(1, int(device.rows)),
+            max_rows=max(1, int(device.rows) - int(device.row_start)),
             bank_bytes=int(device.bank_mem_bytes),
             tile_bytes_fn=lambda to: max(
                 outer_prefix * to * full_inner * in_bpp,
@@ -156,6 +157,7 @@ class _LayerNormVariantBase(OpImplVariant):
             rows=int(outer_prefix * tile_outer),
             cols=int(full_inner),
             vec_size=int(vec_size),
+            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
             gamma_shift=int(GAMMA_FRAC_BITS),
             out_shift=int(to_quant_intent(out_tensor.precision).frac),
             eps_q0=_resolve_eps_q0(node.name, node.metadata, int(precision['lhs'].frac)),
@@ -254,6 +256,16 @@ class _LayerNormVariantBase(OpImplVariant):
             outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )
 
+    def boundary_input_access_endpoints(
+        self, _config: LayerNormConfig, port: int, group: str | None = None
+    ) -> tuple[str, ...]:
+        if group != 'in1':
+            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
+        return (f'kk[{int(port)}].in[0]',)
+
+    def boundary_output_access_endpoints(self, _config: LayerNormConfig, port: int) -> tuple[str, ...]:
+        return (f'kk[{int(port)}].out[0]',)
+
 
 @register_variant
 class LayerNormLinearOpImplVariant(_LayerNormVariantBase):
@@ -273,6 +285,7 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
 
     variant_id = 'layer_norm.i8.tiled.v1'
     layout_name = 'tiled'
+    plevel = 11
     kernel_transposes_microtile = True
 
     def resolve_microtile(self, node: OpNode, input_contracts):

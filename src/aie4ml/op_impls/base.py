@@ -78,7 +78,7 @@ class OpImplVariant:
     ) -> Any:
         return None
 
-    def boundary_input_access_endpoints(self, _config: Any, _port: int) -> tuple[str, ...]:
+    def boundary_input_access_endpoints(self, _config: Any, _port: int, _group: str | None = None) -> tuple[str, ...]:
         raise NotImplementedError(f'{self.variant_id}: direct graph-input buffer access is not implemented.')
 
     def boundary_output_access_endpoints(self, _config: Any, _port: int) -> tuple[str, ...]:

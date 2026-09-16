@@ -23,6 +23,7 @@ inline __attribute__((always_inline)) void softmax_i8<ConfigT>::softmax_row(
     int16_t B,
     int8_t S,
     uint8_t DMAX) {
+    using acc_t = typename ConfigT::acc_scalar_t;
     constexpr int VEC = ConfigT::VEC;
     constexpr int VECS = COLS / VEC;
 
@@ -36,28 +37,45 @@ inline __attribute__((always_inline)) void softmax_i8<ConfigT>::softmax_row(
     vin_it = aie::cbegin_vector<VEC>(in_ptr);
 
     auto scratch_it = aie::begin_vector<VEC>(scratch);
-    aie::accum<acc32, VEC> acc_sum = aie::zeros<acc32, VEC>();
-
+#if defined(__AIE_ARCH__) && __AIE_ARCH__ == 10
+    // AIE1 has no acc32; Vitis schedules this widened acc48 path faster than int8/acc48,
+    // and its unsupported accumulator-to-accumulator add requires the int32 vector sum.
+    aie::vector<int32, VEC> score_sum = aie::zeros<int32, VEC>();
+    const aie::vector<int16, VEC> max16 = aie::broadcast<int16, VEC>((int16_t)max_val);
+    const aie::vector<int16, VEC> dmax16 = aie::broadcast<int16, VEC>((int16_t)DMAX);
+#else
+    aie::accum<acc_t, VEC> acc_sum = aie::zeros<acc_t, VEC>();
     uint8 max_u = (uint8)max_val;
     aie::vector<uint8, VEC> max_u_vec = aie::broadcast<uint8, VEC>(max_u);
+#endif
 
     for (int i = 0; i < VECS; ++i) {
         aie::vector<int8, VEC> x = *vin_it++;
+        aie::accum<acc_t, VEC> acc;
+#if defined(__AIE_ARCH__) && __AIE_ARCH__ == 10
+        const aie::vector<int16, VEC> x16 = aie::from_vector<acc_t>(x).template to_vector<int16>(0);
+        const aie::vector<int16, VEC> d = aie::min(aie::sub(max16, x16), dmax16);
+        acc.from_vector(aie::broadcast<int32, VEC>(B));
+        acc = aie::mac(acc, d, aie::broadcast<int16, VEC>((int16_t)(-S)));
+        score_sum = aie::add(score_sum, acc.template to_vector<int32>(0));
+#else
         aie::vector<uint8, VEC> xu = x.template cast_to<uint8>();
         aie::vector<uint8, VEC> d = aie::sub(max_u_vec, xu);
         d = aie::min(d, (uint8)DMAX);
-
         aie::vector<int8, VEC> d8 = d.template cast_to<int8>();
-        aie::accum<acc32, VEC> acc;
         acc.from_vector(aie::broadcast<int32, VEC>(B));
         acc = aie::mac(acc, d8, aie::broadcast<int8, VEC>(-S));
-
         acc_sum = aie::add(acc_sum, acc);
+#endif
         aie::vector<int16, VEC> score16 = acc.template to_vector<int16>(0);
         *scratch_it++ = score16;
     }
 
+#if defined(__AIE_ARCH__) && __AIE_ARCH__ == 10
+    int32_t sum = aie::reduce_add(score_sum);
+#else
     int32_t sum = aie::reduce_add(acc_sum.template to_vector<int32_t>());
+#endif
 
     int32_t inv_q0;
     if constexpr (ConfigT::USE_CLB) {
@@ -82,7 +100,7 @@ inline __attribute__((always_inline)) void softmax_i8<ConfigT>::softmax_row(
     auto out_it = aie::begin_vector<VEC>(out_ptr);
     for (int i = 0; i < VECS; ++i) {
         aie::vector<int16, VEC> v = *scratch_rd++;
-        aie::accum<acc32, VEC> prod = aie::mul(v, inv_vec);
+        aie::accum<acc_t, VEC> prod = aie::mul(v, inv_vec);
         *out_it++ = prod.template to_vector<out_t>(OUT_SHIFT);
     }
 }
@@ -123,6 +141,46 @@ void softmax_base<ConfigT>::batched_reciprocal(const int32_t (&sum)[N], int32_t 
         while (q * s > (int64_t)NUMER) --q;
         while ((q + 1) * s <= (int64_t)NUMER) ++q;
         invq[r] = (int32_t)q;
+    }
+}
+
+
+// CLB is a single scalar instruction and has no vector API. Spell out the fixed-size row band so
+// AIE1 sees independent operations; a loop here can create an unschedulable dependency hazard.
+template <typename ConfigT>
+template <unsigned N>
+#if defined(__AIE_ARCH__) && __AIE_ARCH__ == 10
+__attribute__((noinline))
+#endif
+void softmax_base<ConfigT>::batched_clb_reciprocal(const int32_t* sum, int32_t* invq)
+{
+    static_assert(N == 2 || N == 4 || N == 8);
+    if constexpr (std::is_same_v<out_t, int16_t>) {
+        invq[0] = 32767 >> (31 - clb(sum[0]));
+        invq[1] = 32767 >> (31 - clb(sum[1]));
+        if constexpr (N >= 4) {
+            invq[2] = 32767 >> (31 - clb(sum[2]));
+            invq[3] = 32767 >> (31 - clb(sum[3]));
+        }
+        if constexpr (N == 8) {
+            invq[4] = 32767 >> (31 - clb(sum[4]));
+            invq[5] = 32767 >> (31 - clb(sum[5]));
+            invq[6] = 32767 >> (31 - clb(sum[6]));
+            invq[7] = 32767 >> (31 - clb(sum[7]));
+        }
+    } else {
+        invq[0] = 255 << (INV_SHIFT - (31 - clb(sum[0])));
+        invq[1] = 255 << (INV_SHIFT - (31 - clb(sum[1])));
+        if constexpr (N >= 4) {
+            invq[2] = 255 << (INV_SHIFT - (31 - clb(sum[2])));
+            invq[3] = 255 << (INV_SHIFT - (31 - clb(sum[3])));
+        }
+        if constexpr (N == 8) {
+            invq[4] = 255 << (INV_SHIFT - (31 - clb(sum[4])));
+            invq[5] = 255 << (INV_SHIFT - (31 - clb(sum[5])));
+            invq[6] = 255 << (INV_SHIFT - (31 - clb(sum[6])));
+            invq[7] = 255 << (INV_SHIFT - (31 - clb(sum[7])));
+        }
     }
 }
 
@@ -168,6 +226,7 @@ static inline aie::vector<T, N> load_microtile(const T* p)
 template <typename ConfigT>
 void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
 {
+    using acc_t = typename ConfigT::acc_scalar_t;
     const in_t*  __restrict in_ptr  = in.data();
           out_t* __restrict out_ptr = out.data();
 
@@ -199,9 +258,9 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
         aie::vector<int32, BLK> ssum = aie::zeros<int32, BLK>();
         for (int bn = 0; bn < NB; ++bn) {
             const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
-            const aie::vector<int16, BLK> vx16 = aie::from_vector<acc32>(vx).template to_vector<int16>(0);
+            const aie::vector<int16, BLK> vx16 = aie::from_vector<acc_t>(vx).template to_vector<int16>(0);
             aie::vector<int16, BLK> d = aie::min(aie::sub(max16, vx16), dmax_v);   // min(max-x, DMAX)
-            aie::accum<acc32, BLK> acc;
+            aie::accum<acc_t, BLK> acc;
             acc.from_vector(aie::broadcast<int32, BLK>(B));
             acc = aie::mac(acc, d, aie::broadcast<int16, BLK>((int16_t)(-S)));     // score = B - S*d
             ssum = aie::add(ssum, acc.template to_vector<int32>(0));
@@ -220,9 +279,13 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
                 sum[sb * (SUB / MT_INNER) + g] = sv.get(g * MT_INNER);
         }
 
-        // ---- one vectorised exact reciprocal for the whole band ----
-        int32_t invq[STAT_LANES];
-        base::template batched_reciprocal<STAT_LANES>(sum, invq);
+        // ---- one reciprocal batch for the whole row band ----
+        int32_t invq[STAT_LANES] = {};
+        if constexpr (ConfigT::USE_CLB) {
+            base::template batched_clb_reciprocal<MT_OUTER>(sum, invq);
+        } else {
+            base::template batched_reciprocal<STAT_LANES>(sum, invq);
+        }
         int16_t inv16[STAT_LANES] = {};
         for (int m = 0; m < MT_OUTER; ++m) {
             const int32_t v = invq[m];
@@ -233,14 +296,14 @@ void softmax_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>
         // ---- pass 3: normalise (recompute the score, then scale) ----
         for (int bn = 0; bn < NB; ++bn) {
             const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
-            const aie::vector<int16, BLK> vx16 = aie::from_vector<acc32>(vx).template to_vector<int16>(0);
+            const aie::vector<int16, BLK> vx16 = aie::from_vector<acc_t>(vx).template to_vector<int16>(0);
             aie::vector<int16, BLK> d = aie::min(aie::sub(max16, vx16), dmax_v);
-            aie::accum<acc32, BLK> acc;
+            aie::accum<acc_t, BLK> acc;
             acc.from_vector(aie::broadcast<int32, BLK>(B));
             acc = aie::mac(acc, d, aie::broadcast<int16, BLK>((int16_t)(-S)));
             const aie::vector<int16, BLK> score16 = acc.template to_vector<int16>(0);
 
-            aie::accum<acc32, BLK> prod = aie::mul(score16, inv_v);
+            aie::accum<acc_t, BLK> prod = aie::mul(score16, inv_v);
             auto vout = aie::begin_vector<BLK>(dst + bn * BLK);
             *vout = prod.template to_vector<out_t>(OUT_SHIFT);
         }
@@ -262,8 +325,9 @@ template <typename ConfigT, int N>
 static aie::vector<int16, N> exp_score16(const aie::vector<int8, N>& vx,
                                          const aie::vector<int16, N>& maxv)
 {
+    using acc_t = typename ConfigT::acc_scalar_t;
     constexpr int ZF = ConfigT::EXP_ZF;
-    const aie::vector<int16, N> vx16 = aie::from_vector<acc32>(vx).template to_vector<int16>(0);
+    const aie::vector<int16, N> vx16 = aie::from_vector<acc_t>(vx).template to_vector<int16>(0);
     const aie::vector<int16, N> d = aie::sub(maxv, vx16);                           // >=0, <=255
     const aie::vector<int16, N> z = aie::mul(d, aie::broadcast<int16, N>(ConfigT::EXP_KQ)).template to_vector<int16>(0);
     const aie::vector<int16, N> zint  = aie::downshift(z, ZF);
@@ -288,6 +352,7 @@ static aie::vector<int16, N> exp_score16(const aie::vector<int8, N>& vx,
 template <typename ConfigT>
 void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
 {
+    using acc_t = typename ConfigT::acc_scalar_t;
     const in_t*  __restrict in_ptr  = in.data();
           out_t* __restrict out_ptr = out.data();
 
@@ -308,7 +373,7 @@ void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<ou
         for (int bn = 0; bn < NB; ++bn) {
             const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
             const aie::vector<int16, BLK> e = exp_score16<ConfigT, BLK>(vx, max16);
-            ssum = aie::add(ssum, aie::from_vector<acc32>(e).template to_vector<int32>(0));
+            ssum = aie::add(ssum, aie::from_vector<acc_t>(e).template to_vector<int32>(0));
         }
         int32_t sum[STAT_LANES] = {};
         constexpr int SUB = (BLK < 32) ? BLK : 32;
@@ -331,7 +396,7 @@ void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<ou
         for (int bn = 0; bn < NB; ++bn) {
             const aie::vector<int8, BLK> vx = load_microtile<ConfigT, BLK, MT_INNER, MT_OUTER>(band + bn * BLK);
             const aie::vector<int16, BLK> e = exp_score16<ConfigT, BLK>(vx, max16);
-            aie::accum<acc32, BLK> prod = aie::mul(e, inv_v);
+            aie::accum<acc_t, BLK> prod = aie::mul(e, inv_v);
             *aie::begin_vector<BLK>(dst + bn * BLK) = prod.template to_vector<out_t>(OUT_SHIFT);
         }
     }
@@ -342,6 +407,7 @@ void softmax_exp_i8_tiled<ConfigT>::run(input_buffer<in_t>& in, output_buffer<ou
 template <typename ConfigT>
 void softmax_exp_i8<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& out)
 {
+    using acc_t = typename ConfigT::acc_scalar_t;
     const int8* __restrict in_ptr  = (const int8*)in.data();
           out_t* __restrict out_ptr = (out_t*)out.data();
     constexpr int VEC  = ConfigT::VEC;
@@ -361,7 +427,7 @@ void softmax_exp_i8<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& 
         it = aie::cbegin_vector<VEC>(rp);
         for (int i = 0; i < VECS; ++i) {
             const aie::vector<int16, VEC> e = exp_score16<ConfigT, VEC>(*it++, mv);
-            vsum = aie::add(vsum, aie::from_vector<acc32>(e).template to_vector<int32>(0));
+            vsum = aie::add(vsum, aie::from_vector<acc_t>(e).template to_vector<int32>(0));
         }
         rsum[row] = aie::reduce_add(vsum);
     }
@@ -386,7 +452,7 @@ void softmax_exp_i8<ConfigT>::run(input_buffer<in_t>& in, output_buffer<out_t>& 
         auto ot = aie::begin_vector<VEC>(op);
         for (int i = 0; i < VECS; ++i) {
             const aie::vector<int16, VEC> e = exp_score16<ConfigT, VEC>(*it++, mv);
-            aie::accum<acc32, VEC> prod = aie::mul(e, inv_vec);
+            aie::accum<acc_t, VEC> prod = aie::mul(e, inv_vec);
             *ot++ = prod.template to_vector<out_t>(OUT_SHIFT);
         }
     }

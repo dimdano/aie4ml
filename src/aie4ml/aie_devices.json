@@ -7,6 +7,10 @@
     "ColumnStart": 7,
     "RowStart": 0,
     "PLIOWidthBits": 128,
+    "CoreStreamInputs": 1,
+    "CoreStreamOutputs": 1,
+    "StreamSwitchWidthBits": 64,
+    "CascadeWidthBits": 512,
     "PLClockFreqMHz": 312.5,
     "Memory": {
       "BankMemBytes": 16384
@@ -27,6 +31,10 @@
     "ColumnStart": 7,
     "RowStart": 0,
     "PLIOWidthBits": 128,
+    "CoreStreamInputs": 1,
+    "CoreStreamOutputs": 1,
+    "StreamSwitchWidthBits": 32,
+    "CascadeWidthBits": 512,
     "PLClockFreqMHz": 312.5,
     "Memory": {
       "BankMemBytes": 16384
@@ -59,7 +67,11 @@
     "Rows": 8,
     "ColumnStart": 7,
     "RowStart": 0,
-    "PLIOWidthBits": 32,
+    "PLIOWidthBits": 128,
+    "CoreStreamInputs": 2,
+    "CoreStreamOutputs": 2,
+    "StreamSwitchWidthBits": 32,
+    "CascadeWidthBits": 384,
     "PLClockFreqMHz": 312.5,
     "Memory": {
       "BankMemBytes": 8192

@@ -131,12 +131,12 @@ $(STAMP_MARKER):
 	@echo "{{ stamp | default('00000000') }}" > $@
 
 $(LIBADF): $(MY_SOURCES) aie.cfg $(STAMP_MARKER)
-	v++ --compile --config aie.cfg --mode aie --target=hw $(AIE_FLAGS_HW) |& tee log
+	set -o pipefail; v++ --compile --config aie.cfg --mode aie --target=hw $(AIE_FLAGS_HW) |& tee log
 
 x86all: clean x86com x86sim
 
 x86com: $(MY_SOURCES) aie.cfg $(STAMP_MARKER)
-	v++ --compile --config aie.cfg --mode aie --target=x86sim $(AIE_FLAGS_X86) |& tee log
+	set -o pipefail; v++ --compile --config aie.cfg --mode aie --target=x86sim $(AIE_FLAGS_X86) |& tee log
 
 aiesim:
 	aiesimulator --pkg-dir=$(AIE_WORKDIR) |& tee -a log

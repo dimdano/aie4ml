@@ -36,12 +36,13 @@ _CORE_RE = re.compile(r'^Core (\S+)', re.M)
 ASSUMED_AIE_CLOCK_GHZ = 1.25
 
 
-def _analyze_aie_out_interval(output_dir: Path) -> Dict:
+def _analyze_aie_out_interval(output_dir: Path, pipeline: Optional[Dict[str, Any]] = None) -> Dict:
     data_dir = output_dir / 'aiesimulator_output' / 'data'
 
     if not data_dir.exists():
         return {}
 
+    elements_by_port = _output_elements_per_inference(pipeline or {})
     per_file = {}
     all_lat = []
     first_out = []
@@ -50,7 +51,9 @@ def _analyze_aie_out_interval(output_dir: Path) -> Dict:
         stamps = _timestamps(fp)
         if stamps:
             first_out.append(min(stamps))
-        lst = _parse_timing(fp)
+        port_match = re.fullmatch(r'y_p(\d+)\.txt', fp.name)
+        port = int(port_match.group(1)) if port_match else None
+        lst = _parse_timing(fp, elements_by_port.get(port))
         if lst:
             per_file[fp.name] = {
                 'min_ns': round(min(lst), 3),
@@ -89,35 +92,81 @@ def _timestamps(path: Path) -> List[float]:
     return out
 
 
-def _parse_timing(path: Path) -> List[float]:
-    """Return TLAST-to-TLAST intervals (in nanoseconds)."""
-    regex = re.compile(r'^T\s+(\d+)\s*(ps|ns|us|ms|s)', re.IGNORECASE)
+def _output_elements_per_inference(pipeline: Dict[str, Any]) -> Dict[int, int]:
+    """Return the number of file elements produced per inference on each output port."""
+    plan = (pipeline.get('physical') or {}).get('plan') or {}
+    result = {}
+    for item in plan.get('io_ports') or []:
+        if item.get('direction') != 'output':
+            continue
+        dims = (item.get('staging') or {}).get('io_tiling_dimension')
+        if not dims:
+            raise ValueError(f'{item.get("tensor", "output")}: missing output IO tiling dimensions in pipeline plan.')
+        elements = 1
+        for dim in dims:
+            elements *= int(dim)
+        result[int(item['port'])] = elements
+    return result
 
-    lat = []
-    last_tlast_time = None
+
+def _parse_timing(path: Path, elements_per_inference: Optional[int] = None) -> List[float]:
+    """Return logical-inference completion intervals (in nanoseconds).
+
+    A simulator TLAST can terminate a row or another DMA frame rather than a whole
+    inference. When the emitted plan is available, accumulate frames until the output
+    port's complete IO tile has been transferred.
+    """
+    regex = re.compile(r'^T\s+([\d.]+)\s*(ps|ns|us|ms|s)', re.IGNORECASE)
+    completion_times: List[float] = []
     current_time = None
+    current_elements = 0
+    current_tlast = False
+    inference_elements = 0
 
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
+    def finish_sample() -> None:
+        nonlocal current_elements, current_tlast, inference_elements
+        inference_elements += current_elements
+        if current_tlast and current_time is not None:
+            if elements_per_inference is None:
+                completion_times.append(current_time)
+            elif inference_elements == elements_per_inference:
+                completion_times.append(current_time)
+                inference_elements = 0
+            elif inference_elements > elements_per_inference:
+                raise ValueError(
+                    f'{path}: TLAST framing exceeded {elements_per_inference} elements per inference.'
+                )
+        current_elements = 0
+        current_tlast = False
 
-            m = regex.match(line)
-            if m:
-                val, unit = m.groups()
-                current_time = _convert_to_ns(int(val), unit)
+    with open(path) as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            match = regex.match(line)
+            if match:
+                if current_time is not None:
+                    finish_sample()
+                value, unit = match.groups()
+                current_time = _convert_to_ns(float(value), unit.lower())
                 continue
 
-            if 'TLAST' in line.upper():
-                if last_tlast_time is not None and current_time is not None:
-                    dt = current_time - last_tlast_time
-                    if dt >= 0:
-                        lat.append(dt)
-                last_tlast_time = current_time
+            tokens = line.split()
+            current_tlast = current_tlast or any(token.upper() == 'TLAST' for token in tokens)
+            current_elements += sum(token.upper() != 'TLAST' for token in tokens)
 
-    return lat
+    if current_time is not None:
+        finish_sample()
+    if elements_per_inference is not None and inference_elements:
+        raise ValueError(f'{path}: incomplete output inference containing {inference_elements} elements.')
+
+    return [
+        current - previous
+        for previous, current in zip(completion_times, completion_times[1:])
+        if current >= previous
+    ]
 
 
-def _convert_to_ns(value: int, unit: str) -> float:
+def _convert_to_ns(value: float, unit: str) -> float:
     if unit == 'ps':
         return value / 1000
     if unit == 'ns':
@@ -508,7 +557,7 @@ def collect_report(model_or_path) -> 'Report':
     per_core = _memory_by_core(project)
     for k in kernels:
         k.update({f'{kind}_B': v for kind, v in per_core.get(k['tile'], {}).items()})
-    latency = _analyze_aie_out_interval(project)
+    latency = _analyze_aie_out_interval(project, doc)
     report: Dict[str, Any] = {
         'project': str(project),
         'design': _design(project, vitis),

@@ -19,6 +19,7 @@ class LayerNormConfig:
     rows: int
     cols: int
     vec_size: int
+    accumulator_tag: Optional[str]
     gamma_shift: int
     out_shift: int
     eps_q0: int

@@ -23,8 +23,8 @@ BETA_FRAC_BITS = 15
 def layernorm_vec_size(precision, device) -> int:
     """Vector lane count for the fully-integer LayerNorm kernel.
 
-    The kernel computes sum/sum-of-squares with aie::accum<acc32, VEC> over
-    int8 inputs, so VEC is the int8 lane count of acc32 (32 on AIE-ML).
+    The kernel computes sum/sum-of-squares with the device's integer accumulator over
+    int8 inputs, so VEC is its 32-lane int8 vector width.
     Float variants will override this when added.
     """
     elem_bytes = storage_bytes_for_spec(precision)

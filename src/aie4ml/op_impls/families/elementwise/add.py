@@ -55,7 +55,7 @@ class AddOpImplVariant(OpImplVariant):
     plevel = 10
 
     def matches(self, _node: OpNode, device) -> bool:
-        return device.generation in ('AIE-ML', 'AIE-MLV2')
+        return device.generation in ('AIE', 'AIE-ML', 'AIE-MLV2')
 
     def resolve(self, node: OpNode, device, directives=None) -> AddConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
@@ -103,7 +103,7 @@ class AddOpImplVariant(OpImplVariant):
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
         vec_size = elementwise_vec_size(precision['lhs'], device)
         bank_bytes = int(device.bank_mem_bytes)
-        max_rows = max(1, int(device.rows))
+        max_rows = max(1, int(device.rows) - int(device.row_start))
         elem_bytes = storage_bytes_for_spec(precision['lhs'])
 
         if inherited_view is not None:
@@ -276,3 +276,14 @@ class AddOpImplVariant(OpImplVariant):
             },
             outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )
+
+    def boundary_input_access_endpoints(
+        self, _config: AddConfig, port: int, group: str | None = None
+    ) -> tuple[str, ...]:
+        kernel_port = {'in1': 0, 'in2': 1}.get(group)
+        if kernel_port is None:
+            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
+        return (f'kk[{int(port)}].in[{kernel_port}]',)
+
+    def boundary_output_access_endpoints(self, _config: AddConfig, port: int) -> tuple[str, ...]:
+        return (f'kk[{int(port)}].out[0]',)

@@ -13,9 +13,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from aie4ml.frontends.onnx import from_onnx
-from helpers import PART, TensorProto, dq, helper, make_model, qdq, qparams
-
-pytestmark = pytest.mark.requires_vitis
+from helpers import PART, TensorProto, dq, helper, lower, make_model, qdq, qparams
 
 ROWS, COLS = 32, 64
 B, S, DMAX, INV_SHIFT = 255, 2, 64, 15
@@ -100,6 +98,7 @@ def softmax_layouts():
     )
 
 
+@pytest.mark.requires_vitis
 def test_softmax_layouts_match_oracle(softmax_layouts, tmp_path):
     """Linear and tiled (2x8/4x8/8x8) all reproduce the integer HCCS oracle bit-for-bit."""
     _compile_and_check(softmax_layouts, VARIANTS, _feed(), tmp_path, project='softmax_layouts')
@@ -127,7 +126,40 @@ def boundary_softmax():
 
 
 @pytest.mark.parametrize('cas_num', [1, 2, 4], ids=['1-tile', '2-tiles', '4-tiles'])
+@pytest.mark.requires_vitis
 def test_softmax_row_split_matches_oracle(boundary_softmax, tmp_path, cas_num):
     """Splitting the rows across tiles -- both layouts stay bit-exact to the oracle."""
     directives = {'lin': _hccs(cas_num, layout='linear'), 'til': _hccs(cas_num, layout='tiled')}
     _compile_and_check(boundary_softmax, directives, _feed(), tmp_path, project=f'sm_split_{cas_num}')
+
+
+def test_softmax_rejects_noncanonical_uint8_scale(tmp_path):
+    nodes: list = []
+    dq(nodes, 'x_i8', 'x', 'x')
+    _softmax(nodes, 'y', 'sm')
+    model = make_model(
+        'softmax_bad_output_scale',
+        nodes=nodes,
+        inputs=[('x_i8', TensorProto.INT8, [ROWS, COLS])],
+        outputs=[('y', TensorProto.FLOAT, [ROWS, COLS])],
+        initializers=[*qparams('x'), *qparams('smo', frac=4, unsigned=True)],
+    )
+
+    with pytest.raises(ValueError, match=r'emits uint8 Q8 probabilities, got output frac=4'):
+        lower(model, tmp_path, {'sm': {'layout': 'linear'}}, batch=ROWS)
+
+
+def test_softmax_existing_ml_accumulator_is_unchanged(boundary_softmax, tmp_path):
+    directives = {'lin': {'layout': 'linear'}, 'til': {'layout': 'tiled'}}
+    ctx = lower(boundary_softmax, tmp_path, directives, batch=ROWS)
+
+    assert ctx.ir.execution.get('lin_aie').config.accumulator_tag == 'acc32'
+    assert ctx.ir.execution.get('til_aie').config.accumulator_tag == 'acc32'
+
+
+def test_softmax_prefers_tiled_and_honors_explicit_linear_layout(boundary_softmax, tmp_path):
+    directives = {'lin': {'layout': 'linear'}, 'til': {'parallelism': {'cas_num': 1}}}
+    ctx = lower(boundary_softmax, tmp_path, directives, batch=ROWS)
+
+    assert ctx.ir.execution.get('lin_aie').variant.variant_id == 'softmax.exp.i8.v1'
+    assert ctx.ir.execution.get('til_aie').variant.variant_id == 'softmax.exp.i8.tiled.v1'

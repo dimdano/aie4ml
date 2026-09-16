@@ -68,6 +68,10 @@ class DeviceSpec:
     column_start: int
     row_start: int
     plio_width_bits: int
+    core_stream_inputs: int
+    core_stream_outputs: int
+    stream_switch_width_bits: int
+    cascade_width_bits: int
     bank_mem_bytes: int
     max_mem_in_ports: int
     max_mem_out_ports: int
@@ -123,6 +127,10 @@ class DeviceSpec:
             column_start=_require_int(cfg, 'ColumnStart'),
             row_start=_require_int(cfg, 'RowStart'),
             plio_width_bits=_require_int(cfg, 'PLIOWidthBits'),
+            core_stream_inputs=_require_int(cfg, 'CoreStreamInputs'),
+            core_stream_outputs=_require_int(cfg, 'CoreStreamOutputs'),
+            stream_switch_width_bits=_require_int(cfg, 'StreamSwitchWidthBits'),
+            cascade_width_bits=_require_int(cfg, 'CascadeWidthBits'),
             bank_mem_bytes=bank_mem_bytes,
             max_mem_in_ports=_require_int(cfg, 'MaxMemTileInPorts'),
             max_mem_out_ports=_require_int(cfg, 'MaxMemTileOutPorts'),

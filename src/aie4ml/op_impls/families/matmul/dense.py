@@ -201,6 +201,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         extras = {'keepout_left': 1}
         if config.alternating_horizontal:
             extras['keepout_right'] = 1
+            extras['row_parity'] = 0
         return OpImplFootprint(
             width=config.parallelism.cas_length,
             height=config.parallelism.cas_num,
@@ -257,7 +258,9 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             outputs={t.name: PortBinding(group=f'out{i + 1}', count=n_out) for i, t in enumerate(node.outputs)},
         )
 
-    def boundary_input_access_endpoints(self, config: DenseConfig, port: int) -> tuple[str, ...]:
+    def boundary_input_access_endpoints(
+        self, config: DenseConfig, port: int, _group: str | None = None
+    ) -> tuple[str, ...]:
         port = int(port)
         cas_length = int(config.parallelism.cas_length)
         cas_num = int(config.parallelism.cas_num)

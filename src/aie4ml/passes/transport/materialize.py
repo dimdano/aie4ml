@@ -194,7 +194,9 @@ class _MemoryPlanMaterializer:
             )
             # Vitis accepts access constraints on hierarchical ports but does not apply their buffer reorder;
             # bind read/write access to the concrete kk[...].in/out[...] port instead.
-            access_endpoints = inst.variant.boundary_input_access_endpoints(inst.config, int(consumer_port))
+            access_endpoints = inst.variant.boundary_input_access_endpoints(
+                inst.config, int(consumer_port), consumer.group
+            )
             if not access_endpoints:
                 raise RuntimeError(f'{entry.logical_tensor}: direct graph input has no concrete kernel endpoint.')
             self.kernel_write_accesses.extend(

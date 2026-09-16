@@ -19,6 +19,7 @@ from .tiling import (
     extract_inner_outer,
     find_tile_split,
     inherited_microtile,
+    layout_variant_matches,
     parse_directives,
     requested_layout,
 )
@@ -39,6 +40,7 @@ __all__ = [
     'extract_inner_outer',
     'find_tile_split',
     'inherited_microtile',
+    'layout_variant_matches',
     'make_staging_descriptor',
     'map_view_axis',
     'ordered_view_shape',

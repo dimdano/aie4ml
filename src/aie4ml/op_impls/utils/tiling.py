@@ -51,12 +51,22 @@ def extract_inner_outer(shape: tuple[int, ...]) -> tuple[int, int, int]:
 
 
 def requested_layout(node) -> str:
-    """The layout a `layout:` directive asks of this node -- the selector between an op's
-    layout variants. Default keeps rows contiguous, what every non-matmul op reads."""
+    """Return and validate the explicitly requested layout, or ``linear`` when omitted."""
     layout = str(node.directives.get('layout', 'linear'))
     if layout not in TENSOR_LAYOUTS:
         raise ValueError(f'{node.name}: unknown layout {layout!r}; expected one of {sorted(TENSOR_LAYOUTS)}.')
     return layout
+
+
+def layout_variant_matches(node, layout: str) -> bool:
+    """Whether a layout variant may participate in selection.
+
+    With no directive all layouts participate, allowing ``plevel`` to express the preferred
+    implementation. An explicit layout remains an exact user constraint.
+    """
+    if 'layout' in node.directives:
+        return requested_layout(node) == layout
+    return True
 
 
 def inherited_microtile(node, input_contracts):
