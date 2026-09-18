@@ -133,9 +133,7 @@ def _parse_timing(path: Path, elements_per_inference: Optional[int] = None) -> L
                 completion_times.append(current_time)
                 inference_elements = 0
             elif inference_elements > elements_per_inference:
-                raise ValueError(
-                    f'{path}: TLAST framing exceeded {elements_per_inference} elements per inference.'
-                )
+                raise ValueError(f'{path}: TLAST framing exceeded {elements_per_inference} elements per inference.')
         current_elements = 0
         current_tlast = False
 
@@ -160,9 +158,7 @@ def _parse_timing(path: Path, elements_per_inference: Optional[int] = None) -> L
         raise ValueError(f'{path}: incomplete output inference containing {inference_elements} elements.')
 
     return [
-        current - previous
-        for previous, current in zip(completion_times, completion_times[1:])
-        if current >= previous
+        current - previous for previous, current in zip(completion_times, completion_times[1:]) if current >= previous
     ]
 
 
