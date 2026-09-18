@@ -1,4 +1,5 @@
 {% set P = L.op_impl.parameters %}
+{% from 'variants/placement.jinja' import buffer_locations %}
 struct {{L.struct_name}} {
   using data_t = {{P.precision.lhs.c_type}};
   using weight_t = {{P.precision.rhs.c_type}};
@@ -13,6 +14,8 @@ struct {{L.struct_name}} {
   static constexpr int SHIFT = {{P.shift}};
   static constexpr int BANK_BYTES = {{P.bank_mem_bytes}};
   static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
   static constexpr int M = {{P.microtiling.microtile_m}}, K = {{P.microtiling.microtile_k}}, N = {{P.microtiling.microtile_n}};
   static constexpr int col_placement = {{L.placement.col}};
   static constexpr int row_placement = {{L.placement.row}};

@@ -83,5 +83,29 @@
     "BankCount": 4,
     "TileMemBytes": 32768,
     "CascadeLayout": "alternating_horizontal"
+  },
+  "xilinx_vck190_base": {
+    "DeviceName": "VCK190",
+    "Generation": "AIE",
+    "Columns": 50,
+    "Rows": 8,
+    "ColumnStart": 7,
+    "RowStart": 0,
+    "PLIOWidthBits": 128,
+    "CoreStreamInputs": 2,
+    "CoreStreamOutputs": 2,
+    "StreamSwitchWidthBits": 32,
+    "CascadeWidthBits": 384,
+    "PLClockFreqMHz": 312.5,
+    "Memory": {
+      "BankMemBytes": 8192
+    },
+    "MaxMemTileInPorts": 0,
+    "MaxMemTileOutPorts": 0,
+    "VectorBytes": 32,
+    "HasMemTile": false,
+    "BankCount": 4,
+    "TileMemBytes": 32768,
+    "CascadeLayout": "alternating_horizontal"
   }
 }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -265,6 +267,26 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     assert '--platform=$(PLATFORM) $(APP_NAME).cpp' not in makefile
     assert makefile.count('set -o pipefail; v++ --compile') == 2
 
+    AIEProjectEmitter()._render_makefile(tmp_path, ctx, env, {'kernels': []})
+    hardware_makefile = (tmp_path / 'Makefile').read_text()
+    xpfm_error = f'Hardware system linking requires a Vitis .xpfm platform; {AIE1_PART} is a raw AIE part target.'
+    assert 'XPFM_GUARD := guard-XPFM' in hardware_makefile
+    assert f'guard-XPFM:\n\t$(error {xpfm_error})' in hardware_makefile
+    assert 'hw:     $(XPFM_GUARD) aiecom kernels xsa_hw     host package_hw' in hardware_makefile
+    assert f'\n$(error {xpfm_error})' not in hardware_makefile
+
+    (tmp_path / 'src' / 'kernels').mkdir(parents=True)
+    (tmp_path / 'app.cpp').touch()
+    (tmp_path / 'aie.cfg').touch()
+    make_env = {**os.environ, 'VITIS_HOME': '/tmp/vitis'}
+    x86com = subprocess.run(['make', '-n', 'x86com'], cwd=tmp_path, env=make_env, capture_output=True, text=True)
+    assert x86com.returncode == 0, x86com.stderr
+    assert f'--part={AIE1_PART}' in x86com.stdout
+
+    hardware = subprocess.run(['make', '-n', 'hw'], cwd=tmp_path, env=make_env, capture_output=True, text=True)
+    assert hardware.returncode != 0
+    assert xpfm_error in hardware.stderr
+
 
 @pytest.mark.parametrize('generation', ['', 'AIE-ML3', 'not-a-device'])
 def test_unknown_generation_is_rejected(generation):
@@ -381,7 +403,8 @@ def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):
     assert 'connect<>(self.dense_aie.out1[0], self.ofm[0]);' in graph_plan
 
     parameters = (aie_model.context.project_config.output_dir / 'src' / 'parameters.h').read_text()
-    assert 'static constexpr bool ALTERNATING_HORIZONTAL = true;' in parameters
+    assert 'KERNEL_LOCATIONS' not in parameters
+    assert '{ -1, 0, 2, 0, 3 }' in parameters
 
 
 def test_aie1_add_maps_both_direct_inputs_to_concrete_kernel_ports(tmp_path):
@@ -409,11 +432,11 @@ def test_aie1_tiled_normalization_chain_uses_direct_acc48_kernels(tmp_path):
     execution = aie_model.context.ir.execution
     plan = aie_model.context.ir.physical.plan
 
-    assert aie_model.context.ir.physical.placements['dense_aie']['row'] % 2 == 0
-    assert aie_model.context.ir.physical.placements['skip_dense_aie']['row'] % 2 == 0
-    assert aie_model.context.ir.physical.placements['add_aie']['row'] % 2 == 0
-    assert aie_model.context.ir.physical.placements['layernorm_aie']['row'] % 2 == 0
-    assert aie_model.context.ir.physical.placements['softmax_aie']['row'] % 2 == 0
+    for name in ('add_aie', 'layernorm_aie', 'softmax_aie'):
+        inst = execution.get(name)
+        locations = inst.variant.buffer_locations(inst.node, inst.config, anchor_row=1)
+        assert inst.config.alternating_horizontal is True
+        assert any(location.rel_col == 1 for location in locations if location.port_group == 'in1')
     assert execution.get('layernorm_aie').config.accumulator_tag == 'acc48'
     assert execution.get('softmax_aie').config.accumulator_tag == 'acc48'
     assert execution.get('layernorm_aie').variant.variant_id == 'layer_norm.i8.tiled.v1'
@@ -433,6 +456,16 @@ def test_aie1_tiled_normalization_chain_uses_direct_acc48_kernels(tmp_path):
     }
     assert all('.kk[' in item['endpoint'] for item in plan['kernel_write_accesses'])
     assert all('.kk[' in item['endpoint'] for item in plan['kernel_read_accesses'])
+
+    AIEProjectEmitter().emit(aie_model.context)
+    kernel_dir = aie_model.context.project_config.output_dir / 'src' / 'kernels'
+    for family, graph_name in (
+        ('elementwise_add', 'elementwise_add_graph.h'),
+        ('layer_norm', 'layer_norm_graph.h'),
+        ('softmax', 'softmax_graph.h'),
+    ):
+        graph = (kernel_dir / family / graph_name).read_text()
+        assert 'adf::bank(tileCol, tileRow, 1)' in graph
 
 
 def test_aie1_outer_parallel_dense_uses_direct_boundary_ports(tmp_path):
@@ -464,6 +497,9 @@ def test_aie1_dense_cascade_ports_follow_logical_snake_order(tmp_path):
         project='aie1_cascade',
     )
     plan = aie_model.context.ir.physical.plan
+    inst = aie_model.context.ir.execution.get('dense_aie')
+    anchor_row = aie_model.context.ir.physical.placements['dense_aie']['row']
+    locations = inst.variant.buffer_locations(inst.node, inst.config, anchor_row)
 
     assert [item['endpoint'] for item in plan['kernel_write_accesses']] == [
         'dense_aie.kk[0].in[0]',
@@ -475,13 +511,26 @@ def test_aie1_dense_cascade_ports_follow_logical_snake_order(tmp_path):
         'dense_aie.kk[1].out[0]',
         'dense_aie.kk[3].out[0]',
     ]
+    assert [
+        (location.rel_col, location.rel_row, location.banks)
+        for location in locations
+        if location.port_group == 'in1' and location.port == 0
+    ] == [
+        (-1, 0, (0, 3)),
+        (2, 1, (0, 3)),
+    ]
+    assert [
+        (location.port, location.rel_col, location.rel_row, location.banks)
+        for location in locations
+        if location.port_group == 'out1'
+    ] == [(0, 1, 0, (0, 3)), (1, 0, 1, (0, 3))]
 
     AIEProjectEmitter().emit(aie_model.context)
     graph = (
         aie_model.context.project_config.output_dir / 'src' / 'kernels' / 'dense_bias_relu' / 'dense_bias_relu_graph.h'
     ).read_text()
-    assert 'reverse ? CAS_LENGTH - 1 - pos : pos' in graph
-    assert 'const int inputMemoryCol = reverse ? tileCol + 1 : tileCol - 1;' in graph
+    assert 'ConfigT::ALTERNATING_HORIZONTAL' in graph
+    assert 'ConfigT::IN1_BUFFER_LOCATIONS[idx]' in graph
 
 
 def test_aie1_dense_stack_inherits_direct_producer_partition(tmp_path):

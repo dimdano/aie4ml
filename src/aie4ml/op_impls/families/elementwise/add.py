@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -212,6 +212,7 @@ class AddOpImplVariant(OpImplVariant):
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             preserved_staging=preserved_staging,
             preserved_tensors=preserved_tensors,
             flags=flags,
@@ -227,10 +228,11 @@ class AddOpImplVariant(OpImplVariant):
                     f'does not match output_port_count {port_count}.'
                 )
 
-    def build_template_params(self, node: OpNode, config: AddConfig):
+    def build_template_params(self, node: OpNode, config: AddConfig, placement):
         lhs_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
-        params.update(tile_elements=int(math.prod(lhs_view.tile)))
+        params['tile_elements'] = int(math.prod(lhs_view.tile))
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
@@ -263,7 +265,20 @@ class AddOpImplVariant(OpImplVariant):
         return []
 
     def footprint(self, node: OpNode, config: AddConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=config.parallelism.cas_num, extras={'keepout_left': 1})
+        return OpImplFootprint(
+            width=1,
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
+        )
+
+    def buffer_locations(self, _node: OpNode, config: AddConfig, anchor_row: int):
+        locations = []
+        for row in range(int(config.parallelism.cas_num)):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            locations.append(BufferLocation('in1', row, 1 if reverse else -1, row, (0, 3)))
+            locations.append(BufferLocation('in2', row, 0, row, (1, 2)))
+            locations.append(BufferLocation('out1', row, 0, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: AddConfig):
         lhs_tensor = input_tensor_for_role(node, 'lhs')

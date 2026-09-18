@@ -52,33 +52,51 @@ public:
   {
     for (int idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx)
     {
-      const int tileRow = ROW_START + (idx / CAS_LENGTH);
-      const int tileCol = COL_START + (idx % CAS_LENGTH);
-      const bool is_last = (idx % CAS_LENGTH) == (CAS_LENGTH - 1);
+      const int pos = idx % CAS_LENGTH;
+      const int chain = idx / CAS_LENGTH;
+      const bool is_last = pos == CAS_LENGTH - 1;
+      const bool reverse = ConfigT::ALTERNATING_HORIZONTAL && ((ROW_START + chain) % 2 != 0);
+      const auto lhsLocation = ConfigT::INA_BUFFER_LOCATIONS[idx];
+      const auto rhsLocation = ConfigT::INB_BUFFER_LOCATIONS[idx];
+      const int tileCol = COL_START + (reverse ? CAS_LENGTH - 1 - pos : pos);
+      const int tileRow = ROW_START + chain;
 
       adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
 
-      const int memCol = tileCol - 1;
-      const int memRow = tileRow;
+      if (lhsLocation.bank_count == 1) {
+        adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
+          COL_START + lhsLocation.col, ROW_START + lhsLocation.row, lhsLocation.bank0);
+      } else {
+        adf::location<adf::buffer>(kk[idx].in[0]) = {
+          adf::bank(COL_START + lhsLocation.col, ROW_START + lhsLocation.row, lhsLocation.bank0),
+          adf::bank(COL_START + lhsLocation.col, ROW_START + lhsLocation.row, lhsLocation.bank1)
+        };
+      }
 
-      adf::location<adf::buffer>(kk[idx].in[0]) = {
-        adf::bank(memCol, memRow, 0),
-        adf::bank(memCol, memRow, 3)
-      };
-
-      adf::location<adf::buffer>(kk[idx].in[1]) = {
-        adf::bank(tileCol, memRow, 1),
-        adf::bank(tileCol, memRow, 2)
-      };
+      if (rhsLocation.bank_count == 1) {
+        adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(
+          COL_START + rhsLocation.col, ROW_START + rhsLocation.row, rhsLocation.bank0);
+      } else {
+        adf::location<adf::buffer>(kk[idx].in[1]) = {
+          adf::bank(COL_START + rhsLocation.col, ROW_START + rhsLocation.row, rhsLocation.bank0),
+          adf::bank(COL_START + rhsLocation.col, ROW_START + rhsLocation.row, rhsLocation.bank1)
+        };
+      }
 
       // Stack shares one B bank, but let compiler choose the offset.
-      adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, memRow, 1);
+      adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
 
       if (is_last) {
-        adf::location<adf::buffer>(kk[idx].out[0]) = {
-          adf::bank(tileCol, tileRow, 0),
-          adf::bank(tileCol, tileRow, 3)
-        };
+        const auto outputLocation = ConfigT::OUTC_BUFFER_LOCATIONS[idx / CAS_LENGTH];
+        if (outputLocation.bank_count == 1) {
+          adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
+            COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0);
+        } else {
+          adf::location<adf::buffer>(kk[idx].out[0]) = {
+            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0),
+            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
+          };
+        }
       }
     }
   }

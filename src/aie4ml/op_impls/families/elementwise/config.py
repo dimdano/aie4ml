@@ -22,6 +22,7 @@ class AddConfig:
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
+    alternating_horizontal: bool
     preserved_staging: Optional[Tuple[Dict[str, Any], ...]] = None
     #: Inputs `preserved_staging` describes verbatim, so they hand over with no memtile.
     preserved_tensors: Tuple[str, ...] = ()

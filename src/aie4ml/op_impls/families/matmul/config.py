@@ -57,4 +57,5 @@ class MatmulConfig:
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
+    alternating_horizontal: bool
     flags: MatmulFlags

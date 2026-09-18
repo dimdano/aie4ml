@@ -8,6 +8,10 @@ This document describes the PL integration code-generation flow added to **aie4m
 
 The hardware / emulation build needs the Vitis tools (`v++`), the
 aarch64 cross-compiler, XRT, and the board's rootfs / kernel image.
+The `part` passed to a hardware build must name a Vitis `.xpfm` platform, not only a raw
+AIE device part. A raw part is sufficient for standalone AIE compilation and simulation,
+but it does not describe the programmable-logic resources and interfaces required by
+`v++` system linking and packaging.
 
 ```bash
     source <>/2025.2/Vitis/settings64.sh
@@ -34,6 +38,10 @@ aie_model = hls4ml.converters.convert_from_keras_model(
 
 - `target='aie'` (default): unchanged — emits only AIE source
 - `target='hardware'`: additionally emits the PL data mover, connectivity, host, and a Makefile with hw and hw_emu compilation
+
+The generated project still permits `make x86com`, `make x86sim`, and standalone AIE
+compilation when its device is a raw part. `make hw` and `make hw_emu` fail explicitly until
+the design is regenerated for a matching `.xpfm` platform.
 ---
 
 ## 2. What gets emitted
@@ -148,17 +156,19 @@ Supported today:
   (from the dense `cas_num × cas_length` parallelism) is fully handled;
 - **multi-layer** graphs — per-layer weights/bias are loaded as RTP;
 - **int8** I/O with **128-bit PLIO** and **512-bit-aligned** per-stream sizes.
-- Input copies in PL are hardcoded to 64 iterations and stored in PL memory
-- Hardware execution on the board showing end to end time from host as well as PL kernel
-- PL memory can be seleted as URAM or BRAM. (Only URAM is tested)
+- `benchmark`, `memory_stream`, and `external_stream` PL data-mover modes;
+- configurable iteration counts, with the benchmark mode capped from the selected PL-memory
+  block budget;
+- ping-pong buffering in the `memory_stream` movers;
+- hardware execution with host and optional PL timing;
+- URAM or BRAM selection for PL-resident buffers (URAM has received the most testing).
 
 Not yet supported:
+- system linking from a raw AIE part; an `.xpfm` platform matching the target board is required;
 - per-stream sizes that are not 512-bit aligned (would need padding);
 - non-int8 element types / non-128-bit PLIO in the data mover lane math.
 - hardware emulation execution is not automated via python
 - Tiling in PL is not supported
-- PL does not support double buffering
-- Execution time measurement via PL kernel is not a config it's hardcoded for now
 - No golden verification. The host replays the input, runs the design, and reads the
   output back (it can dump it), but does not compare against a precomputed golden. (Functional
   verification of the array itself is done via the existing x86/AIE simulators.)

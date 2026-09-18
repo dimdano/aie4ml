@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -162,6 +162,7 @@ class _LayerNormVariantBase(OpImplVariant):
             out_shift=int(to_quant_intent(out_tensor.precision).frac),
             eps_q0=_resolve_eps_q0(node.name, node.metadata, int(precision['lhs'].frac)),
             rounding_mode=aie_rounding_token(precision['output']),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             io_views=io_views,
             io_route=io_route,
             layout=self.layout_name,
@@ -177,8 +178,10 @@ class _LayerNormVariantBase(OpImplVariant):
                 'integer LayerNorm cannot left-shift or exceed NORM_SHIFT=15.'
             )
 
-    def build_template_params(self, _node: OpNode, config: LayerNormConfig):
-        return {f: getattr(config, f) for f in config.__dataclass_fields__}
+    def build_template_params(self, node: OpNode, config: LayerNormConfig, placement):
+        params = {f: getattr(config, f) for f in config.__dataclass_fields__}
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
+        return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         return describe_partition_staging(
@@ -246,7 +249,19 @@ class _LayerNormVariantBase(OpImplVariant):
         ]
 
     def footprint(self, node: OpNode, config: LayerNormConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=int(config.parallelism.cas_num), extras={'keepout_left': 1})
+        return OpImplFootprint(
+            width=1,
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
+        )
+
+    def buffer_locations(self, _node: OpNode, config: LayerNormConfig, anchor_row: int):
+        locations = []
+        for row in range(int(config.parallelism.cas_num)):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            locations.append(BufferLocation('in1', row, 1 if reverse else -1, row, (0, 3)))
+            locations.append(BufferLocation('out1', row, 0, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: LayerNormConfig):
         in_tensor = input_tensor_for_role(node, 'lhs')

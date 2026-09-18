@@ -1,4 +1,5 @@
 {% set P = L.op_impl.parameters %}
+{% from 'variants/placement.jinja' import buffer_locations %}
 struct {{L.struct_name}} {
   using input_t  = {{P.precision.lhs.c_type}};
   using output_t = {{P.precision.output.c_type}};
@@ -12,6 +13,8 @@ struct {{L.struct_name}} {
   static constexpr int OUT_SHIFT   = {{P.out_shift}};
   static constexpr int EPS_Q0      = {{P.eps_q0}};
   static constexpr bool LAYOUT_TILED = {{ 'true' if P.layout == 'tiled' else 'false' }};
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
   static constexpr int  MICROTILE_OUTER = {{ P.microtile.outer if P.microtile else 0 }};
   static constexpr int  MICROTILE_INNER = {{ P.microtile.inner if P.microtile else 0 }};
   static constexpr bool TRANSPOSE_INPUT = {{ 'true' if P.transpose_input else 'false' }};

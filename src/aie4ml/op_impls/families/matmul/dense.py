@@ -7,7 +7,7 @@ import numpy as np
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives
@@ -45,7 +45,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
 
     contract: ClassVar[str]
 
-    def build_template_params(self, node, config):
+    def build_template_params(self, node, config, placement):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         lhs_view = config.io_views[lhs_tensor.name]
         output_view = config.io_views[node.outputs[0].name]
@@ -59,6 +59,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_lhs_raw=lhs_view.tile_raw_inner,
             tile_inner_rhs_raw=output_view.tile_raw_inner,
         )
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def kernel_outer_extent(self, lhs_view):
@@ -198,15 +199,26 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return W, b, int(W.shape[-2]), int(W.shape[-1])
 
     def footprint(self, _node, config) -> OpImplFootprint:
-        extras = {'keepout_left': 1}
-        if config.alternating_horizontal:
-            extras['keepout_right'] = 1
-            extras['row_parity'] = 0
         return OpImplFootprint(
-            width=config.parallelism.cas_length,
-            height=config.parallelism.cas_num,
-            extras=extras,
+            width=int(config.parallelism.cas_length),
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
         )
+
+    def buffer_locations(self, _node, config, anchor_row):
+        locations = []
+        cas_num = int(config.parallelism.cas_num)
+        cas_length = int(config.parallelism.cas_length)
+        outer = config.parallelism.contract == 'outer'
+        for chain in range(cas_num):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + chain) % 2)
+            for pos in range(cas_length):
+                idx = chain * cas_length + pos
+                tile_col = cas_length - 1 - pos if reverse else pos
+                port = idx if outer else pos
+                locations.append(BufferLocation('in1', port, tile_col + 1 if reverse else tile_col - 1, chain, (0, 3)))
+            locations.append(BufferLocation('out1', chain, 0 if reverse else cas_length - 1, chain, (0, 3)))
+        return tuple(locations)
 
     def get_artifacts(self, inst: OpImplInstance):
         inst_name = sanitize_identifier(inst.name)

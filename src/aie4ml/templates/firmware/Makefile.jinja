@@ -34,9 +34,6 @@ PLATFORM      ?= $(VITIS_HOME)/base_platforms/$(PLATFORM_USE)/$(PLATFORM_USE).xp
 AIE_TARGET    := --platform=$(PLATFORM)
 {% endif %}
 {% if is_hardware %}
-{% if aie_compiler_target == 'part' %}
-$(error Hardware system linking requires a Vitis .xpfm platform; {{ platform }} is a raw AIE part target.)
-{% endif %}
 SDK_VER          := 2025.2
 ROOTFS           ?= ${PLATFORM_REPO_PATHS}/host/versal/xilinx-versal-common-v$(SDK_VER)/rootfs.ext4
 IMAGE            ?= ${PLATFORM_REPO_PATHS}/host/versal/xilinx-versal-common-v$(SDK_VER)/Image
@@ -100,6 +97,13 @@ guard-CXX:
 	$(call check_defined, CXX, Run: xilinx-versal-common-v$(SDK_VER)/environment-setup-aarch64-xilinx-linux)
 guard-SDKTARGETSYSROOT:
 	$(call check_defined, SDKTARGETSYSROOT, Run: xilinx-versal-common-v$(SDK_VER)/environment-setup-aarch64-xilinx-linux)
+{% if aie_compiler_target == 'part' %}
+XPFM_GUARD := guard-XPFM
+guard-XPFM:
+	$(error Hardware system linking requires a Vitis .xpfm platform; {{ platform }} is a raw AIE part target.)
+{% else %}
+XPFM_GUARD :=
+{% endif %}
 
 .PHONY: hw hw_emu aiecom kernels xsa_hw xsa_hw_emu host package_hw package_hw_emu run_emu
 {% endif %}
@@ -155,21 +159,21 @@ analyze:
 
 {% if is_hardware %}
 # ---------- Hardware: on-board (hw) and emulation (hw_emu) ----------
-hw:     aiecom kernels xsa_hw     host package_hw
-hw_emu: aiecom kernels xsa_hw_emu host package_hw_emu
+hw:     $(XPFM_GUARD) aiecom kernels xsa_hw     host package_hw
+hw_emu: $(XPFM_GUARD) aiecom kernels xsa_hw_emu host package_hw_emu
 
 # ---------- PL kernels (HLS data movers -> .xo) ----------
-kernels: guard-PLATFORM_REPO_PATHS
+kernels: $(XPFM_GUARD) guard-PLATFORM_REPO_PATHS
 {% for k in pl_plan.kernels %}
 	$(VPP) $(VPP_XO_FLAGS) --config pl/{{ k.name }}.cfg
 {% endfor %}
 
 # ---------- XSA (link PL .xo + AIE graph) ----------
-xsa_hw: guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
+xsa_hw: $(XPFM_GUARD) guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
 	$(VPP) -l -t hw --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM)_hw.xsa
 	@echo "COMPLETE: $(PFM)_hw.xsa (hw) created."
 
-xsa_hw_emu: guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
+xsa_hw_emu: $(XPFM_GUARD) guard-PLATFORM_REPO_PATHS $(LIBADF) $(KERNEL_XO)
 	$(VPP) -l -t hw_emu --platform $(PLATFORM) $(KERNEL_XO) $(LIBADF) --save-temps -g --config $(CONFIG_FILE) -o $(PFM)_hw_emu.xsa
 	@echo "COMPLETE: $(PFM)_hw_emu.xsa (hw_emu) created."
 
@@ -182,7 +186,7 @@ host: guard-CXX guard-SDKTARGETSYSROOT
 	@echo "COMPLETE: Host application ($(OUTPUT_DIR)/host.exe) created."
 
 # ---------- Package (sd_card) ----------
-package_hw: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
+package_hw: $(XPFM_GUARD) guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
 	mkdir -p $(OUTPUT_DIR)
 	v++ -p -t hw \
 		-f $(PLATFORM) \
@@ -195,7 +199,7 @@ package_hw: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
 		--package.sd_file $(OUTPUT_DIR)/host.exe $(PFM)_hw.xsa $(LIBADF)
 	@echo "COMPLETE: hw package created."
 
-package_hw_emu: guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
+package_hw_emu: $(XPFM_GUARD) guard-PLATFORM_REPO_PATHS guard-IMAGE guard-ROOTFS
 	mkdir -p $(OUTPUT_DIR)
 	v++ -p -t hw_emu \
 		-f $(PLATFORM) \

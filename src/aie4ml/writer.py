@@ -83,7 +83,7 @@ class AIEProjectEmitter:
                     'graph_header': inst.graph_header,
                     'graph_name': inst.graph_name,
                     'param_template': inst.param_template,
-                    'parameters': variant.build_template_params(node, inst.config),
+                    'parameters': variant.build_template_params(node, inst.config, placement),
                 },
                 'io_views': inst.io_views,
                 'placement': placement,

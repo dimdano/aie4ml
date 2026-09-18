@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -150,6 +150,7 @@ class _SoftmaxVariantBase(OpImplVariant):
             parallelism=ParallelismConfig(cas_num=int(cas_num), contract='outer'),
             vec_size=int(vec_size),
             accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             io_views=io_views,
             io_route=io_route,
             layout=self.layout_name,
@@ -170,11 +171,12 @@ class _SoftmaxVariantBase(OpImplVariant):
                 f'got output frac={config.precision["output"].frac}.'
             )
 
-    def build_template_params(self, node: OpNode, config: SoftmaxConfig):
+    def build_template_params(self, node: OpNode, config: SoftmaxConfig, placement):
         in_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         params.update(rows=int(in_view.compacted_tile_outer), cols=int(in_view.full_inner))
         params['packed_hccs'] = self._packed_hccs(config, int(in_view.full_inner))
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
@@ -202,7 +204,19 @@ class _SoftmaxVariantBase(OpImplVariant):
         return []
 
     def footprint(self, node: OpNode, config: SoftmaxConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=int(config.parallelism.cas_num), extras={'keepout_left': 1})
+        return OpImplFootprint(
+            width=1,
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
+        )
+
+    def buffer_locations(self, _node: OpNode, config: SoftmaxConfig, anchor_row: int):
+        locations = []
+        for row in range(int(config.parallelism.cas_num)):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            locations.append(BufferLocation('in1', row, 1 if reverse else -1, row, (0, 3)))
+            locations.append(BufferLocation('out1', row, 0, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: SoftmaxConfig):
         in_tensor = input_tensor_for_role(node, 'lhs')
