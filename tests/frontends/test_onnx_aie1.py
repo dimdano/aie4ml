@@ -11,6 +11,7 @@ from aie4ml.device_catalog import resolve_device
 from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
 from aie4ml.op_impls.common_types import PortBinding, to_plain
 from aie4ml.op_impls.families.matmul.common import select_generation_key
+from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
 from aie4ml.op_impls.utils.precision import infer_accumulator_tag
 from aie4ml.passes import Resolve
 from aie4ml.writer import AIEProjectEmitter
@@ -28,6 +29,20 @@ def test_device_stream_switch_width(part, expected_width):
     device, _ = resolve_device(part, {})
 
     assert device.stream_switch_width_bits == expected_width
+
+
+def test_matmul_boundary_dma_targets_concrete_kernel_ports():
+    inner = SimpleNamespace(parallelism=SimpleNamespace(cas_length=2, cas_num=3, contract='inner'))
+    outer = SimpleNamespace(parallelism=SimpleNamespace(cas_length=2, cas_num=3, contract='outer'))
+
+    assert MatmulOpImplVariant().boundary_input_access_endpoints(inner, 1, 'inA') == (
+        'kk[1].in[0]',
+        'kk[3].in[0]',
+        'kk[5].in[0]',
+    )
+    assert MatmulRowWiseOpImplVariant().boundary_input_access_endpoints(outer, 4, 'inA') == ('kk[4].in[0]',)
+    assert MatmulRowWiseOpImplVariant().boundary_input_access_endpoints(outer, 4, 'inB') == ('kk[4].in[1]',)
+    assert MatmulRowWiseOpImplVariant().boundary_output_access_endpoints(outer, 2) == ('kk[5].out[0]',)
 
 
 def _qparams(prefix: str, elem_type: int, *, frac: int = 4) -> list:

@@ -141,6 +141,23 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
             outputs={node.outputs[0].name: PortBinding(group='outC', count=int(config.parallelism.cas_num))},
         )
 
+    def boundary_input_access_endpoints(
+        self, config: MatmulConfig, port: int, group: str | None = None
+    ) -> tuple[str, ...]:
+        port = int(port)
+        cas_length = int(config.parallelism.cas_length)
+        if group == 'inB':
+            return (f'kk[{port}].in[1]',)
+        if group != 'inA':
+            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
+        if config.parallelism.contract == 'outer':
+            return (f'kk[{port}].in[0]',)
+        return tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(int(config.parallelism.cas_num)))
+
+    def boundary_output_access_endpoints(self, config: MatmulConfig, port: int) -> tuple[str, ...]:
+        index = int(port) * int(config.parallelism.cas_length) + int(config.parallelism.cas_length) - 1
+        return (f'kk[{index}].out[0]',)
+
 
 @register_variant
 class MatmulOpImplVariant(_MatmulVariantBase):
