@@ -34,8 +34,10 @@ class TransportCollector:
         graph_output_names = set(self.ctx.ir.logical.output_tensor_names)
         for name in graph_output_names:
             tensor = self.ctx.ir.logical.tensors[name]
-            if tensor.producer is not None and tensor.producer.op_type in ('slice', 'split'):
-                raise NotImplementedError(f'{name}: slice-backed graph outputs are not implemented.')
+            if tensor.producer is not None and tensor.producer.op_type in ('slice', 'split', 'concat'):
+                raise NotImplementedError(
+                    f'{name}: {tensor.producer.op_type}-backed graph outputs are not implemented.'
+                )
 
         # inputs — skip parameter tensors
         for n in nodes:

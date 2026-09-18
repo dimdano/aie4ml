@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ...ir import get_backend_context
 from ..base import AIEPass
-from .legality import direct_transport_supported
+from .legality import direct_transport_failure
 from .model import TransportDecision
 
 
@@ -37,17 +37,16 @@ class ClassifyTransportEntries(AIEPass):
             return TransportDecision(realization, True if realization == 'direct' else None)
 
         consumer = entry.single_consumer()
-        staging_compatible = not self._has_consumer_perm(consumer) and direct_transport_supported(
-            ctx,
-            entry.logical_tensor,
-            entry.producer,
-            consumer,
-        )
+        if self._has_consumer_perm(consumer):
+            direct_failure = f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
+        else:
+            direct_failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
+        staging_compatible = direct_failure is None
         if route == 'direct':
             if not staging_compatible:
                 raise RuntimeError(
                     f'{entry.logical_tensor}: io_route=direct requested but point-to-point transport '
-                    'is not staging-compatible.'
+                    f'is not staging-compatible: {direct_failure}.'
                 )
             realization = 'direct'
         elif route == 'memtile':
@@ -61,8 +60,8 @@ class ClassifyTransportEntries(AIEPass):
                 realization = 'direct'
             elif not has_memtile:
                 raise RuntimeError(
-                    f'{entry.logical_tensor}: AIE1 direct transport requires matching producer and consumer '
-                    'staging; relay/relayout is not implemented.'
+                    f'{entry.logical_tensor}: AIE1 cannot directly connect this transport: {direct_failure}; '
+                    'relay/relayout is not implemented.'
                 )
             else:
                 realization = 'memtile'

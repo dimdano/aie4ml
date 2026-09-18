@@ -24,6 +24,7 @@ from helpers import (
 )
 
 ROWS, COLS = 32, 64
+AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 
 
 @pytest.fixture
@@ -94,6 +95,20 @@ def test_a_linear_consumer_of_tiled_data_needs_a_memtile(dense_then_layernorm, t
     ctx = _lower(dense_then_layernorm, tmp_path, parallelism(4) | {'layout': 'linear'})
     assert ('fc_aie', 'ln_aie') not in direct_edges(ctx)
     assert 'fc_out' in memtiles(ctx)
+
+
+def test_aie1_staging_mismatch_identifies_the_ports_and_descriptor_fields(dense_then_layernorm, tmp_path):
+    with pytest.raises(
+        RuntimeError,
+        match=r'staging mismatch at fc_aie\.out1\[0\] -> ln_aie\.in1\[0\] \([^)]*tiling_dimension',
+    ):
+        lower(
+            dense_then_layernorm,
+            tmp_path,
+            {'fc': parallelism(4, contract='outer'), 'ln': parallelism(4) | {'layout': 'linear'}},
+            part=AIE1_PART,
+            batch=ROWS,
+        )
 
 
 def test_same_layout_is_not_enough_when_the_partition_differs(dense_then_layernorm, tmp_path):

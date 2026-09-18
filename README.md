@@ -9,7 +9,7 @@
 
 `aie4ml` is an end-to-end compiler that generates **optimized** AIE firmware automatically, which can be then built and simulated directly using **AMD Vitis**. It targets the **AMD AI Engine (AIE)** from model-level frontends and lowers supported operators into AIE graphs and kernels as a standalone AIE project.
 
-- Current hardware targets: AIE-ML and AIE-MLv2 devices.
+- Current hardware targets: AIE1, AIE-ML and AIE-MLv2 devices.
 - Current frontend paths: ONNX for explicit operator graphs, and an optional [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) frontend path.
 
 ## Current Support
