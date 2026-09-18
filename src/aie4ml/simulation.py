@@ -79,66 +79,40 @@ class IOLayout:
 
 def build_io_layout(model) -> IOLayout:
     """
-    Build a canonical per-port IO layout strictly from:
-      - ctx.ir.physical.plan['buffers']
+    Build the canonical per-port layout published by the physical plan.
     """
     ctx = get_backend_context(model)
     plan = ctx.ir.physical.plan
-    buffers = plan['buffers']
+    io_ports = plan.get('io_ports')
+    if not isinstance(io_ports, list):
+        raise RuntimeError('Physical plan is missing io_ports required for IO layout reconstruction.')
 
     inputs: Dict[str, List[IOPortLayout]] = {}
     outputs: Dict[str, List[IOPortLayout]] = {}
 
-    for buf in buffers:
-        tensor = buf['tensor']
+    for item in io_ports:
+        direction = item.get('direction')
+        if direction not in ('input', 'output'):
+            raise RuntimeError(f'Physical plan contains invalid IO direction {direction!r}.')
+        tensor = item.get('tensor')
+        if not tensor:
+            raise RuntimeError('Physical plan contains an IO port without a tensor name.')
+        staging = item.get('staging')
+        dtype = _dtype_from_plan(item.get('dtype'))
+        if staging is None:
+            raise RuntimeError(f'{tensor}: physical plan is missing graph-{direction} staging data.')
+        if dtype is None:
+            raise RuntimeError(f'{tensor}: physical plan is missing graph-{direction} dtype data.')
 
-        for writer in buf['writers']:
-            if writer['source_type'] != 'plio':
-                continue
-            if writer['source_endpoint']['name'] != 'ifm':
-                continue
-            port = int(writer['source_endpoint']['port'])
-            st = writer.get('staging')
-            dtype = _dtype_from_plan(writer.get('dtype'))
-            if st is None:
-                raise RuntimeError(f'{tensor}: physical plan is missing graph-input staging data.')
-            if dtype is None:
-                raise RuntimeError(f'{tensor}: physical plan is missing graph-input dtype data.')
-
-            inputs.setdefault(tensor, []).append(
-                IOPortLayout(
-                    direction='input',
-                    port=port,
-                    tensor=tensor,
-                    descriptor=writer['descriptor'],
-                    staging=st,
-                    dtype=dtype,
-                )
-            )
-
-        for reader in buf['readers']:
-            if reader.get('target_type') != 'plio':
-                continue
-            if reader['target_endpoint']['name'] != 'ofm':
-                continue
-            port = int(reader['target_endpoint']['port'])
-            st = reader.get('staging')
-            dtype = _dtype_from_plan(reader.get('dtype'))
-            if st is None:
-                raise RuntimeError(f'{tensor}: physical plan is missing graph-output staging data.')
-            if dtype is None:
-                raise RuntimeError(f'{tensor}: physical plan is missing graph-output dtype data.')
-
-            outputs.setdefault(tensor, []).append(
-                IOPortLayout(
-                    direction='output',
-                    port=port,
-                    tensor=tensor,
-                    descriptor=reader['descriptor'],
-                    staging=st,
-                    dtype=dtype,
-                )
-            )
+        port = IOPortLayout(
+            direction=direction,
+            port=int(item['port']),
+            tensor=tensor,
+            descriptor=item['descriptor'],
+            staging=staging,
+            dtype=dtype,
+        )
+        (inputs if direction == 'input' else outputs).setdefault(tensor, []).append(port)
 
     for t in inputs:
         inputs[t] = sorted(inputs[t], key=lambda p: p.port)

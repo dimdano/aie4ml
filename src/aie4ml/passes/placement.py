@@ -9,9 +9,10 @@ import logging
 from dataclasses import dataclass, field
 from itertools import permutations
 from statistics import median
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..ir import get_backend_context
+from ..op_impls.base import BufferLocation
 from .base import AIEPass
 
 log = logging.getLogger(__name__)
@@ -59,6 +60,7 @@ class Rect:
     keepout_bottom: int = 0
 
     extras: Dict[str, Any] = field(default_factory=dict)
+    buffer_locations: Optional[Callable[[int], Tuple[BufferLocation, ...]]] = None
 
 
 @dataclass
@@ -83,6 +85,9 @@ class EdgeSpec:
     tensor: Optional[str] = None
     direct: bool = False
     producer_exclusive: bool = True
+    src_group: str = ''
+    dst_group: str = ''
+    port_pairs: Tuple[Tuple[int, int], ...] = ()
 
 
 @dataclass
@@ -186,10 +191,16 @@ def _coerce_rect(footprint: Any) -> Rect:
       input_side:  "left" | "right" | "top" | "bottom"
       output_side: "left" | "right" | "top" | "bottom"
       keepout_left / keepout_right / keepout_top / keepout_bottom
+      row_parity: 0 for even starting rows or 1 for odd starting rows
     """
     w = int(getattr(footprint, 'width'))
     h = int(getattr(footprint, 'height'))
     extras = dict(getattr(footprint, 'extras', {}) or {})
+    if extras.get('row_parity') is not None:
+        row_parity = int(extras['row_parity'])
+        if row_parity not in (0, 1):
+            raise ValueError(f'Invalid row_parity: {row_parity}; expected 0 or 1.')
+        extras['row_parity'] = row_parity
 
     input_face = _parse_face(
         extras.get('input_face'),
@@ -204,15 +215,12 @@ def _coerce_rect(footprint: Any) -> Rect:
         h=h,
     )
 
-    # Preserve the old dense-like bank-conflict spacing by default.
-    default_keepout_left = 1 if input_face.side == 'left' else 0
-
     return Rect(
         w=w,
         h=h,
         input_face=input_face,
         output_face=output_face,
-        keepout_left=int(extras.get('keepout_left', default_keepout_left)),
+        keepout_left=int(extras.get('keepout_left', 0)),
         keepout_right=int(extras.get('keepout_right', 0)),
         keepout_top=int(extras.get('keepout_top', 0)),
         keepout_bottom=int(extras.get('keepout_bottom', 0)),
@@ -330,26 +338,50 @@ def _boxes_conflict(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) 
     return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
 
 
-def _direct_left_bank_reuse(producer: Placed, consumer: Placed, graph: GraphSpec) -> bool:
-    """Whether a face-adjacent pair may share the consumer's left-bank keepout.
+def _absolute_bank_locations(
+    placed: Placed,
+    *,
+    group: str,
+    port: int,
+) -> set[Tuple[int, int, Tuple[int, ...]]]:
+    if placed.rect.buffer_locations is None:
+        return set()
+    return {
+        (placed.x + location.rel_col, placed.y + location.rel_row, tuple(location.banks))
+        for location in placed.rect.buffer_locations(placed.y)
+        if location.port_group == group and location.port == int(port)
+    }
 
-    Most ops (like dense/matmul) use banks 0/3 of the tile to its left, which is why every such op
-    reserves a keepout column. When the left neighbour is the direct, exclusive producer,
-    those banks are exactly where it wrote its output, so only one buffer is used for read/write.
-    """
-    if producer.rect.output_face.side != 'right' or consumer.rect.input_face.side != 'left':
-        return False
-    if producer.x + producer.rect.w != consumer.x:
-        return False
-    if not any(
-        edge.direct and edge.producer_exclusive and edge.src == producer.name and edge.dst == consumer.name
+
+def _direct_buffer_aliases(producer: Placed, consumer: Placed, graph: GraphSpec) -> bool:
+    """Whether a direct edge aliases the same physical banks at every paired port."""
+    edges = [
+        edge
         for edge in graph.edges
-    ):
+        if edge.direct
+        and edge.producer_exclusive
+        and edge.src == producer.name
+        and edge.dst == consumer.name
+        and edge.port_pairs
+    ]
+    if not edges:
         return False
 
-    _, _, producer_y0, producer_y1 = _face_abs_box(producer, producer.rect.output_face)
-    _, _, consumer_y0, consumer_y1 = _face_abs_box(consumer, consumer.rect.input_face)
-    return producer_y0 == consumer_y0 and producer_y1 == consumer_y1
+    alias_tiles = set()
+    for edge in edges:
+        for src_port, dst_port in edge.port_pairs:
+            source = _absolute_bank_locations(producer, group=edge.src_group, port=src_port)
+            target = _absolute_bank_locations(consumer, group=edge.dst_group, port=dst_port)
+            if not source or source != target:
+                return False
+            alias_tiles.update((col, row) for col, row, _ in source)
+
+    ax0, ax1, ay0, ay1 = _expanded_box(producer)
+    bx0, bx1, by0, by1 = _expanded_box(consumer)
+    overlap = {
+        (col, row) for col in range(max(ax0, bx0), min(ax1, bx1) + 1) for row in range(max(ay0, by0), min(ay1, by1) + 1)
+    }
+    return bool(overlap) and overlap <= alias_tiles
 
 
 def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
@@ -357,13 +389,18 @@ def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
         return False
     if _boxes_conflict(_occupancy_box(a), _occupancy_box(b)):
         return True
-    if _direct_left_bank_reuse(a, b, graph) or _direct_left_bank_reuse(b, a, graph):
+    if _direct_buffer_aliases(a, b, graph) or _direct_buffer_aliases(b, a, graph):
         return False
     return True
 
 
 def _in_bounds(p: Placed, W: int, H: int) -> bool:
-    return p.x >= 0 and p.y >= 0 and p.x + p.rect.w <= W and p.y + p.rect.h <= H
+    return (
+        p.x >= 0
+        and p.y >= 0
+        and p.x + p.rect.w + p.rect.keepout_right <= W
+        and p.y + p.rect.h + p.rect.keepout_bottom <= H
+    )
 
 
 def _feasible(p: Placed, placed: Dict[str, Placed], graph: GraphSpec, W: int, H: int) -> bool:
@@ -390,8 +427,8 @@ def _possible_face_domain(
         ax, ay = spec.anchor
         return _face_abs_box(Placed(spec.name, ax, ay, rect), face)
 
-    max_x = W - rect.w
-    max_y = H - rect.h
+    max_x = W - rect.w - rect.keepout_right
+    max_y = H - rect.h - rect.keepout_bottom
     if max_x < 0 or max_y < 0:
         raise RuntimeError(f'Node {spec.name} footprint ({rect.w}x{rect.h}) does not fit device ({W}x{H}).')
 
@@ -444,6 +481,13 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
             return tuple(int(port) for port in entry.producer.ports)
         return tuple(range(int(entry.producer_port_count)))
 
+    def consumer_ports(entry, consumer) -> Tuple[int, ...]:
+        if entry.unit is not None:
+            return tuple(int(port) for port in entry.unit.consumer_ports)
+        inst = ctx.ir.execution.get(consumer.node.name)
+        binding = inst.ports.inputs[consumer.tensor]
+        return consumer.selected_ports(int(binding.count))
+
     kernel_set = set(kernel_names)
     producer_port_uses = {}
     for entry in state['entries']:
@@ -467,7 +511,19 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
             consumer = connection.consumer
             if consumer is None or src.name not in kernel_set or consumer.node.name not in kernel_set:
                 continue
-            key = (src.name, consumer.node.name, entry.producer.tensor, entry_producer_ports)
+            entry_consumer_ports = consumer_ports(entry, consumer)
+            direct = entry.decision is not None and entry.decision.realization == 'direct'
+            if direct and len(entry_producer_ports) != len(entry_consumer_ports):
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: direct placement requires equal producer and consumer port counts.'
+                )
+            key = (
+                src.name,
+                consumer.node.name,
+                entry.producer.tensor,
+                entry_producer_ports,
+                entry_consumer_ports,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -476,8 +532,11 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                     src=src.name,
                     dst=consumer.node.name,
                     tensor=entry.producer.tensor,
-                    direct=entry.decision is not None and entry.decision.realization == 'direct',
+                    direct=direct,
                     producer_exclusive=producer_exclusive,
+                    src_group=entry.producer.group,
+                    dst_group=consumer.group,
+                    port_pairs=tuple(zip(entry_producer_ports, entry_consumer_ports)) if direct else (),
                 )
             )
     return edges
@@ -530,6 +589,11 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
             raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
 
         rect = _coerce_rect(footprint)
+        rect.buffer_locations = lambda anchor_row, inst=inst, node=node: inst.variant.buffer_locations(
+            node, inst.config, int(anchor_row) + row_offset
+        )
+        if rect.extras.get('row_parity') is not None:
+            rect.extras['row_parity'] = (int(rect.extras['row_parity']) - row_offset) % 2
 
         placement_hint = node.directives.get('placement', {})
         anchor: Optional[Tuple[int, int]] = None
@@ -750,20 +814,24 @@ def _enumerate_candidate_positions(
         return
 
     min_x = 0 if spec.x_range is None else spec.x_range[0]
-    max_x = (W - spec.rect.w) if spec.x_range is None else spec.x_range[1]
+    max_x = (W - spec.rect.w - spec.rect.keepout_right) if spec.x_range is None else spec.x_range[1]
     min_y = 0 if spec.y_range is None else spec.y_range[0]
-    max_y = (H - spec.rect.h) if spec.y_range is None else spec.y_range[1]
+    max_y = (H - spec.rect.h - spec.rect.keepout_bottom) if spec.y_range is None else spec.y_range[1]
     if max_x < 0 or max_y < 0:
         return
     if max_x < min_x or max_y < min_y:
         return
 
     ideal_x, ideal_y = _ideal_anchor_from_neighbors(spec, graph, placed)
+    row_parity = spec.rect.extras.get('row_parity')
+
+    def eligible_row(y: int) -> bool:
+        return row_parity is None or y % 2 == int(row_parity)
 
     # Exact mode: enumerate all legal coordinates, biased toward the ideal.
     if candidate_limit is None:
         xs = list(range(min_x, max_x + 1))
-        ys = list(range(min_y, max_y + 1))
+        ys = [y for y in range(min_y, max_y + 1) if eligible_row(y)]
         xs.sort(key=lambda x: (abs(x - ideal_x), x))
         ys.sort(key=lambda y: (abs(y - ideal_y), y))
         for y in ys:
@@ -774,6 +842,8 @@ def _enumerate_candidate_positions(
     # Heuristic mode: score the full domain and keep the best N.
     scored: List[Tuple[float, int, int, int]] = []
     for y in range(min_y, max_y + 1):
+        if not eligible_row(y):
+            continue
         for x in range(min_x, max_x + 1):
             score = abs(x - ideal_x) + abs(y - ideal_y)
             score += heuristics.low_row_weight * y
@@ -1243,10 +1313,15 @@ class PlaceKernels(AIEPass):
         ctx = get_backend_context(model_or_ctx)
         device = ctx.device
 
-        W = int(device.columns)
-        H = int(device.rows)
         col_offset = int(device.column_start)
         row_offset = int(device.row_start)
+        W = int(device.columns) - col_offset
+        H = int(device.rows) - row_offset
+        if W <= 0 or H <= 0:
+            raise ValueError(
+                f'Device placement origin ({col_offset}, {row_offset}) is outside '
+                f'the {device.columns}x{device.rows} AIE array.'
+            )
 
         graph = _build_graph(ctx, col_offset, row_offset)
         if not graph.specs:

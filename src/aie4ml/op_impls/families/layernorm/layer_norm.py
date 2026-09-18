@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -17,13 +17,14 @@ from ...utils import (
     extract_inner_outer,
     find_tile_split,
     inherited_microtile,
+    layout_variant_matches,
     parse_directives,
-    requested_layout,
     require_power_of_two,
 )
 from ...utils.io import view_shape
 from ...utils.precision import (
     aie_rounding_token,
+    infer_accumulator_tag,
     resolve_exact_storage_dtype,
     storage_bytes_for_spec,
     to_quant_intent,
@@ -76,9 +77,9 @@ class _LayerNormVariantBase(OpImplVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        if requested_layout(node) != self.layout_name:
+        if not layout_variant_matches(node, self.layout_name):
             return False
-        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
+        if device.generation not in ('AIE', 'AIE-ML', 'AIE-MLV2'):
             return False
         in_tensor = input_tensor_for_role(node, 'lhs')
         if isinstance(in_tensor.precision, FloatIntent):
@@ -121,7 +122,7 @@ class _LayerNormVariantBase(OpImplVariant):
 
         cas_num, tile_outer = find_tile_split(
             partition_size=last_outer,
-            max_rows=max(1, int(device.rows)),
+            max_rows=max(1, int(device.rows) - int(device.row_start)),
             bank_bytes=int(device.bank_mem_bytes),
             tile_bytes_fn=lambda to: max(
                 outer_prefix * to * full_inner * in_bpp,
@@ -156,10 +157,12 @@ class _LayerNormVariantBase(OpImplVariant):
             rows=int(outer_prefix * tile_outer),
             cols=int(full_inner),
             vec_size=int(vec_size),
+            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
             gamma_shift=int(GAMMA_FRAC_BITS),
             out_shift=int(to_quant_intent(out_tensor.precision).frac),
             eps_q0=_resolve_eps_q0(node.name, node.metadata, int(precision['lhs'].frac)),
             rounding_mode=aie_rounding_token(precision['output']),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             io_views=io_views,
             io_route=io_route,
             layout=self.layout_name,
@@ -175,8 +178,10 @@ class _LayerNormVariantBase(OpImplVariant):
                 'integer LayerNorm cannot left-shift or exceed NORM_SHIFT=15.'
             )
 
-    def build_template_params(self, _node: OpNode, config: LayerNormConfig):
-        return {f: getattr(config, f) for f in config.__dataclass_fields__}
+    def build_template_params(self, node: OpNode, config: LayerNormConfig, placement):
+        params = {f: getattr(config, f) for f in config.__dataclass_fields__}
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
+        return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         return describe_partition_staging(
@@ -244,7 +249,19 @@ class _LayerNormVariantBase(OpImplVariant):
         ]
 
     def footprint(self, node: OpNode, config: LayerNormConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=int(config.parallelism.cas_num), extras={'keepout_left': 1})
+        return OpImplFootprint(
+            width=1,
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
+        )
+
+    def buffer_locations(self, _node: OpNode, config: LayerNormConfig, anchor_row: int):
+        locations = []
+        for row in range(int(config.parallelism.cas_num)):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            locations.append(BufferLocation('in1', row, 1 if reverse else -1, row, (0, 3)))
+            locations.append(BufferLocation('out1', row, 0, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: LayerNormConfig):
         in_tensor = input_tensor_for_role(node, 'lhs')
@@ -253,6 +270,16 @@ class _LayerNormVariantBase(OpImplVariant):
             inputs={in_tensor.name: PortBinding(group='in1', count=n)},
             outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )
+
+    def boundary_input_access_endpoints(
+        self, _config: LayerNormConfig, port: int, group: str | None = None
+    ) -> tuple[str, ...]:
+        if group != 'in1':
+            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
+        return (f'kk[{int(port)}].in[0]',)
+
+    def boundary_output_access_endpoints(self, _config: LayerNormConfig, port: int) -> tuple[str, ...]:
+        return (f'kk[{int(port)}].out[0]',)
 
 
 @register_variant
@@ -273,6 +300,7 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
 
     variant_id = 'layer_norm.i8.tiled.v1'
     layout_name = 'tiled'
+    plevel = 11
     kernel_transposes_microtile = True
 
     def resolve_microtile(self, node: OpNode, input_contracts):

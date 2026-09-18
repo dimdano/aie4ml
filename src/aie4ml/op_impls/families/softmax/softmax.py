@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict
 
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -16,11 +16,11 @@ from ...utils import (
     extract_inner_outer,
     find_tile_split,
     inherited_microtile,
+    layout_variant_matches,
     parse_directives,
-    requested_layout,
 )
 from ...utils.io import view_shape
-from ...utils.precision import resolve_exact_storage_dtype, storage_bytes_for_spec
+from ...utils.precision import infer_accumulator_tag, resolve_exact_storage_dtype, storage_bytes_for_spec
 from .common import DEFAULT_INV_SHIFT, infer_hccs_param_sets, pack_hccs_params, softmax_vec_size, validate_hccs_params
 from .config import SoftmaxConfig
 
@@ -65,11 +65,11 @@ class _SoftmaxVariantBase(OpImplVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        if requested_layout(node) != self.layout_name:
+        if not layout_variant_matches(node, self.layout_name):
             return False
         if _requested_approximation(node) != self.approximation:
             return False
-        if device.generation not in ('AIE-ML', 'AIE-MLV2'):
+        if device.generation not in ('AIE', 'AIE-ML', 'AIE-MLV2'):
             return False
         in_tensor = input_tensor_for_role(node, 'lhs')
         if isinstance(in_tensor.precision, FloatIntent):
@@ -117,7 +117,7 @@ class _SoftmaxVariantBase(OpImplVariant):
         out_bpp = storage_bytes_for_spec(precision['output'])
         cas_num, tile_outer = find_tile_split(
             partition_size=last_outer,
-            max_rows=max(1, int(device.rows)),
+            max_rows=max(1, int(device.rows) - int(device.row_start)),
             bank_bytes=int(device.bank_mem_bytes),
             tile_bytes_fn=lambda to: max(
                 outer_prefix * to * full_inner * in_bpp,
@@ -149,6 +149,8 @@ class _SoftmaxVariantBase(OpImplVariant):
             precision=precision,
             parallelism=ParallelismConfig(cas_num=int(cas_num), contract='outer'),
             vec_size=int(vec_size),
+            accumulator_tag=infer_accumulator_tag(device, precision['lhs'], precision['lhs'], None),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             io_views=io_views,
             io_route=io_route,
             layout=self.layout_name,
@@ -162,12 +164,19 @@ class _SoftmaxVariantBase(OpImplVariant):
         out_format = config.precision['output'].format
         if out_format not in ('uint8', 'int16'):
             raise ValueError(f'{node.name}: {self.variant_id} requires uint8 or int16 output, got {out_format!r}.')
+        expected_frac = 8 if out_format == 'uint8' else 15
+        if int(config.precision['output'].frac) != expected_frac:
+            raise ValueError(
+                f'{node.name}: {self.variant_id} emits {out_format} Q{expected_frac} probabilities, '
+                f'got output frac={config.precision["output"].frac}.'
+            )
 
-    def build_template_params(self, node: OpNode, config: SoftmaxConfig):
+    def build_template_params(self, node: OpNode, config: SoftmaxConfig, placement):
         in_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         params.update(rows=int(in_view.compacted_tile_outer), cols=int(in_view.full_inner))
         params['packed_hccs'] = self._packed_hccs(config, int(in_view.full_inner))
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:
@@ -195,7 +204,19 @@ class _SoftmaxVariantBase(OpImplVariant):
         return []
 
     def footprint(self, node: OpNode, config: SoftmaxConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=int(config.parallelism.cas_num), extras={'keepout_left': 1})
+        return OpImplFootprint(
+            width=1,
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
+        )
+
+    def buffer_locations(self, _node: OpNode, config: SoftmaxConfig, anchor_row: int):
+        locations = []
+        for row in range(int(config.parallelism.cas_num)):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            locations.append(BufferLocation('in1', row, 1 if reverse else -1, row, (0, 3)))
+            locations.append(BufferLocation('out1', row, 0, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: SoftmaxConfig):
         in_tensor = input_tensor_for_role(node, 'lhs')
@@ -205,9 +226,22 @@ class _SoftmaxVariantBase(OpImplVariant):
             outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )
 
+    def boundary_input_access_endpoints(
+        self, _config: SoftmaxConfig, port: int, group: str | None = None
+    ) -> tuple[str, ...]:
+        if group != 'in1':
+            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
+        return (f'kk[{int(port)}].in[0]',)
+
+    def boundary_output_access_endpoints(self, _config: SoftmaxConfig, port: int) -> tuple[str, ...]:
+        return (f'kk[{int(port)}].out[0]',)
+
 
 class _SoftmaxTiledMixin:
     """Microtile inheritance and the tiled envelope, shared by the HCCS and exp tiled variants."""
+
+    # Prefer microtiled execution when layout is unconstrained; explicit layout wins in matches().
+    plevel = 11
 
     def resolve_microtile(self, node: OpNode, input_contracts):
         """Match the producer's microtile so the edge is direct; else choose our own."""

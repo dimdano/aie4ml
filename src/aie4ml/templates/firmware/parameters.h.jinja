@@ -8,6 +8,14 @@
 
 #define N_ITER {{ iterations }}
 
+struct aie4ml_buffer_location {
+  int col;
+  int row;
+  int bank_count;
+  int bank0;
+  int bank1;
+};
+
 {% for L in layers %}
 {% set tpl = 'variants/' ~ L.op_impl.param_template ~ '/parameters.h.jinja' %}
 {% include tpl %}

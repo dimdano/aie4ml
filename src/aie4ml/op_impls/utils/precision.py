@@ -8,6 +8,7 @@ ACC_TAG_WIDTHS = {
     'acc32': 32,
     'acc48': 48,
     'acc64': 64,
+    'acc80': 80,
 }
 
 ROUNDING_TOKEN_MAP: Dict[RoundingMode, str] = {
@@ -84,7 +85,7 @@ def infer_accumulator_tag(
             if bits == int(acc_precision.width):
                 return tag
         raise ValueError(
-            f'Unsupported accumulator precision width {acc_precision.width}; expected one of 32, 48 or 64 bits.'
+            f'Unsupported accumulator precision width {acc_precision.width}; expected one of 32, 48, 64 or 80 bits.'
         )
 
     if lhs_dtype is None or rhs_dtype is None:
@@ -105,9 +106,11 @@ def infer_accumulator_tag(
 
     if not is_ml:
         if lhs_w <= 8 and rhs_w <= 8:
-            return 'acc32'
+            return 'acc48'
         if lhs_w <= 16 and rhs_w <= 16:
             return 'acc48'
+        if lhs_w <= 32 and rhs_w <= 32:
+            return 'acc80'
         raise ValueError(
             f'No accumulator tag registered for AIE generation "{device.generation}" '
             f'with lhs {lhs_w}-bit and rhs {rhs_w}-bit precisions.'

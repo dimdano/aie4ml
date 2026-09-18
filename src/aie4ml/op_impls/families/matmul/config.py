@@ -42,6 +42,8 @@ class DenseConfig:
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
+    bank_mem_bytes: int
+    alternating_horizontal: bool
     flags: DenseFlags
 
 
@@ -55,4 +57,5 @@ class MatmulConfig:
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
+    alternating_horizontal: bool
     flags: MatmulFlags

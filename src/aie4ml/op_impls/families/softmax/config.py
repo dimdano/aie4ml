@@ -12,8 +12,10 @@ class SoftmaxConfig:
     parallelism: ParallelismConfig
     param_sets: int
     vec_size: int
+    accumulator_tag: Optional[str]
     inv_shift: int
     use_clb: bool
+    alternating_horizontal: bool
     io_views: Dict[str, TensorView]
     io_route: Dict[str, Any]
     hccs: Dict[str, Any]

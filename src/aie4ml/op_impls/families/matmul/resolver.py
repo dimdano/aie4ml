@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ....aie_types import AIEDataType, FloatIntent, legality_format
+from ....aie_types import FLOAT_FORMATS, AIEDataType, FloatIntent, legality_format
 from ....ir import input_role, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
@@ -79,7 +79,7 @@ def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
     return list(MICROTILE_OPTIONS.get(select_generation_key(generation), {}).get(key, []))
 
 
-def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConfig:
+def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, required_lhs_microtile=None) -> MatmulMicrotileConfig:
     microtiling_cfg = node.directives.get('microtiling', {}) or {}
     raw = {
         key: int(microtiling_cfg[key]) if key in microtiling_cfg else 0
@@ -100,13 +100,30 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConf
                 f'{node.name}: microtiling {candidate} not supported for Generation={device.generation} and '
                 f'(input={lhs_dtype.format!r}, weight={rhs_dtype.format!r}). Allowed: {options}'
             )
+        if required_lhs_microtile is not None and candidate[:2] != (
+            int(required_lhs_microtile.outer),
+            int(required_lhs_microtile.inner),
+        ):
+            raise ValueError(
+                f'{node.name}: microtiling {candidate} does not match the producer output microtile '
+                f'({required_lhs_microtile.outer}, {required_lhs_microtile.inner}).'
+            )
         return MatmulMicrotileConfig(microtile_m=candidate[0], microtile_k=candidate[1], microtile_n=candidate[2])
+
+    if required_lhs_microtile is not None:
+        required = (int(required_lhs_microtile.outer), int(required_lhs_microtile.inner))
+        options = [option for option in options if option[:2] == required]
+        if not options:
+            raise ValueError(
+                f'{node.name}: no supported microtiling accepts producer output microtile {required} for '
+                f'Generation={device.generation}.'
+            )
 
     default_m, default_k, default_n = options[0]
     return MatmulMicrotileConfig(microtile_m=default_m, microtile_k=default_k, microtile_n=default_n)
 
 
-def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
+def _resolve_numeric(node, device) -> tuple[Dict[str, AIEDataType], str]:
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     rhs_tensor = input_tensor_for_role(node, 'rhs')
     out_tensor = node.outputs[0]
@@ -122,30 +139,21 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
     if isinstance(lhs_tensor.precision, FloatIntent):
         if not all(isinstance(t.precision, FloatIntent) for t in (lhs_tensor, rhs_tensor, out_tensor)):
             raise ValueError(f'{node.name}: float {node.op_type} requires lhs/rhs/output to share float precision.')
-        resolved['acc'] = AIEDataType(format='accfloat', frac=0)
-        return resolved
-
-    lhs_intent = to_quant_intent(lhs_tensor.precision)
-    rhs_intent = to_quant_intent(rhs_tensor.precision)
+        return resolved, 'accfloat'
 
     if int(resolved['lhs'].width) <= 8 and int(resolved['rhs'].width) > 8:
         raise RuntimeError(
-            f'{node.name}: unsupported int8 x int16 precision mix for AIE implementations; '
-            'no implementation variant available.'
+            f'{node.name}: unsupported int8 x int16 precision mix; its accumulator output shift '
+            'may be negative, which the current kernels do not support.'
         )
 
     acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'], None)
-    acc_width = {'acc32': 32, 'acc48': 48, 'acc64': 64}[acc_tag]
-    resolved['acc'] = AIEDataType(
-        format=f'int{acc_width}',
-        frac=int(lhs_intent.frac + rhs_intent.frac),
-    )
-    return resolved
+    return resolved, acc_tag
 
 
 def _resolve_bias_dtype(node, precision: Dict[str, AIEDataType]) -> AIEDataType:
     """Resolve the bias accumulator dtype for dense-family ops."""
-    is_float = precision['acc'].format == 'accfloat'
+    is_float = precision['lhs'].format in FLOAT_FORMATS
     if is_float:
         return AIEDataType(format='float32', frac=0)
     bias_tensor = next((t for t in node.inputs if t.is_parameter and input_role(node, t.name) == 'bias'), None)
@@ -233,13 +241,18 @@ def _parallelism_candidate(
 
 
 def _resolve_parallelism(
-    node, device, microtiling: MatmulMicrotileConfig, precision: Dict[str, AIEDataType], contract: str = 'inner'
+    node,
+    device,
+    microtiling: MatmulMicrotileConfig,
+    precision: Dict[str, AIEDataType],
+    contract: str = 'inner',
+    parallel_cfg=None,
 ) -> MatmulTiling:
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     lhs_shape = view_shape(node, lhs_tensor, 'inputs')
     in_shape = lhs_shape[-1]
     out_shape = view_shape(node, node.outputs[0], 'outputs')[-1]
-    parallel_cfg = node.directives.get('parallelism', {}) or {}
+    parallel_cfg = dict(node.directives.get('parallelism', {}) or {}) if parallel_cfg is None else dict(parallel_cfg)
     user_num_chains = parallel_cfg.get('cas_num')
     user_cas_length = parallel_cfg.get('cas_length')
     target_parallel_factor = parallel_cfg.get('parallel_factor')
@@ -290,14 +303,14 @@ def _resolve_parallelism(
         (int(full_outer), int(outer_granularity)) if contract == 'outer' else (int(out_shape), int(rhs_align))
     )
     max_chain_candidates = min(
-        max(1, int(device.rows)),
+        max(1, int(device.rows) - int(device.row_start)),
         max(
             max(1, int(getattr(device, 'max_mem_out_ports', 0) or 0)),
             ceildiv(partitioned_extent, max(1, partition_align)),
         ),
     )
     max_cas_candidates = min(
-        max(1, int(device.columns)),
+        max(1, int(device.columns) - int(device.column_start)),
         max(max(1, int(getattr(device, 'max_mem_in_ports', 0) or 0)), ceildiv(int(in_shape), max(1, lhs_align))),
     )
     chain_candidates = [int(user_num_chains)] if user_num_chains else list(range(1, max_chain_candidates + 1))

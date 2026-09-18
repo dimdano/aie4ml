@@ -7,13 +7,12 @@ import numpy as np
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, parse_directives
+from ...utils import ParallelismConfig, inherited_microtile, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
-    infer_accumulator_tag,
     resolve_accumulator_output_shift,
 )
 from .common import (
@@ -46,7 +45,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
 
     contract: ClassVar[str]
 
-    def build_template_params(self, node, config):
+    def build_template_params(self, node, config, placement):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         lhs_view = config.io_views[lhs_tensor.name]
         output_view = config.io_views[node.outputs[0].name]
@@ -60,6 +59,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_lhs_raw=lhs_view.tile_raw_inner,
             tile_inner_rhs_raw=output_view.tile_raw_inner,
         )
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def kernel_outer_extent(self, lhs_view):
@@ -88,14 +88,45 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return requested_contract(node) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
-        io_route, _, _ = parse_directives(directives)
-        precision = _resolve_numeric(node, device)
+        io_route, input_contracts, parallel_cfg = parse_directives(directives)
+        precision, accumulator_tag = _resolve_numeric(node, device)
         precision['bias'] = _resolve_bias_dtype(node, precision)
-        microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
-        tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
+        lhs_tensor = input_tensor_for_role(node, 'lhs')
+        required_microtile = None
+        producer_contract = input_contracts.get(lhs_tensor.name)
+        if not device.has_memtile and self.contract == 'inner' and producer_contract is not None:
+            if producer_contract.contract != 'inner':
+                raise ValueError(
+                    f'{node.name}: AIE1 dense inner contract cannot directly consume producer '
+                    f'{producer_contract.contract!r} staging.'
+                )
+            required_cas_length = len(producer_contract.port_staging)
+            requested_cas_length = parallel_cfg.get('cas_length')
+            if requested_cas_length is not None and int(requested_cas_length) != required_cas_length:
+                raise ValueError(
+                    f'{node.name}: cas_length={requested_cas_length} conflicts with the producer port count '
+                    f'{required_cas_length} required for direct AIE1 transport.'
+                )
+            parallel_cfg['cas_length'] = required_cas_length
+            required_microtile = inherited_microtile(node, input_contracts)
+
+        microtiling = _resolve_tile_cfg(
+            node,
+            device,
+            precision['lhs'],
+            precision['rhs'],
+            required_lhs_microtile=required_microtile,
+        )
+        tiling = _resolve_parallelism(
+            node,
+            device,
+            microtiling,
+            precision,
+            self.contract,
+            parallel_cfg=parallel_cfg,
+        )
         io_views = _build_matmul_io_views(node, microtiling, tiling)
 
-        lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
 
@@ -118,8 +149,10 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             io_views=io_views,
             io_route=io_route,
             shift=shift,
-            accumulator_tag=infer_accumulator_tag(device, None, None, precision['acc']),
+            accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
+            bank_mem_bytes=int(device.bank_mem_bytes),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             flags=DenseFlags(
                 use_relu=use_relu,
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
@@ -167,10 +200,25 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
 
     def footprint(self, _node, config) -> OpImplFootprint:
         return OpImplFootprint(
-            width=config.parallelism.cas_length,
-            height=config.parallelism.cas_num,
-            extras={'keepout_left': 1},
+            width=int(config.parallelism.cas_length),
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
         )
+
+    def buffer_locations(self, _node, config, anchor_row):
+        locations = []
+        cas_num = int(config.parallelism.cas_num)
+        cas_length = int(config.parallelism.cas_length)
+        outer = config.parallelism.contract == 'outer'
+        for chain in range(cas_num):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + chain) % 2)
+            for pos in range(cas_length):
+                idx = chain * cas_length + pos
+                tile_col = cas_length - 1 - pos if reverse else pos
+                port = idx if outer else pos
+                locations.append(BufferLocation('in1', port, tile_col + 1 if reverse else tile_col - 1, chain, (0, 3)))
+            locations.append(BufferLocation('out1', chain, 0 if reverse else cas_length - 1, chain, (0, 3)))
+        return tuple(locations)
 
     def get_artifacts(self, inst: OpImplInstance):
         inst_name = sanitize_identifier(inst.name)
@@ -221,6 +269,20 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             inputs={t.name: PortBinding(group=f'in{i + 1}', count=n_in) for i, t in enumerate(data_inputs)},
             outputs={t.name: PortBinding(group=f'out{i + 1}', count=n_out) for i, t in enumerate(node.outputs)},
         )
+
+    def boundary_input_access_endpoints(
+        self, config: DenseConfig, port: int, _group: str | None = None
+    ) -> tuple[str, ...]:
+        port = int(port)
+        cas_length = int(config.parallelism.cas_length)
+        cas_num = int(config.parallelism.cas_num)
+        if config.parallelism.contract == 'outer':
+            return (f'kk[{port}].in[0]',)
+        return tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(cas_num))
+
+    def boundary_output_access_endpoints(self, config: DenseConfig, port: int) -> tuple[str, ...]:
+        index = int(port) * int(config.parallelism.cas_length) + int(config.parallelism.cas_length) - 1
+        return (f'kk[{index}].out[0]',)
 
 
 @register_variant

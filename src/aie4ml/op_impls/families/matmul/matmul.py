@@ -2,13 +2,12 @@ from __future__ import annotations
 
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_role, input_tensor_for_role
-from ...base import OpImplFootprint
+from ...base import BufferLocation, OpImplFootprint
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
-    infer_accumulator_tag,
     resolve_accumulator_output_shift,
 )
 from .common import (
@@ -47,7 +46,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> MatmulConfig:
         io_route, _, _ = parse_directives(directives)
-        precision = _resolve_numeric(node, device)
+        precision, accumulator_tag = _resolve_numeric(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
         tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
@@ -72,8 +71,9 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
             io_views=io_views,
             io_route=io_route,
             shift=shift,
-            accumulator_tag=infer_accumulator_tag(device, None, None, precision['acc']),
+            accumulator_tag=accumulator_tag,
             rounding_mode='conv_even' if is_float else aie_rounding_token(precision['output']),
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             flags=MatmulFlags(
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
                 transpose_rhs=io_views[rhs_tensor.name].is_transposed,
@@ -104,10 +104,28 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
 
     def footprint(self, _node, config) -> OpImplFootprint:
         return OpImplFootprint(
-            width=config.parallelism.cas_length,
-            height=config.parallelism.cas_num,
-            extras={'keepout_left': 1},
+            width=int(config.parallelism.cas_length),
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
         )
+
+    def buffer_locations(self, _node, config, anchor_row):
+        locations = []
+        cas_num = int(config.parallelism.cas_num)
+        cas_length = int(config.parallelism.cas_length)
+        outer = config.parallelism.contract == 'outer'
+        for row in range(cas_num):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            for pos in range(cas_length):
+                idx = row * cas_length + pos
+                tile_col = cas_length - 1 - pos if reverse else pos
+                lhs_port = idx if outer else pos
+                locations.append(
+                    BufferLocation('inA', lhs_port, tile_col + 1 if reverse else tile_col - 1, row, (0, 3))
+                )
+                locations.append(BufferLocation('inB', idx, tile_col, row, (1, 2)))
+            locations.append(BufferLocation('outC', row, 0 if reverse else cas_length - 1, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: MatmulConfig):
         lhs_tensor = input_tensor_for_role(node, 'lhs')

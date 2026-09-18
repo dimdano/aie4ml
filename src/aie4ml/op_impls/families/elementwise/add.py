@@ -5,7 +5,7 @@ from typing import Any, Dict
 
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import (
@@ -55,7 +55,7 @@ class AddOpImplVariant(OpImplVariant):
     plevel = 10
 
     def matches(self, _node: OpNode, device) -> bool:
-        return device.generation in ('AIE-ML', 'AIE-MLV2')
+        return device.generation in ('AIE', 'AIE-ML', 'AIE-MLV2')
 
     def resolve(self, node: OpNode, device, directives=None) -> AddConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
@@ -103,7 +103,7 @@ class AddOpImplVariant(OpImplVariant):
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
         vec_size = elementwise_vec_size(precision['lhs'], device)
         bank_bytes = int(device.bank_mem_bytes)
-        max_rows = max(1, int(device.rows))
+        max_rows = max(1, int(device.rows) - int(device.row_start))
         elem_bytes = storage_bytes_for_spec(precision['lhs'])
 
         if inherited_view is not None:
@@ -212,6 +212,7 @@ class AddOpImplVariant(OpImplVariant):
             shift=shift,
             accumulator_tag=accumulator_tag,
             rounding_mode=rounding_mode,
+            alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             preserved_staging=preserved_staging,
             preserved_tensors=preserved_tensors,
             flags=flags,
@@ -227,10 +228,11 @@ class AddOpImplVariant(OpImplVariant):
                     f'does not match output_port_count {port_count}.'
                 )
 
-    def build_template_params(self, node: OpNode, config: AddConfig):
+    def build_template_params(self, node: OpNode, config: AddConfig, placement):
         lhs_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
-        params.update(tile_elements=int(math.prod(lhs_view.tile)))
+        params['tile_elements'] = int(math.prod(lhs_view.tile))
+        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
@@ -263,7 +265,20 @@ class AddOpImplVariant(OpImplVariant):
         return []
 
     def footprint(self, node: OpNode, config: AddConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=config.parallelism.cas_num, extras={'keepout_left': 1})
+        return OpImplFootprint(
+            width=1,
+            height=int(config.parallelism.cas_num),
+            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
+        )
+
+    def buffer_locations(self, _node: OpNode, config: AddConfig, anchor_row: int):
+        locations = []
+        for row in range(int(config.parallelism.cas_num)):
+            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            locations.append(BufferLocation('in1', row, 1 if reverse else -1, row, (0, 3)))
+            locations.append(BufferLocation('in2', row, 0, row, (1, 2)))
+            locations.append(BufferLocation('out1', row, 0, row, (0, 3)))
+        return tuple(locations)
 
     def build_ports(self, node: OpNode, config: AddConfig):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -276,3 +291,14 @@ class AddOpImplVariant(OpImplVariant):
             },
             outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
         )
+
+    def boundary_input_access_endpoints(
+        self, _config: AddConfig, port: int, group: str | None = None
+    ) -> tuple[str, ...]:
+        kernel_port = {'in1': 0, 'in2': 1}.get(group)
+        if kernel_port is None:
+            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
+        return (f'kk[{int(port)}].in[{kernel_port}]',)
+
+    def boundary_output_access_endpoints(self, _config: AddConfig, port: int) -> tuple[str, ...]:
+        return (f'kk[{int(port)}].out[0]',)

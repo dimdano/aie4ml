@@ -7,13 +7,21 @@
     "ColumnStart": 7,
     "RowStart": 0,
     "PLIOWidthBits": 128,
+    "CoreStreamInputs": 1,
+    "CoreStreamOutputs": 1,
+    "StreamSwitchWidthBits": 64,
+    "CascadeWidthBits": 512,
     "PLClockFreqMHz": 312.5,
     "Memory": {
       "BankMemBytes": 16384
     },
     "MaxMemTileInPorts": 8,
     "MaxMemTileOutPorts": 8,
-    "VectorBytes": 64
+    "VectorBytes": 64,
+    "HasMemTile": true,
+    "BankCount": 4,
+    "TileMemBytes": 65536,
+    "CascadeLayout": "uniform_right"
   },
   "xilinx_vek280_base": {
     "DeviceName": "Vek280",
@@ -23,6 +31,10 @@
     "ColumnStart": 7,
     "RowStart": 0,
     "PLIOWidthBits": 128,
+    "CoreStreamInputs": 1,
+    "CoreStreamOutputs": 1,
+    "StreamSwitchWidthBits": 32,
+    "CascadeWidthBits": 512,
     "PLClockFreqMHz": 312.5,
     "Memory": {
       "BankMemBytes": 16384
@@ -30,6 +42,10 @@
     "MaxMemTileInPorts": 8,
     "MaxMemTileOutPorts": 8,
     "VectorBytes": 64,
+    "HasMemTile": true,
+    "BankCount": 4,
+    "TileMemBytes": 65536,
+    "CascadeLayout": "uniform_right",
     "UltraRAM": {
       "BlockBytes": 36864,
       "Blocks": 264,
@@ -42,5 +58,54 @@
       "Depth": 512,
       "WidthBits": 72
     }
+  },
+  "xcvp2802-vsva5601-2mhp-e-s": {
+    "DeviceName": "VP2802",
+    "Generation": "AIE",
+    "AIECompilerTarget": "part",
+    "Columns": 59,
+    "Rows": 8,
+    "ColumnStart": 7,
+    "RowStart": 0,
+    "PLIOWidthBits": 128,
+    "CoreStreamInputs": 2,
+    "CoreStreamOutputs": 2,
+    "StreamSwitchWidthBits": 32,
+    "CascadeWidthBits": 384,
+    "PLClockFreqMHz": 312.5,
+    "Memory": {
+      "BankMemBytes": 8192
+    },
+    "MaxMemTileInPorts": 0,
+    "MaxMemTileOutPorts": 0,
+    "VectorBytes": 32,
+    "HasMemTile": false,
+    "BankCount": 4,
+    "TileMemBytes": 32768,
+    "CascadeLayout": "alternating_horizontal"
+  },
+  "xilinx_vck190_base": {
+    "DeviceName": "VCK190",
+    "Generation": "AIE",
+    "Columns": 50,
+    "Rows": 8,
+    "ColumnStart": 7,
+    "RowStart": 0,
+    "PLIOWidthBits": 128,
+    "CoreStreamInputs": 2,
+    "CoreStreamOutputs": 2,
+    "StreamSwitchWidthBits": 32,
+    "CascadeWidthBits": 384,
+    "PLClockFreqMHz": 312.5,
+    "Memory": {
+      "BankMemBytes": 8192
+    },
+    "MaxMemTileInPorts": 0,
+    "MaxMemTileOutPorts": 0,
+    "VectorBytes": 32,
+    "HasMemTile": false,
+    "BankCount": 4,
+    "TileMemBytes": 32768,
+    "CascadeLayout": "alternating_horizontal"
   }
 }

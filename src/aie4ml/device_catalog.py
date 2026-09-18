@@ -35,7 +35,7 @@ _RELEASE_SUFFIX = re.compile(r'_\d{6}_\d+$')
 
 
 def lookup_device(part_name: str) -> Dict[str, Any]:
-    """Return the catalog entry for a Vitis part name, or {} when the board is unknown."""
+    """Return the catalog entry for a Vitis platform or raw device part."""
 
     catalog = load_device_catalog()
     name = str(part_name)
@@ -46,11 +46,9 @@ def lookup_device(part_name: str) -> Dict[str, Any]:
     return {}
 
 
-#: We call `Part` here the full Vitis platform name: it keys this catalog *and* becomes the .xpfm path
-#: in the generated Makefile, so the release suffix must be kept.
 PART_HELP = (
-    'Pass the full Vitis platform name, e.g. xilinx_vek280_base_202610_1 -- it is also used '
-    'to locate the .xpfm. Known boards (match release suffix with your Vitis version): {boards}.'
+    'Pass a known Vitis platform name or raw AIE device part. Platform release suffixes must match '
+    'the installed Vitis version. Known targets: {boards}.'
 )
 
 
@@ -74,15 +72,16 @@ def resolve_device(part_name: Any, aie_cfg: Dict[str, Any]) -> tuple[DeviceSpec,
     entry = lookup_device(part_name)
     if not entry and 'Columns' not in aie_cfg:
         raise ValueError(f'Unknown part "{part_name}". {PART_HELP.format(boards=known_boards())}')
+    merged = dict(entry)
+    merged.update(aie_cfg)
+    merged.setdefault('Generation', entry.get('Generation', ''))
+
     installed = installed_platforms()
-    if installed and str(part_name) not in installed:
+    if merged.get('AIECompilerTarget', 'platform') == 'platform' and installed and str(part_name) not in installed:
         warnings.warn(
             f'Part "{part_name}" is not in this Vitis install, so the generated Makefile will '
             f'point at a missing .xpfm. Installed: {", ".join(installed)}.',
             stacklevel=2,
         )
 
-    merged = dict(entry)
-    merged.update(aie_cfg)
-    merged.setdefault('Generation', entry.get('Generation', ''))
     return DeviceSpec.from_config(str(part_name), merged), merged

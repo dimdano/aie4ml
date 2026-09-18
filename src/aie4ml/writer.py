@@ -83,7 +83,7 @@ class AIEProjectEmitter:
                     'graph_header': inst.graph_header,
                     'graph_name': inst.graph_name,
                     'param_template': inst.param_template,
-                    'parameters': variant.build_template_params(node, inst.config),
+                    'parameters': variant.build_template_params(node, inst.config, placement),
                 },
                 'io_views': inst.io_views,
                 'placement': placement,
@@ -170,6 +170,7 @@ class AIEProjectEmitter:
         context = {
             'project_name': ctx.project_config.project_name,
             'platform': ctx.device.platform,
+            'aie_compiler_target': ctx.device.aie_compiler_target,
             'stamp': ctx.project_config.stamp,
             'is_hardware': pl_plan is not None,
             'pl_plan': pl_plan,

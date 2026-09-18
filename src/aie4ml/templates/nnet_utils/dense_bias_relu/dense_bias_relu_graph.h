@@ -38,25 +38,40 @@ void place_graph(int COL_START, int ROW_START)
 {
   for (int idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx)
   {
-    const int tileRow = ROW_START + (idx / CAS_LENGTH);
-    const int tileCol = COL_START + (idx % CAS_LENGTH);
-    const bool is_last = (idx % CAS_LENGTH) == (CAS_LENGTH - 1);
+    const int pos = idx % CAS_LENGTH;
+    const int chain = idx / CAS_LENGTH;
+    const bool is_last = pos == CAS_LENGTH - 1;
+    const bool reverse = ConfigT::ALTERNATING_HORIZONTAL && ((ROW_START + chain) % 2 != 0);
+    const int tileCol = COL_START + (reverse ? CAS_LENGTH - 1 - pos : pos);
+    const int tileRow = ROW_START + chain;
+    const auto inputLocation = ConfigT::IN1_BUFFER_LOCATIONS[idx];
 
     adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
 
-    adf::location<adf::buffer>(kk[idx].in[0]) = {
-      adf::bank(tileCol - 1, tileRow, 0),
-      adf::bank(tileCol - 1, tileRow, 3)
-    };
+    if (inputLocation.bank_count == 1) {
+      adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
+        COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0);
+    } else {
+      adf::location<adf::buffer>(kk[idx].in[0]) = {
+        adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0),
+        adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank1)
+      };
+    }
 
     adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
     adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
 
     if (is_last) {
-      adf::location<adf::buffer>(kk[idx].out[0]) = {
-        adf::bank(tileCol, tileRow, 0),
-        adf::bank(tileCol, tileRow, 3)
-      };
+      const auto outputLocation = ConfigT::OUT1_BUFFER_LOCATIONS[idx / CAS_LENGTH];
+      if (outputLocation.bank_count == 1) {
+        adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
+          COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0);
+      } else {
+        adf::location<adf::buffer>(kk[idx].out[0]) = {
+          adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0),
+          adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
+        };
+      }
 
       if constexpr (CAS_LENGTH == 1) {
         adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);

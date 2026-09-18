@@ -19,10 +19,12 @@ class LayerNormConfig:
     rows: int
     cols: int
     vec_size: int
+    accumulator_tag: Optional[str]
     gamma_shift: int
     out_shift: int
     eps_q0: int
     rounding_mode: Optional[str]
+    alternating_horizontal: bool
     io_views: Dict[str, TensorView]
     io_route: Dict[str, Any]
     #: One of ir.graph.TENSOR_LAYOUTS; picks the kernel via the template's LAYOUT_TILED.

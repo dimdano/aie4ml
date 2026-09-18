@@ -10,8 +10,8 @@ dense_base<ConfigT>::dense_base() {
   aie::set_saturation(ConfigT::SATURATION);
 
   static_assert(
-        ConfigT::OUT_FEAT_SLICE * ConfigT::IN_FEAT_SLICE * sizeof(weight_t) <= 16384,
-        "Weight size per tile must not exceed one AIE-ML memory bank (16 KiB)");
+        ConfigT::OUT_FEAT_SLICE * ConfigT::IN_FEAT_SLICE * sizeof(weight_t) <= ConfigT::BANK_BYTES,
+        "Weight size per tile must not exceed one device memory bank");
   static_assert(
         ConfigT::IN_FEAT_SLICE % (2 * ConfigT::N) == 0,
         "IN_FEAT_SLICE must be divisible by 2*K");

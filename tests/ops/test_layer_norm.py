@@ -186,16 +186,27 @@ def test_boundary_layernorm_splits_rows_across_tiles(tmp_path, cas_num):
 
 
 @pytest.mark.parametrize('cas_num', [1, 4])
-def test_dense_to_layernorm_crosses_a_memtile(tmp_path, cas_num):
-    """Dense partitions features, LayerNorm needs whole rows, so the edge is re-sharded."""
+def test_dense_to_layernorm_only_reshards_a_partitioned_edge(tmp_path, cas_num):
+    """A single tiled producer connects directly; an inner split must still be re-sharded."""
     directives = {'d': parallelism(cas_num), 'ln': parallelism(cas_num)}
     ctx = lower(_after_dense_model(), tmp_path, directives, batch=ROWS)
-    assert ('d_aie', 'ln_aie') not in direct_edges(ctx)
-    assert any('d_mm' in str(t) for t in memtiles(ctx))
+    if cas_num == 1:
+        assert ('d_aie', 'ln_aie') in direct_edges(ctx)
+        assert not any('d_mm' in str(t) for t in memtiles(ctx))
+    else:
+        assert ('d_aie', 'ln_aie') not in direct_edges(ctx)
+        assert any('d_mm' in str(t) for t in memtiles(ctx))
 
 
-def test_boundary_layernorm_picks_the_linear_variant(tmp_path):
+def test_boundary_layernorm_prefers_the_tiled_variant(tmp_path):
     ctx = lower(_boundary_model(), tmp_path, {'ln': parallelism(1)}, batch=ROWS)
+    inst = ctx.ir.execution.get('ln_aie')
+    assert inst.variant.variant_id == 'layer_norm.i8.tiled.v1'
+    assert inst.config.accumulator_tag == 'acc32'
+
+
+def test_boundary_layernorm_honors_explicit_linear_layout(tmp_path):
+    ctx = lower(_boundary_model(), tmp_path, {'ln': {**parallelism(1), 'layout': 'linear'}}, batch=ROWS)
     assert ctx.ir.execution.get('ln_aie').variant.variant_id == 'layer_norm.i8.v1'
 
 

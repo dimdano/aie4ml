@@ -47,6 +47,7 @@ void layernorm_i8<ConfigT>::run(input_buffer<in_t>&    in,
                                 const int16_t (&beta)[COLS],
                                 output_buffer<out_t>&  out)
 {
+    using acc_t = typename ConfigT::acc_scalar_t;
     const in_t*  __restrict in_ptr  = in.data();
           out_t* __restrict out_ptr = out.data();
 
@@ -76,8 +77,8 @@ void layernorm_i8<ConfigT>::run(input_buffer<in_t>&    in,
             chess_loop_range(ROWS_PER_BATCH, ROWS_PER_BATCH)
         {
             auto vin_it = aie::cbegin_vector<VEC>(in_ptr + (base_row + r) * COLS);
-            aie::accum<acc32, VEC> acc_sum = aie::zeros<acc32, VEC>();
-            aie::accum<acc32, VEC> acc_sq  = aie::zeros<acc32, VEC>();
+            aie::accum<acc_t, VEC> acc_sum = aie::zeros<acc_t, VEC>();
+            aie::accum<acc_t, VEC> acc_sq  = aie::zeros<acc_t, VEC>();
             for (int v = 0; v < VECS; ++v) {
                 const aie::vector<int8, VEC> vx = *vin_it++;
                 acc_sum = aie::mac(acc_sum, vx, ones8);
@@ -106,12 +107,12 @@ void layernorm_i8<ConfigT>::run(input_buffer<in_t>&    in,
                 const aie::vector<int8, VEC> vx = *vin_it++;
 
                 const aie::vector<int16, VEC> vd16 =
-                    aie::sub(aie::from_vector<acc32>(vx), mu_vec).template to_vector<int16>(0);
+                    aie::sub(aie::from_vector<acc_t>(vx), mu_vec).template to_vector<int16>(0);
 
-                const aie::accum<acc32, VEC> acc_fs = aie::mul(inv_std_vec, gamma_v[v]);
+                const aie::accum<acc_t, VEC> acc_fs = aie::mul(inv_std_vec, gamma_v[v]);
                 const aie::vector<int16, VEC> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
 
-                aie::accum<acc32, VEC> acc_out = aie::mul(vd16, fscale);
+                aie::accum<acc_t, VEC> acc_out = aie::mul(vd16, fscale);
                 acc_out = aie::add(acc_out, beta_v[v]);
 
                 *vout_it++ = acc_out.template to_vector<out_t>(NORM_SHIFT - OUT_SHIFT);
@@ -147,6 +148,7 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
                                         const int16_t (&beta)[COLS * MT_OUTER],
                                         output_buffer<out_t>&  out)
 {
+    using acc_t = typename ConfigT::acc_scalar_t;
     const in_t*  __restrict in_ptr  = in.data();
           out_t* __restrict out_ptr = out.data();
 
@@ -159,8 +161,8 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
 
         // Lane group m of every microtile belongs to row m, so accumulating along the
         // feature axis keeps the rows' partial sums separate with no shuffling.
-        aie::accum<acc32, BLK> acc_sum = aie::zeros<acc32, BLK>();
-        aie::accum<acc32, BLK> acc_sq  = aie::zeros<acc32, BLK>();
+        aie::accum<acc_t, BLK> acc_sum = aie::zeros<acc_t, BLK>();
+        aie::accum<acc_t, BLK> acc_sq  = aie::zeros<acc_t, BLK>();
 
         for (int bn = 0; bn < NB; ++bn)
             chess_prepare_for_pipelining
@@ -218,12 +220,12 @@ void layernorm_i8_tiled<ConfigT>::run(input_buffer<in_t>&    in,
             const aie::vector<int16, BLK> beta_blk  = *aie::cbegin_vector<BLK>((const int16_t*)beta + bn * BLK);
 
             const aie::vector<int16, BLK> vd16 =
-                aie::sub(aie::from_vector<acc32>(vx), mu_v).template to_vector<int16>(0);
+                aie::sub(aie::from_vector<acc_t>(vx), mu_v).template to_vector<int16>(0);
 
-            const aie::accum<acc32, BLK> acc_fs = aie::mul(is_v, gamma_blk);
+            const aie::accum<acc_t, BLK> acc_fs = aie::mul(is_v, gamma_blk);
             const aie::vector<int16, BLK> fscale = acc_fs.template to_vector<int16>(GAMMA_SHIFT);
 
-            aie::accum<acc32, BLK> acc_out = aie::mul(vd16, fscale);
+            aie::accum<acc_t, BLK> acc_out = aie::mul(vd16, fscale);
             acc_out = aie::add(acc_out, beta_blk);
 
             auto vout_it = aie::begin_vector<BLK>(dst + bn * BLK);

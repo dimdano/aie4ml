@@ -24,8 +24,17 @@ class ClassifyTransportEntries(AIEPass):
 
     def _classify_entry(self, entry, ctx) -> TransportDecision:
         self._validate_entry(entry)
-        if entry.producer.node is None or entry.graph_output:
-            return TransportDecision('memtile', None)
+        route = self._route_policy(entry, ctx)
+        is_boundary = entry.producer.node is None or entry.graph_output
+        has_memtile = bool(ctx.device.has_memtile)
+
+        if is_boundary:
+            if route == 'memtile' and not has_memtile:
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: io_route=memtile requested on a device without memory tiles.'
+                )
+            realization = 'direct' if route == 'direct' or (route == 'auto' and not has_memtile) else 'memtile'
+            return TransportDecision(realization, True if realization == 'direct' else None)
 
         consumer = entry.single_consumer()
         staging_compatible = not self._has_consumer_perm(consumer) and direct_transport_supported(
@@ -34,7 +43,6 @@ class ClassifyTransportEntries(AIEPass):
             entry.producer,
             consumer,
         )
-        route = self._route_policy(entry, ctx)
         if route == 'direct':
             if not staging_compatible:
                 raise RuntimeError(
@@ -43,9 +51,21 @@ class ClassifyTransportEntries(AIEPass):
                 )
             realization = 'direct'
         elif route == 'memtile':
+            if not has_memtile:
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: io_route=memtile requested on a device without memory tiles.'
+                )
             realization = 'memtile'
         else:
-            realization = 'direct' if staging_compatible else 'memtile'
+            if staging_compatible:
+                realization = 'direct'
+            elif not has_memtile:
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: AIE1 direct transport requires matching producer and consumer '
+                    'staging; relay/relayout is not implemented.'
+                )
+            else:
+                realization = 'memtile'
         return TransportDecision(realization, staging_compatible)
 
     @staticmethod
@@ -63,20 +83,19 @@ class ClassifyTransportEntries(AIEPass):
 
     @staticmethod
     def _route_policy(entry, ctx) -> str:
-        if entry.producer.node is None or entry.graph_output:
-            return 'memtile'
-
         modes = set()
-        producer_inst = ctx.ir.execution.get(entry.producer.node.name)
-        producer_mode = producer_inst.io_route.get('outputs', {}).get(entry.producer.tensor)
-        if producer_mode:
-            modes.add(str(producer_mode))
+        if entry.producer.node is not None:
+            producer_inst = ctx.ir.execution.get(entry.producer.node.name)
+            producer_mode = producer_inst.io_route.get('outputs', {}).get(entry.producer.tensor)
+            if producer_mode:
+                modes.add(str(producer_mode))
 
-        consumer = entry.single_consumer()
-        consumer_inst = ctx.ir.execution.get(consumer.node.name)
-        consumer_mode = consumer_inst.io_route.get('inputs', {}).get(consumer.tensor)
-        if consumer_mode:
-            modes.add(str(consumer_mode))
+        if entry.consumers:
+            consumer = entry.single_consumer()
+            consumer_inst = ctx.ir.execution.get(consumer.node.name)
+            consumer_mode = consumer_inst.io_route.get('inputs', {}).get(consumer.tensor)
+            if consumer_mode:
+                modes.add(str(consumer_mode))
 
         bad = [mode for mode in modes if mode not in ('direct', 'memtile', 'auto')]
         if bad:

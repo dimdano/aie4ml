@@ -1,10 +1,32 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from ..ir.graph import OpImplInstance, OpNode
 from .common_types import PortMap
+
+
+@dataclass(frozen=True)
+class BufferLocation:
+    """One transport-visible buffer's footprint-relative location."""
+
+    port_group: str
+    port: int
+    rel_col: int
+    rel_row: int
+    banks: Tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if not self.port_group or self.port < 0:
+            raise ValueError('Buffer locations require a port group and non-negative port index.')
+        if (
+            not self.banks
+            or len(self.banks) > 2
+            or len(set(self.banks)) != len(self.banks)
+            or any(bank not in range(4) for bank in self.banks)
+        ):
+            raise ValueError(f'Invalid ADF bank set {self.banks}.')
 
 
 @dataclass(frozen=True)
@@ -14,6 +36,10 @@ class OpImplFootprint:
     width: int
     height: int
     extras: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError(f'Footprint dimensions must be positive, got {self.width}x{self.height}.')
 
 
 class OpImplVariant:
@@ -41,8 +67,15 @@ class OpImplVariant:
     def validate_config(self, _node: OpNode, _config: Any, _device: Any) -> None:
         """Post-lowering attribute verifier. Override to enforce kernel ABI rules."""
 
-    def build_template_params(self, _node: OpNode, config: Any) -> Dict[str, Any]:
+    def build_template_params(self, _node: OpNode, config: Any, _placement: Dict[str, int]) -> Dict[str, Any]:
         return config
+
+    def buffer_locations(self, _node: OpNode, _config: Any, _anchor_row: int) -> Tuple[BufferLocation, ...]:
+        """Return transport-visible buffers relative to an op anchor.
+
+        Repeated group/port pairs describe multicast graph ports.
+        """
+        return ()
 
     def output_staging_contract(self, _node: OpNode, _config: Any, _tensor_name: str) -> Optional[str]:
         return None
@@ -77,6 +110,12 @@ class OpImplVariant:
         _producer: Optional[OpNode] = None,
     ) -> Any:
         return None
+
+    def boundary_input_access_endpoints(self, _config: Any, _port: int, _group: str | None = None) -> tuple[str, ...]:
+        raise NotImplementedError(f'{self.variant_id}: direct graph-input buffer access is not implemented.')
+
+    def boundary_output_access_endpoints(self, _config: Any, _port: int) -> tuple[str, ...]:
+        raise NotImplementedError(f'{self.variant_id}: direct graph-output buffer access is not implemented.')
 
     def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
         raise NotImplementedError

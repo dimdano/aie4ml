@@ -68,12 +68,14 @@ def resolve_input_contract(
     return contract, patches
 
 
-_STAGING_COMPAT_STRIP = frozenset({'access', 'boundary_dimension'})
+_STAGING_COMPAT_STRIP = frozenset({'access', 'boundary_dimension', 'slice_dimension'})
 """Keys stripped from staging descriptors before compatibility comparison.
 
 'access' is read/write direction — irrelevant for shape compatibility.
 'boundary_dimension' is a per-shard override computed by the planner and absent
 from the canonical per-port descriptor; consumers must not compare it.
+'slice_dimension' names the logical partition axis; compatibility is determined by
+the concrete port count, offsets, dimensions, and traversal instead.
 """
 
 

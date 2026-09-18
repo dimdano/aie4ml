@@ -35,9 +35,21 @@ class LegalizeMemtilePortLimits(AIEPass):
             consumer_ports = self._consumer_port_ids(entry, ctx)
 
             if entry.decision.realization == 'direct':
+                if entry.producer.node is None:
+                    port_base = next_graph_input_port
+                    next_graph_input_port += len(producer_ports)
+                    descriptors = graph_input_port_descs(entry, ctx, port_base)
+                    entry.graph_input = GraphInputSpec(descriptors, graph_input_writer_port_descs(descriptors))
+                    producer_ports = tuple(port_base + index for index in range(len(producer_ports)))
                 entry.unit = TransportUnit(producer_ports, consumer_ports)
                 rewritten.append(entry)
                 continue
+
+            if max_in <= 0 or max_out <= 0:
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: memory-tile transport selected on a device without usable '
+                    'memory-tile ports.'
+                )
 
             p = len(producer_ports)
             c = len(consumer_ports) if entry.consumers else p
@@ -120,9 +132,6 @@ class LegalizeMemtilePortLimits(AIEPass):
             raise RuntimeError(f'{entry.logical_tensor}: missing transport decision; run classification first.')
         if len(entry.consumers) > 1 or (entry.consumers and entry.graph_output):
             raise RuntimeError(f'{entry.logical_tensor}: memtile legalization requires one independent transport leg.')
-        if entry.decision.realization == 'direct':
-            if entry.producer.node is None or entry.graph_output or len(entry.consumers) != 1:
-                raise RuntimeError(f'{entry.logical_tensor}: direct realization requires one internal consumer leg.')
 
     def _single_unit(self, entry, ctx, producer_ports, consumer_ports, port_base: int) -> TransportUnit:
         if entry.producer.node is None:

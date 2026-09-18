@@ -1,4 +1,5 @@
 {% set P = L.op_impl.parameters %}
+{% from 'variants/placement.jinja' import buffer_locations %}
 struct {{L.struct_name}} {
   using data_t = {{P.precision.lhs.c_type}};
   using rhs_t = {{P.precision.rhs.c_type}};
@@ -8,6 +9,10 @@ struct {{L.struct_name}} {
   using c_t = result_t;
   static constexpr int IN_FEAT = {{L.n_in}}; static constexpr int OUT_FEAT = {{L.n_out}};
   static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
+  static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
+{{ buffer_locations('INA_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'inA') | list) }}
+{{ buffer_locations('INB_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'inB') | list) }}
+{{ buffer_locations('OUTC_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'outC') | list) }}
   static constexpr bool PARALLELISM_CONTRACT_OUTER = {{ 'true' if P.parallelism.contract == 'outer' else 'false' }};
   static constexpr bool TRANSPOSE_A = {{ 'true' if P.flags.transpose_lhs else 'false' }};
   static constexpr bool TRANSPOSE_B = {{ 'true' if P.flags.transpose_rhs else 'false' }};
