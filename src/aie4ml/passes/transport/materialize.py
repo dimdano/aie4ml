@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from ...aie_types import AIEDataType
 from ...ir import get_backend_context, input_role
-from ...op_impls.utils import staging_tile_shape
+from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
 from ..base import AIEPass
 from ..utils import sanitize_identifier
 from .boundary import (
@@ -16,7 +16,7 @@ from .boundary import (
     graph_input_writer_port_descriptor,
 )
 from .collect import TransportCollector
-from .descriptors import localize_descriptor, localized_graph_io_descriptor
+from .descriptors import boundary_access_descriptor, localize_descriptor, localized_graph_io_descriptor
 from .model import EdgeEntry
 
 
@@ -182,11 +182,8 @@ class _MemoryPlanMaterializer:
             staging = graph_input_writer_port_descriptor(entry, int(graph_port))
             descriptor = graph_input_port_descriptor(entry, int(graph_port))
             self._localize_direct_descriptor(descriptor)
-            access_descriptor = descriptor
-            if not self.device.has_memtile:
-                access_descriptor = _logical_stream_microtiled_2d_descriptor(descriptor)
-                if access_descriptor is not None:
-                    descriptor = access_descriptor
+            access_descriptor = boundary_access_descriptor(descriptor)
+            descriptor = access_descriptor
 
             self.direct_edges.append(
                 {
@@ -202,11 +199,10 @@ class _MemoryPlanMaterializer:
             )
             if not access_endpoints:
                 raise RuntimeError(f'{entry.logical_tensor}: direct graph input has no concrete kernel endpoint.')
-            if access_descriptor is not None:
-                self.kernel_write_accesses.extend(
-                    {'endpoint': f'{consumer_id}.{access_endpoint}', 'descriptor': access_descriptor}
-                    for access_endpoint in access_endpoints
-                )
+            self.kernel_write_accesses.extend(
+                {'endpoint': f'{consumer_id}.{access_endpoint}', 'descriptor': access_descriptor}
+                for access_endpoint in access_endpoints
+            )
             self.io_ports.append(
                 {
                     'direction': 'input',
@@ -236,16 +232,16 @@ class _MemoryPlanMaterializer:
             self._localize_direct_descriptor(descriptor)
             elements = int(prod(staging_tile_shape(descriptor)))
             logical_elements = int(prod(int(value) for value in staging['io_tiling_dimension']))
-            if logical_elements != elements:
+            access_descriptor = boundary_access_descriptor(
+                descriptor, project_to_io_boundary=logical_elements != elements
+            )
+            descriptor = access_descriptor
+            transferred_elements = int(prod(staging_tile_shape(descriptor)))
+            if transferred_elements != logical_elements:
                 raise NotImplementedError(
                     f'{entry.logical_tensor}: direct graph output requires {elements} kernel-buffer elements '
-                    f'but exposes {logical_elements} logical elements; an output relayout adapter is required.'
+                    f'but exposes {logical_elements} logical elements; the boundary DMA cannot project this layout.'
                 )
-            access_descriptor = descriptor
-            if not self.device.has_memtile:
-                access_descriptor = _logical_stream_microtiled_2d_descriptor(descriptor)
-                if access_descriptor is not None:
-                    descriptor = access_descriptor
             graph_port = self._next_graph_output_port
             self._next_graph_output_port += 1
 
@@ -261,10 +257,9 @@ class _MemoryPlanMaterializer:
                 raise RuntimeError(
                     f'{entry.logical_tensor}: direct graph output requires exactly one concrete kernel endpoint.'
                 )
-            if access_descriptor is not None:
-                self.kernel_read_accesses.append(
-                    {'endpoint': f'{producer_id}.{access_endpoints[0]}', 'descriptor': access_descriptor}
-                )
+            self.kernel_read_accesses.append(
+                {'endpoint': f'{producer_id}.{access_endpoints[0]}', 'descriptor': access_descriptor}
+            )
             self.io_ports.append(
                 {
                     'direction': 'output',
@@ -448,6 +443,7 @@ class _MemoryPlanMaterializer:
 
         return {
             'access': 'write',
+            'storage_layout': STORAGE_LAYOUT_LINEAR,
             'buffer_dimension': list(base['buffer_dimension']),
             'tiling_dimension': io_tile,
             'io_tiling_dimension': list(io_tile),
@@ -478,6 +474,7 @@ class _MemoryPlanMaterializer:
         boundary[shard_dim] = min(int(buf_dims[shard_dim]), max(0, int(io_boundary[shard_dim]) - int(unit_base_dim0)))
         return {
             'access': 'read',
+            'storage_layout': STORAGE_LAYOUT_LINEAR,
             'buffer_dimension': list(buf_dims),
             'tiling_dimension': io_tile,
             'io_tiling_dimension': list(io_tile),
@@ -630,43 +627,5 @@ def _host_visible_output_staging(base: Dict[str, Any]) -> Dict[str, Any]:
     desc['buffer_dimension'] = list(io_boundary)
     desc['offset'] = host_offsets
     desc['tiling_dimension'] = list(io_tile)
-    return desc
-
-
-def _logical_stream_microtiled_2d_descriptor(base: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return the AIE1 boundary reorder, or ``None`` when packed order is already linear."""
-
-    dimensions = [int(value) for value in base['buffer_dimension']]
-    tile = [int(value) for value in base['tiling_dimension']]
-    if len(dimensions) != 2 or len(tile) != 2:
-        raise NotImplementedError('AIE1 direct boundary DMA currently requires a 2-D kernel buffer.')
-
-    inner = int(base['inner_dimension'])
-    outer = int(base['outer_dimension'])
-    micro_n = tile[inner]
-    micro_m = tile[outer]
-    if inner != 0 or outer != 1 or any(int(value) != 0 for value in base['offset']):
-        raise NotImplementedError('AIE1 direct boundary DMA requires a local, inner-contiguous 2-D buffer.')
-    if micro_m == 1:
-        return None
-
-    cols, rows = dimensions
-    if cols % micro_n or rows % micro_m:
-        raise ValueError(
-            f'AIE1 direct boundary shape {(rows, cols)} is not divisible by microtile {(micro_m, micro_n)}.'
-        )
-
-    block = micro_m * micro_n
-    desc = dict(base)
-    # Physical storage is [row-block, column-block, row-in-block, column-in-block].
-    # Splitting it into three DMA dimensions exposes logical rows without a tiler kernel.
-    desc['buffer_dimension'] = [block, cols // micro_n, rows // micro_m]
-    desc['tiling_dimension'] = [micro_n, 1, 1]
-    desc['offset'] = [0, 0, 0]
-    desc['tile_traversal'] = [
-        {'dimension': 1, 'stride': 1, 'wrap': cols // micro_n},
-        {'dimension': 0, 'stride': micro_n, 'wrap': micro_m},
-        {'dimension': 2, 'stride': 1, 'wrap': rows // micro_m},
-    ]
-    desc.pop('boundary_dimension', None)
+    desc['storage_layout'] = STORAGE_LAYOUT_LINEAR
     return desc

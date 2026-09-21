@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List
 
+from ...op_impls.utils import STORAGE_LAYOUT_LINEAR
 from .descriptors import rebase_descriptor_offset
 
 
@@ -35,6 +36,7 @@ def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
     io_tile = list(base['io_tiling_dimension'])
     return {
         'access': 'write',
+        'storage_layout': STORAGE_LAYOUT_LINEAR,
         'buffer_dimension': list(base['buffer_dimension']),
         'tiling_dimension': list(io_tile),
         'io_tiling_dimension': list(io_tile),
@@ -52,6 +54,7 @@ def graph_input_writer_port_descs(read_descs: Dict[int, Dict[str, Any]]) -> Dict
         io_tile = list(base['io_tiling_dimension'])
         out[int(port)] = {
             'access': 'write',
+            'storage_layout': STORAGE_LAYOUT_LINEAR,
             'buffer_dimension': list(base['buffer_dimension']),
             'tiling_dimension': list(io_tile),
             'io_tiling_dimension': list(io_tile),

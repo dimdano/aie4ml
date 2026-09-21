@@ -4,6 +4,10 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Mapping, NamedTuple, Sequence
 
+STORAGE_LAYOUT_LINEAR = 'linear'
+STORAGE_LAYOUT_MICROTILED = 'microtiled'
+STORAGE_LAYOUTS = frozenset({STORAGE_LAYOUT_LINEAR, STORAGE_LAYOUT_MICROTILED})
+
 
 @dataclass(frozen=True)
 class TensorView:
@@ -169,6 +173,7 @@ def make_staging_descriptor(
     # tiling_dimension is ADF's per-BD chunk, NOT TensorView.tile.
     descriptor: Dict[str, Any] = {
         'access': access,
+        'storage_layout': STORAGE_LAYOUT_MICROTILED if view.microtile is not None else STORAGE_LAYOUT_LINEAR,
         'buffer_dimension': ordered_view_shape(view, 'full'),
         'tiling_dimension': [int(x) for x in tiling_dimension],
         'offset': [int(x) for x in offset],
@@ -325,20 +330,26 @@ class MicrotileShape:
 
 
 def microtile_from_staging(desc: Mapping[str, Any]):
-    """Decode the microtile out of a staging descriptor, or None for whole rows.
+    """Decode a microtiled staging layout, or return ``None`` for linear storage.
 
     Not how an op reads its own layout -- that is `view.microtile`. This is the edge decoder: a
-    TensorView never crosses, so a consumer only sees the producer's published descriptor.
-    Reads axis-neutral fields only, so it knows nothing about which family wrote the data.
+    TensorView never crosses, so a consumer only sees the producer's published staging contract.
     """
-    tiling = desc.get('tiling_dimension')
-    buffer_dim = desc.get('buffer_dimension')
-    inner = desc.get('inner_dimension')
-    outer = desc.get('outer_dimension')
-    if tiling is None or buffer_dim is None or inner is None or outer is None:
+    storage_layout = desc.get('storage_layout')
+    if storage_layout == STORAGE_LAYOUT_LINEAR:
         return None
-    if int(tiling[int(inner)]) >= int(buffer_dim[int(inner)]):
-        return None  # whole rows, not microtiled
+    if storage_layout not in STORAGE_LAYOUTS:
+        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
+    if storage_layout != STORAGE_LAYOUT_MICROTILED:
+        raise NotImplementedError(f'Cannot decode staging storage_layout {storage_layout!r} as a microtile.')
+
+    required = ('tiling_dimension', 'buffer_dimension', 'inner_dimension', 'outer_dimension')
+    missing = [field for field in required if field not in desc]
+    if missing:
+        raise ValueError(f'Microtiled staging descriptor is missing {", ".join(missing)}.')
+    tiling = desc['tiling_dimension']
+    inner = desc['inner_dimension']
+    outer = desc['outer_dimension']
     return MicrotileShape(outer=int(tiling[int(outer)]), inner=int(tiling[int(inner)]))
 
 

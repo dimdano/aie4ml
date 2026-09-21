@@ -402,6 +402,7 @@ def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):
     assert [item['endpoint'] for item in plan['kernel_read_accesses']] == ['dense_aie.kk[0].out[0]']
     for access in (plan['kernel_write_accesses'][0], plan['kernel_read_accesses'][0]):
         descriptor = access['descriptor']
+        assert descriptor['storage_layout'] == 'microtiled'
         assert descriptor['buffer_dimension'] == [16, 2, 4]
         assert descriptor['tiling_dimension'] == [8, 1, 1]
         assert descriptor['tile_traversal'] == [
@@ -422,7 +423,7 @@ def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):
     assert '{ -1, 0, 2, 0, 3 }' in parameters
 
 
-def test_aie1_add_maps_both_direct_inputs_to_concrete_kernel_ports(tmp_path):
+def test_aie1_linear_add_keeps_concrete_dma_accesses(tmp_path):
     aie_model = _run_pipeline(_add_model(), tmp_path, project='aie1_add')
     inst = aie_model.context.ir.execution.get('add_aie')
     plan = aie_model.context.ir.physical.plan
@@ -434,6 +435,10 @@ def test_aie1_add_maps_both_direct_inputs_to_concrete_kernel_ports(tmp_path):
         'add_aie.kk[0].in[1]',
     ]
     assert [item['endpoint'] for item in plan['kernel_read_accesses']] == ['add_aie.kk[0].out[0]']
+    assert all(
+        item['descriptor']['storage_layout'] == 'linear'
+        for item in (*plan['kernel_write_accesses'], *plan['kernel_read_accesses'])
+    )
 
 
 def test_aie1_tiled_normalization_chain_uses_direct_acc48_kernels(tmp_path):
@@ -603,6 +608,18 @@ def test_memtile_device_keeps_default_boundaries_and_publishes_io_ports(tmp_path
     assert [(port['direction'], port['port']) for port in plan['io_ports']] == [('input', 0), ('output', 0)]
 
 
-def test_aie1_padded_direct_output_requires_relayout_adapter(tmp_path):
-    with pytest.raises(NotImplementedError, match=r'direct graph output requires 128.*exposes 64.*adapter'):
-        _run_pipeline(_dense_model(), tmp_path, project='aie1_padded_output')
+def test_direct_padded_output_uses_dma_projection(tmp_path):
+    aie_model = _run_pipeline(_dense_model(), tmp_path, project='aie1_padded_output')
+    plan = aie_model.context.ir.physical.plan
+
+    assert plan['buffers'] == []
+    assert [item['endpoint'] for item in plan['kernel_read_accesses']] == ['dense_aie.kk[0].out[0]']
+    descriptor = plan['kernel_read_accesses'][0]['descriptor']
+    assert descriptor['storage_layout'] == 'microtiled'
+    assert descriptor['buffer_dimension'] == [16, 2, 4]
+    assert descriptor['tiling_dimension'] == [8, 1, 1]
+    assert descriptor['tile_traversal'] == [
+        {'dimension': 1, 'stride': 1, 'wrap': 1},
+        {'dimension': 0, 'stride': 8, 'wrap': 2},
+        {'dimension': 2, 'stride': 1, 'wrap': 4},
+    ]

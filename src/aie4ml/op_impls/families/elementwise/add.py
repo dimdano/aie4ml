@@ -181,10 +181,8 @@ class AddOpImplVariant(OpImplVariant):
             transpose_rhs=io_views[rhs_tensor.name].is_transposed,
         )
         microtile = io_views[lhs_tensor.name].microtile
-        # Re-deriving a descriptor does not always reproduce the producer's byte for byte -- a
-        # padded inner dim decodes as a spurious microtile and reorders the traversal. So the
-        # inherited descriptor stays authoritative for the inputs it actually describes: same
-        # staging as the primary, and not transposed (a transposed leg derives its own read).
+        # Re-deriving a descriptor can lose the producer's exact partition offsets and traversal.
+        # Keep inherited staging authoritative for matching, non-transposed inputs.
         preserved_tensors = tuple(
             t.name
             for t in (lhs_tensor, rhs_tensor)

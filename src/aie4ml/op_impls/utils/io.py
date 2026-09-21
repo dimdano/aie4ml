@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Sequence
 
 from ...ir import TraitInstance
 from ...ir.graph import STAGING_CONTRACTS, TensorContract
+from .tensor_view import STORAGE_LAYOUTS
 
 
 def ensure_io_view(node, generation: str) -> None:
@@ -82,6 +83,9 @@ the concrete port count, offsets, dimensions, and traversal instead.
 def normalized_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
     if desc is None:
         return None
+    storage_layout = desc.get('storage_layout')
+    if storage_layout not in STORAGE_LAYOUTS:
+        raise ValueError(f'Unknown or missing staging storage_layout {storage_layout!r}.')
     data = {k: v for k, v in desc.items() if k not in _STAGING_COMPAT_STRIP}
     if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
         data['boundary_dimension'] = data['io_boundary_dimension']

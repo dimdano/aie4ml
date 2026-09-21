@@ -1,5 +1,8 @@
 from .math import align_up, ceildiv, require_power_of_two
 from .tensor_view import (
+    STORAGE_LAYOUT_LINEAR,
+    STORAGE_LAYOUT_MICROTILED,
+    STORAGE_LAYOUTS,
     AxisPlan,
     MicrotileShape,
     TensorView,
@@ -28,6 +31,9 @@ __all__ = [
     'AxisPlan',
     'MicrotileShape',
     'ParallelismConfig',
+    'STORAGE_LAYOUT_LINEAR',
+    'STORAGE_LAYOUT_MICROTILED',
+    'STORAGE_LAYOUTS',
     'TensorView',
     'align_up',
     'build_io_views',
