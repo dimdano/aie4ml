@@ -71,6 +71,7 @@ def _quantize_linear(ctx: OnnxImportContext, node, node_name: str, _directives: 
             else:
                 raise ValueError(f'{node_name}: QuantizeLinear intent does not match source tensor precision.')
         ctx.q_aliases[out_name] = ('tensor', tensor, intent, tuple(int(x) for x in tensor.shape))
+        ctx.propagate_order(src_name, out_name)
     elif src_name in ctx.input_shapes:
         ctx.q_aliases[out_name] = ('input', src_name, intent, ctx.input_shapes[src_name])
     elif src_name in ctx.initializers:
@@ -109,6 +110,7 @@ def _dequantize_linear(ctx: OnnxImportContext, node, node_name: str, _directives
                 intent,
             )
         ctx.bind(out_name, tensor)
+        ctx.propagate_order(src_name, out_name)
         return
 
     if src_name in ctx.initializers:

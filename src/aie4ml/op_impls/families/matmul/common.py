@@ -107,6 +107,7 @@ def describe_inner_lhs_staging(view: TensorView, port: int, buf_dims=None):
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
         },
         order=traversal_dims,
+        logical_origin={inner_dim: int(port) * view.tile_raw_inner},
         io_tiling_overrides={inner_dim: view.tile_raw_inner},
         buf_dims=buf_dims,
         boundary_shape='logical',
@@ -128,6 +129,7 @@ def describe_inner_output_staging(view: TensorView, port: int, buf_dims=None):
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
         },
         order=traversal_dims,
+        logical_origin={inner_dim: int(port) * view.tile_raw_inner},
         io_tiling_overrides={inner_dim: view.tile_raw_inner},
         buf_dims=buf_dims,
     )
@@ -152,6 +154,10 @@ def describe_outer_lhs_staging(view: TensorView, parallelism, port: int, buf_dim
             inner_dim: AxisPlan(microtile_k, microtile_k, in_slice // microtile_k, k_chain * in_slice),
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, row_group * outer_slice),
         },
+        logical_origin={
+            inner_dim: int(k_chain) * view.tile_raw_inner,
+            outer_dim: int(row_group) * view.tile_raw_outer,
+        },
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
         buf_dims=buf_dims,
@@ -174,6 +180,7 @@ def describe_outer_output_staging(view: TensorView, port: int, buf_dims=None):
             inner_dim: AxisPlan(microtile_n, microtile_n, out_slice // microtile_n),
             outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m, int(port) * outer_slice),
         },
+        logical_origin={outer_dim: int(port) * view.tile_raw_outer},
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
         buf_dims=buf_dims,
@@ -205,11 +212,13 @@ def describe_stream_staging(
     plans = {dim: AxisPlan(int(full[dim]), int(full[dim]), 1) for dim in traversal_dims}
     plans[inner_dim] = AxisPlan(in_slice, in_slice, 1, k_chain * in_slice)
     plans[outer_dim] = AxisPlan(outer_slice, outer_slice, 1, row_group * outer_slice)
+    origin = {inner_dim: int(k_chain) * view.tile_raw_inner, outer_dim: int(row_group) * view.tile_raw_outer}
     return build_staging_descriptor(
         view,
         access=access,
         plans=plans,
         order=traversal_dims,
+        logical_origin=origin,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
         buf_dims=buf_dims,
         slice_dim=outer_dim if contract == 'outer' else inner_dim,
@@ -235,6 +244,7 @@ def describe_outer_rhs_staging(view: TensorView, parallelism, port: int, buf_dim
             inner_dim: AxisPlan(microtile_n, microtile_n, max(1, n_slice // microtile_n)),
             outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), k_chain * k_slice),
         },
+        logical_origin={outer_dim: int(k_chain) * view.tile_raw_outer},
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
         buf_dims=buf_dims,
@@ -265,6 +275,10 @@ def describe_inner_rhs_staging(view: TensorView, parallelism, port: int, buf_dim
         plans={
             inner_dim: AxisPlan(microtile_n, microtile_n, max(1, n_slice // microtile_n), row * n_slice),
             outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), col * k_slice),
+        },
+        logical_origin={
+            inner_dim: int(row) * view.tile_raw_inner,
+            outer_dim: int(col) * view.tile_raw_outer,
         },
         order=traversal_dims,
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},

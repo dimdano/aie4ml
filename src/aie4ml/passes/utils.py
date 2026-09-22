@@ -30,40 +30,32 @@ def lookup_layer(model: Any, name: str):
 
 
 def assert_true_pointwise(layer) -> None:
-    if layer.class_name == 'Conv1D':
-        filt_w = layer.get_attr('filt_width')
-        stride_w = layer.get_attr('stride_width')
-        pad_l = layer.get_attr('pad_left')
-        pad_r = layer.get_attr('pad_right')
-        in_w = layer.get_attr('in_width')
-        out_w = layer.get_attr('out_width')
-        if not (filt_w == 1 and stride_w == 1 and pad_l == 0 and pad_r == 0 and in_w == out_w):
-            raise ValueError(f'{layer.name}: PointwiseConv1D is not true pointwise.')
-        return
-
-    filt_h = layer.get_attr('filt_height')
+    """A Conv1D that stands in for a Dense must really be pointwise; hls4ml's multi-dense
+    replacement only ever produces that shape."""
     filt_w = layer.get_attr('filt_width')
-    stride_h = layer.get_attr('stride_height')
     stride_w = layer.get_attr('stride_width')
-    pad_t = layer.get_attr('pad_top')
-    pad_b = layer.get_attr('pad_bottom')
     pad_l = layer.get_attr('pad_left')
     pad_r = layer.get_attr('pad_right')
-    in_h = layer.get_attr('in_height')
-    in_w = layer.get_attr('in_width')
-    out_h = layer.get_attr('out_height')
-    out_w = layer.get_attr('out_width')
-    if not (
-        (filt_h, filt_w) == (1, 1)
-        and (stride_h, stride_w) == (1, 1)
-        and (pad_t, pad_b, pad_l, pad_r) == (0, 0, 0, 0)
-        and (in_h, in_w) == (out_h, out_w)
-    ):
-        raise ValueError(f'{layer.name}: PointwiseConv2D is not true pointwise.')
+    if not (filt_w == 1 and stride_w == 1 and pad_l == 0 and pad_r == 0):
+        raise ValueError(f'{layer.name}: PointwiseConv1D is not true pointwise.')
+    if layer.get_attr('in_width') != layer.get_attr('out_width'):
+        raise ValueError(f'{layer.name}: PointwiseConv1D is not true pointwise.')
 
 
 def is_pointwise_dense(layer) -> bool:
-    if layer.class_name not in ('Conv1D', 'Conv2D'):
+    """Whether a convolution layer is a Dense in disguise: a 1x1 window over every pixel.
+
+    A Conv2D that is not pointwise is an ordinary convolution and lowers to the conv2d family.
+    """
+    if layer.class_name == 'Conv1D':
+        assert_true_pointwise(layer)
+        return True
+    if layer.class_name != 'Conv2D':
         return False
-    assert_true_pointwise(layer)
-    return True
+    return (
+        (layer.get_attr('filt_height'), layer.get_attr('filt_width')) == (1, 1)
+        and (layer.get_attr('stride_height'), layer.get_attr('stride_width')) == (1, 1)
+        and not any(layer.get_attr(f'pad_{side}', 0) for side in ('top', 'bottom', 'left', 'right'))
+        and (layer.get_attr('in_height'), layer.get_attr('in_width'))
+        == (layer.get_attr('out_height'), layer.get_attr('out_width'))
+    )

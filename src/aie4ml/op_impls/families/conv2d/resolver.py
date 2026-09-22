@@ -1,0 +1,48 @@
+"""Conv2D's semantic contract: what the operation means, independent of any kernel."""
+
+from __future__ import annotations
+
+from ....ir.graph import VIEW_FLATTEN_2D, input_tensor_for_role
+from ...family_registry import FamilyResolver, family_resolver
+from ...utils import SpatialAccess2D
+from .common import spatial_access_of
+
+
+@family_resolver('conv2d')
+class Conv2dFamilyResolver(FamilyResolver):
+    """conv2d semantics: canonical NHWC activations, compact `[kh, kw, Cin/groups, Cout]` weights
+    and the standard attribute vocabulary (kernel_shape, strides, dilations, pads, groups).
+
+    Only what the operation means lives here; what a kernel can run lives in its variant.
+    """
+
+    op_type = 'conv2d'
+    supported_fusions = frozenset({'bias', 'relu'})
+    supported_output_views = frozenset({VIEW_FLATTEN_2D})
+
+    def spatial_access(self, node) -> SpatialAccess2D:
+        return spatial_access_of(node)
+
+    def validate_structure(self, node, _device) -> None:
+        lhs = input_tensor_for_role(node, 'lhs')
+        rhs = input_tensor_for_role(node, 'rhs')
+        out = node.outputs[0]
+        if len(lhs.shape) != 4:
+            raise ValueError(f'{node.name}: conv2d input must be a rank-4 NHWC activation, got {tuple(lhs.shape)}.')
+        if not rhs.is_parameter or len(rhs.shape) != 4:
+            raise ValueError(f'{node.name}: conv2d weights must be a constant [kh, kw, Cin/groups, Cout] tensor.')
+        access = spatial_access_of(node)  # verifies positive kernel/strides/dilations, non-negative pads
+        groups = int(node.metadata['groups'])
+        kh, kw, cin_g, cout = (int(d) for d in rhs.shape)
+        batch, h, w, cin = (int(d) for d in lhs.shape)
+        if access.kernel != (kh, kw):
+            raise ValueError(f'{node.name}: kernel_shape {access.kernel} does not match the weights {(kh, kw)}.')
+        if groups <= 0 or cin_g * groups != cin or cout % groups:
+            raise ValueError(f'{node.name}: groups={groups} does not divide Cin={cin} / Cout={cout}.')
+        out_h, out_w = access.output_extent(h, w)
+        if min(out_h, out_w) < 1:
+            raise ValueError(f'{node.name}: conv2d window {access} leaves no output for a {h}x{w} input.')
+        view = node.trait_data('output_view')
+        expected = (batch, out_h * out_w * cout) if view else (batch, out_h, out_w, cout)
+        if tuple(int(d) for d in out.shape) != expected:
+            raise ValueError(f'{node.name}: conv2d output {tuple(out.shape)} does not match {expected}.')

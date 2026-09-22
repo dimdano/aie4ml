@@ -9,6 +9,8 @@ from ...utils import ParallelismConfig, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
     resolve_accumulator_output_shift,
+    resolve_operand_precision,
+    resolve_output_scale_shift,
 )
 from .common import (
     bitwidths_supported,
@@ -22,13 +24,7 @@ from .common import (
 )
 from .config import MatmulConfig, MatmulFlags
 from .dense import _BaseDenseMatmulVariant
-from .resolver import (
-    _build_matmul_io_views,
-    _resolve_numeric,
-    _resolve_output_scale_shift,
-    _resolve_parallelism,
-    _resolve_tile_cfg,
-)
+from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg
 
 
 class _MatmulVariantBase(_BaseDenseMatmulVariant):
@@ -46,7 +42,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> MatmulConfig:
         io_route, _, _ = parse_directives(directives)
-        precision, accumulator_tag = _resolve_numeric(node, device)
+        precision, accumulator_tag = resolve_operand_precision(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
         tiling = _resolve_parallelism(node, device, microtiling, precision, self.contract)
         io_views = _build_matmul_io_views(node, microtiling, tiling)
@@ -60,7 +56,7 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
             if is_float
             else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
         )
-        shift += _resolve_output_scale_shift(node, is_float=is_float)
+        shift += resolve_output_scale_shift(node, is_float=is_float)
 
         return MatmulConfig(
             precision=precision,

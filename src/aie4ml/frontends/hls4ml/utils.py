@@ -92,7 +92,7 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
 
 
 def _create_weight_tensors(layer, graph: LogicalIR):
-    """Create weight and bias TensorVars for Dense/Conv1D layers and register them in the graph.
+    """Create weight and bias TensorVars for a weighted layer and register them in the graph.
 
     Returns (weight_tv, bias_tv); bias_tv is None if the layer has no bias.
     """

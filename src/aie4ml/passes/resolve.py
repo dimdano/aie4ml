@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..ir import get_backend_context
-from ..ir.graph import TensorContract
+from ..ir.graph import OUTPUT_VIEWS, TensorContract
 from ..op_impls import get_family_resolver_registry
 from ..op_impls.utils.io import ensure_io_view, normalized_staging, resolve_io_route
 from .base import AIEPass
@@ -58,6 +58,25 @@ def _check_transposed_views(node, config, variant) -> None:
             )
 
 
+def _check_output_view(node, resolver) -> None:
+    """A folded view must name a view its family emits, and describe the output it left behind."""
+    view = node.trait_data('output_view')
+    if not view:
+        return
+    kind = view.get('kind')
+    if kind not in OUTPUT_VIEWS or kind not in resolver.supported_output_views:
+        raise ValueError(
+            f'{node.name}: carries output view {kind!r}, which {node.op_type} does not emit '
+            f'({sorted(resolver.supported_output_views)}).'
+        )
+    shape = tuple(int(d) for d in view.get('shape', ()))
+    if shape != tuple(int(d) for d in node.outputs[0].shape):
+        raise ValueError(
+            f'{node.name}: output view {kind!r} claims {shape} but its output is '
+            f'{tuple(int(d) for d in node.outputs[0].shape)}.'
+        )
+
+
 class Resolve(AIEPass):
     """Resolve logical nodes into family-owned execution entries."""
 
@@ -78,6 +97,7 @@ class Resolve(AIEPass):
                 continue
 
             resolver = self._registry.get(node.op_type)
+            _check_output_view(node, resolver)
             ensure_io_view(node, ctx.device.generation)
 
             resolved_directives = dict(node.directives or {})

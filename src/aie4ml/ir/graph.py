@@ -90,6 +90,11 @@ def input_role(node: OpNode, tensor_name: str) -> Optional[str]:
     return node.roles.get(tensor_name)
 
 
+def has_input_role(node: OpNode, role: str) -> bool:
+    """Whether one of this node's inputs plays `role` -- the only record that it does."""
+    return role in node.roles.values()
+
+
 def input_tensor_for_role(node: OpNode, role: str) -> TensorVar:
     for tensor in node.inputs:
         if node.roles.get(tensor.name) == role:
@@ -173,6 +178,12 @@ class LogicalIR:
         out_tv.consumers.clear()
         self.tensors.pop(out_tv.name, None)
 
+    def _retarget_boundary(self, old: 'TensorVar', new: 'TensorVar') -> None:
+        """Move a graph-boundary marker onto the tensor that replaces `old`."""
+        for names in (self.input_tensor_names, self.output_tensor_names):
+            if old.name in names:
+                names[names.index(old.name)] = new.name
+
     def _contract_node(self, node: OpNode):
         in_tv, out_tv = node.inputs[0], node.outputs[0]
         producer = in_tv.producer
@@ -190,6 +201,8 @@ class LogicalIR:
 
         in_tv.producer = None
         if not in_tv.consumers:
+            # The downstream tensor takes its place, boundary marker included.
+            self._retarget_boundary(in_tv, out_tv)
             self.tensors.pop(in_tv.name, None)
 
     def _detach_node(self, node: OpNode):
@@ -221,6 +234,8 @@ class LogicalIR:
         self._verify_unique_node_names()
         self._verify_topological_order()
         self._verify_tensor_producers()
+        self._verify_connectivity()
+        self._verify_graph_boundaries()
 
     def _verify_unique_node_names(self) -> None:
         seen: set = set()
@@ -252,6 +267,36 @@ class LogicalIR:
                         'and is not a declared graph input.'
                     )
 
+    def _verify_connectivity(self) -> None:
+        """Every edge is reciprocal: a node lists the tensors that list it."""
+        for node in self.nodes:
+            for tensor in node.inputs:
+                if node not in tensor.consumers:
+                    raise RuntimeError(f'{node.name}: reads {tensor.name!r}, which does not list it as a consumer.')
+            for tensor in node.outputs:
+                if tensor.producer is not node:
+                    raise RuntimeError(
+                        f'{node.name}: writes {tensor.name!r}, whose producer is '
+                        f'{tensor.producer.name if tensor.producer else None!r}.'
+                    )
+        for tensor in self.tensors.values():
+            for consumer in tensor.consumers:
+                if tensor not in consumer.inputs:
+                    raise RuntimeError(f'{tensor.name}: lists {consumer.name!r} as a consumer, which does not read it.')
+            if any(int(extent) <= 0 for extent in tensor.shape):
+                raise RuntimeError(f'{tensor.name}: has a non-positive extent in {tuple(tensor.shape)}.')
+
+    def _verify_graph_boundaries(self) -> None:
+        for name in self.input_tensor_names:
+            if name not in self.tensors:
+                raise RuntimeError(f'graph input {name!r} is not a tensor of this graph.')
+        for name in self.output_tensor_names:
+            tensor = self.tensors.get(name)
+            if tensor is None:
+                raise RuntimeError(f'graph output {name!r} is not a tensor of this graph.')
+            if tensor.producer is None and name not in self.input_tensor_names:
+                raise RuntimeError(f'graph output {name!r} has no producer and is not a graph input.')
+
     def __iter__(self):
         return iter(self.nodes)
 
@@ -265,6 +310,12 @@ STAGING_CONTRACTS: frozenset = frozenset({'outer', 'inner'})
 ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'plio', 'auto'})
 """Compiler-wide vocabulary of valid IO route modes."""
 
+
+VIEW_FLATTEN_2D = 'flatten_2d'
+"""Output view: the producer writes its result as one `[1, K]` row instead of its natural shape."""
+
+OUTPUT_VIEWS: frozenset = frozenset({VIEW_FLATTEN_2D})
+"""Compiler-wide vocabulary of output views a producing family may be asked to emit."""
 
 TENSOR_LAYOUTS: frozenset = frozenset({'linear', 'tiled'})
 """Valid `layout:` directive names. Only a variant selector -- the layout itself is the

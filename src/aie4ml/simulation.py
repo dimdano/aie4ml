@@ -52,6 +52,12 @@ class IOPortLayout:
         return [int(x) for x in self.staging['offset']]
 
     @property
+    def logical_origin(self) -> List[int]:
+        # Where this port's window starts in the tensor, signed: negative means it opens on
+        # padding, before the data (a conv frame's zero border).
+        return [int(x) for x in self.staging['logical_origin']]
+
+    @property
     def tiling_dimension(self) -> List[int]:
         # The shape a PLIO file carries per iteration: the logical IO tile for a DMA-fed buffer
         # port, the whole padded port tile for a stream port. `io_tiling_dimension` bounds the
@@ -246,40 +252,37 @@ def _quantize_to_int(data: np.ndarray, dtype: AIEDataType) -> np.ndarray:
 
 
 def _extract_port_tile(data: np.ndarray, port: IOPortLayout) -> np.ndarray:
-    rank = port.rank
+    """The tile one port carries: its window over the tensor, clipped, the rest left zero."""
     tile = np.zeros((data.shape[0], *port.numpy_tile_shape), dtype=data.dtype)
-
-    src_slices = [slice(None)] * (rank + 1)
-    dst_slices = [slice(None)] * (rank + 1)
-    for d in range(rank):
-        axis = rank - d
-        start = int(port.offset[d])
-        size = int(port.io_tiling_dimension[d])
-        bound = int(port.io_boundary_dimension[d])
-        take = min(size, max(0, bound - start))
-
-        src_slices[axis] = slice(start, start + take)
-        dst_slices[axis] = slice(0, take)
-
-    tile[tuple(dst_slices)] = data[tuple(src_slices)]
+    src, dst = _window_slices(port, data.shape[1:])
+    tile[(slice(None), *dst)] = data[(slice(None), *src)]
     return tile
 
 
 def _insert_port_tile(out: np.ndarray, tile: np.ndarray, port: IOPortLayout) -> None:
-    rank = port.rank
-    dst_slices = [slice(None)] * (rank + 1)
-    src_slices = [slice(None)] * (rank + 1)
-    for d in range(rank):
-        axis = rank - d
-        start = int(port.offset[d])
-        size = int(port.io_tiling_dimension[d])
-        bound = int(port.io_boundary_dimension[d])
-        take = min(size, max(0, bound - start))
+    """The inverse: keep the part of the tile that lands inside the tensor."""
+    src, dst = _window_slices(port, out.shape[1:])
+    out[(slice(None), *src)] = tile[(slice(None), *dst)]
 
-        dst_slices[axis] = slice(start, start + take)
-        src_slices[axis] = slice(0, take)
 
-    out[tuple(dst_slices)] = tile[tuple(src_slices)]
+def _window_slices(port: IOPortLayout, tensor_shape):
+    """Intersect a port's window with the tensor, per axis, in numpy order.
+
+    The window starts at `logical_origin` (signed) and spans the transfer shape; everything
+    outside the tensor is padding the host leaves at zero.
+    """
+    tensor_slices, tile_slices = [], []
+    for axis, extent in enumerate(tensor_shape):
+        dim = port.rank - 1 - axis  # numpy axis -> descriptor axis (buffer order)
+        start = int(port.logical_origin[dim])
+        span = int(port.numpy_tile_shape[axis])
+        bound = min(int(extent), int(port.numpy_boundary_shape[axis]))
+        first = max(0, start)
+        last = min(bound, start + span)
+        take = max(0, last - first)
+        tensor_slices.append(slice(first, first + take))
+        tile_slices.append(slice(first - start, first - start + take))
+    return tuple(tensor_slices), tuple(tile_slices)
 
 
 def _read_output_file(path: Path, port: IOPortLayout) -> np.ndarray:

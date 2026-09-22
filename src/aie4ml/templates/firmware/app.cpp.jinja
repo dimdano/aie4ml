@@ -98,7 +98,7 @@ int main() {
         {% else %}
         {{ spec.name }}_{{ L.inst_name }}[ch][col],
         {% endif %}
-        {{ L.struct_name }}::IN_FEAT_SLICE * {{ L.struct_name }}::OUT_FEAT_SLICE
+        {{ spec.array[0][0]|length }}
       );
     }
   }

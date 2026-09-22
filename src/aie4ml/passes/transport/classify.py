@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ...ir import get_backend_context
 from ..base import AIEPass
-from .legality import direct_transport_failure, uses_stream
+from .legality import direct_transport_failure, memtile_staging_failure, uses_stream
 from .model import TransportDecision
 
 
@@ -28,6 +28,13 @@ class ClassifyTransportEntries(AIEPass):
         is_boundary = entry.producer.node is None or entry.graph_output
         has_memtile = bool(ctx.device.has_memtile)
 
+        restage_failure = memtile_staging_failure(ctx, entry)
+        if route == 'memtile' and restage_failure is not None:
+            raise NotImplementedError(
+                f'{entry.logical_tensor}: io_route=memtile needs re-staging, but {restage_failure}.'
+            )
+        can_memtile = has_memtile and restage_failure is None
+
         if uses_stream(ctx, entry):
             # A stream port has no buffer for a memory tile to stage, so the leg is
             # point-to-point (or PLIO) and must already agree on its element order.
@@ -40,7 +47,9 @@ class ClassifyTransportEntries(AIEPass):
                 else:
                     failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
                 if failure is not None:
-                    raise RuntimeError(f'{entry.logical_tensor}: stream ports cannot connect directly: {failure}.')
+                    raise RuntimeError(
+                        f'{entry.logical_tensor}: point-to-point ports cannot connect directly: {failure}.'
+                    )
             return TransportDecision('direct', True)
 
         if is_boundary:
@@ -48,7 +57,7 @@ class ClassifyTransportEntries(AIEPass):
                 raise RuntimeError(
                     f'{entry.logical_tensor}: io_route=memtile requested on a device without memory tiles.'
                 )
-            realization = 'direct' if route == 'direct' or (route == 'auto' and not has_memtile) else 'memtile'
+            realization = 'direct' if route == 'direct' or (route == 'auto' and not can_memtile) else 'memtile'
             return TransportDecision(realization, True if realization == 'direct' else None)
 
         consumer = entry.single_consumer()
@@ -73,7 +82,7 @@ class ClassifyTransportEntries(AIEPass):
         else:
             if staging_compatible:
                 realization = 'direct'
-            elif not has_memtile:
+            elif not can_memtile:
                 raise RuntimeError(
                     f'{entry.logical_tensor}: AIE1 cannot directly connect this transport: {direct_failure}; '
                     'relay/relayout is not implemented.'

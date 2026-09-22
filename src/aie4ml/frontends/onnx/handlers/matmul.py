@@ -43,6 +43,7 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
         # canonicalization first if that subset is ever needed.
         rhs_is_constant = True
 
+    ctx.require_identity_order(lhs_name, node_name)
     lhs_tensor = ctx.source_for(lhs_name, node_name)
     if lhs_tensor.is_parameter:
         raise ValueError(f'{node_name}: activation input cannot be constant.')
@@ -53,6 +54,7 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
     if not rhs_is_constant:
         if bias_name is not None:
             raise ValueError(f'{node_name}: dynamic MatMul does not support fused bias.')
+        ctx.require_identity_order(rhs_name, node_name)
         rhs_tensor = ctx.source_for(rhs_name, node_name)
         rhs_shape = ctx.output_shape(rhs_name, node_name)
         n_in = int(rhs_shape[0] if len(rhs_shape) == 1 else rhs_shape[-2])
@@ -141,7 +143,6 @@ def _matmul_meta(source_class: str, n_in: int, n_out: int, node_name: str) -> di
     return {
         'n_in': n_in,
         'n_out': n_out,
-        'use_bias': False,
         'layer_class': 'MatMul',
         'source_class': source_class,
         'source_layer': node_name,
@@ -152,7 +153,6 @@ def _dense_meta(source_class: str, n_in: int, n_out: int, node_name: str) -> dic
     return {
         'n_in': n_in,
         'n_out': n_out,
-        'use_bias': False,
         'layer_class': 'Dense',
         'source_class': source_class,
         'source_layer': node_name,

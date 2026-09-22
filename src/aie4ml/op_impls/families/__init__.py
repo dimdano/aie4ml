@@ -1,5 +1,5 @@
 """Op-implementation families."""
 
-from . import elementwise, layernorm, matmul, softmax
+from . import conv2d, elementwise, layernorm, matmul, softmax
 
-__all__ = ['elementwise', 'layernorm', 'matmul', 'softmax']
+__all__ = ['conv2d', 'elementwise', 'layernorm', 'matmul', 'softmax']

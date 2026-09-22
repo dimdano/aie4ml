@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 from ...op_impls.common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM
+from ...op_impls.utils import STORAGE_LAYOUT_INNER_BLOCKED
 from ...op_impls.utils.io import normalized_staging
 from .descriptors import localize_descriptor
 from .model import Endpoint
@@ -23,6 +24,28 @@ def uses_stream(ctx, entry) -> bool:
     """Whether any kernel endpoint of a transport entry is a stream port."""
     endpoints = [entry.producer] + [conn.consumer for conn in entry.consumers if conn.consumer is not None]
     return any(endpoint_port_kind(ctx, endpoint) == PORT_KIND_STREAM for endpoint in endpoints)
+
+
+def memtile_staging_failure(ctx, entry) -> str | None:
+    """Why a memory tile cannot re-stage this entry, or None when it can.
+
+    Storage encoding and routing are separate concerns: this answers only whether the memtile
+    pass knows how to shard the layout the endpoints use.
+    """
+    for endpoint in [entry.producer] + [conn.consumer for conn in entry.consumers if conn.consumer is not None]:
+        if endpoint.node is None:
+            continue
+        inst = ctx.ir.execution.get(endpoint.node.name)
+        if endpoint.tensor in inst.ports.outputs:
+            desc = inst.variant.describe_output_staging(endpoint.node, inst.config, endpoint.tensor, 0, None)
+        else:
+            desc = inst.variant.describe_input_staging(endpoint.node, inst.config, endpoint.tensor, 0, None, None)
+        if desc.get('storage_layout') == STORAGE_LAYOUT_INNER_BLOCKED:
+            return (
+                f'{endpoint.node.name}.{endpoint.group} stages an inner-blocked buffer, which memtile '
+                'sharding does not implement'
+            )
+    return None
 
 
 def direct_transport_failure(

@@ -16,10 +16,16 @@ from .boundary import (
     graph_input_port_descriptor,
     graph_input_writer_port_descriptor,
     host_offsets,
+    host_visible_input_staging,
     require_linear_stream_staging,
 )
 from .collect import TransportCollector
-from .descriptors import boundary_access_descriptor, localize_descriptor, localized_graph_io_descriptor
+from .descriptors import (
+    boundary_access_descriptor,
+    describes_natural_order,
+    localize_descriptor,
+    localized_graph_io_descriptor,
+)
 from .model import EdgeEntry
 
 
@@ -198,12 +204,14 @@ class _MemoryPlanMaterializer:
             )
             if not stream:
                 # Vitis accepts access constraints on hierarchical ports but does not apply their buffer
-                # reorder; bind them to the kernel ports. A stream port has no DMA to constrain.
+                # reorder; bind them to the kernel ports. A stream port has no DMA to constrain, and
+                # neither does a transfer that already moves the buffer in its own order.
                 descriptor = boundary_access_descriptor(descriptor)
-                self.kernel_write_accesses.extend(
-                    {'endpoint': f'{consumer_id}.{endpoint}', 'descriptor': descriptor}
-                    for endpoint in binding.endpoints[int(consumer_port)]
-                )
+                if not describes_natural_order(descriptor):
+                    self.kernel_write_accesses.extend(
+                        {'endpoint': f'{consumer_id}.{endpoint}', 'descriptor': descriptor}
+                        for endpoint in binding.endpoints[int(consumer_port)]
+                    )
             self.io_ports.append(
                 {
                     'direction': 'input',
@@ -250,20 +258,21 @@ class _MemoryPlanMaterializer:
                 elements = int(prod(staging_tile_shape(descriptor)))
                 logical_elements = int(prod(int(value) for value in staging['io_tiling_dimension']))
                 descriptor = boundary_access_descriptor(descriptor, project_to_io_boundary=logical_elements != elements)
-                transferred_elements = int(prod(staging_tile_shape(descriptor)))
-                if transferred_elements != logical_elements:
-                    raise NotImplementedError(
-                        f'{entry.logical_tensor}: direct graph output requires {elements} kernel-buffer elements '
-                        f'but exposes {logical_elements} logical elements; the boundary DMA cannot project this layout.'
-                    )
+                # What the PLIO carries per iteration: the projected transfer (logical rows, columns
+                # rounded up to the microtile) or the whole tile; the host trims to io_tiling.
+                transfer = descriptor.pop('transfer_shape', None) or list(staging['tiling_dimension'])
+                if int(prod(transfer)) != int(prod(staging_tile_shape(descriptor))):
+                    raise RuntimeError(f'{entry.logical_tensor}: boundary DMA transfer does not match its descriptor.')
+                staging['tiling_dimension'] = [int(value) for value in transfer]
                 endpoints = binding.endpoints[int(producer_port)]
                 if len(endpoints) != 1:
                     raise RuntimeError(
                         f'{entry.logical_tensor}: direct graph output requires one kernel endpoint, got {endpoints}.'
                     )
-                self.kernel_read_accesses.append(
-                    {'endpoint': f'{producer_id}.{endpoints[0]}', 'descriptor': descriptor}
-                )
+                if not describes_natural_order(descriptor):
+                    self.kernel_read_accesses.append(
+                        {'endpoint': f'{producer_id}.{endpoints[0]}', 'descriptor': descriptor}
+                    )
             self.io_ports.append(
                 {
                     'direction': 'output',
@@ -442,21 +451,7 @@ class _MemoryPlanMaterializer:
         inst = self._kernel_inst(consumer.node)
         port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
         base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None, None)
-
-        io_tile = list(base['io_tiling_dimension'])
-
-        return {
-            'access': 'write',
-            'storage_layout': STORAGE_LAYOUT_LINEAR,
-            'buffer_dimension': list(base['buffer_dimension']),
-            'tiling_dimension': io_tile,
-            'io_tiling_dimension': list(io_tile),
-            'io_boundary_dimension': list(base['io_boundary_dimension']),
-            'offset': [0 for _ in io_tile],
-            'slice_dimension': int(base['slice_dimension']),
-            'inner_dimension': int(base['inner_dimension']),
-            'outer_dimension': int(base['outer_dimension']),
-        }
+        return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
 
     def _graph_output_reader_descriptor(
         self,
@@ -605,6 +600,7 @@ def _host_visible_output_staging(base: Dict[str, Any], *, stream: bool = False) 
     desc = dict(base)
     desc['buffer_dimension'] = list(base['io_boundary_dimension'])
     desc['offset'] = host_offsets(base)
+    desc['logical_origin'] = list(base['logical_origin'])
     desc['tiling_dimension'] = list(base['tiling_dimension'] if stream else base['io_tiling_dimension'])
     desc['storage_layout'] = STORAGE_LAYOUT_LINEAR
     return desc

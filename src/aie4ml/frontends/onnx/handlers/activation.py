@@ -15,11 +15,12 @@ def _relu(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> Non
         raise ValueError(f'{node_name}: Relu must have exactly 1 input.')
     src = ctx.source_for(node.input[0], node_name)
     out_name = node.output[0]
+    ctx.propagate_order(node.input[0], out_name)  # elementwise: any axis order passes through
     ctx.emit(
         'activation',
         node_name,
         inputs=[src],
-        outputs=[(out_name, ctx.output_shape(out_name, node_name), src.precision)],
+        outputs=[(out_name, src.shape, src.precision)],
         roles=['lhs'],
         metadata={'activation': 'relu', 'layer_class': 'Activation', 'source_layer': node_name},
         directives=directives,

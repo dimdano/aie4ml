@@ -26,6 +26,7 @@ def _layer_norm(ctx: OnnxImportContext, node, node_name: str, directives: dict) 
     norm_shape = tuple(x_shape[axis:])
     epsilon = float(attr(node, 'epsilon', 1e-5))
 
+    ctx.require_identity_order(x_name, node_name)
     x_tensor = ctx.source_for(x_name, node_name)
     scale_tensor = ctx.parameter_source_for(scale_name, node_name)
     if not scale_tensor.is_parameter:
@@ -61,6 +62,7 @@ def _layer_norm(ctx: OnnxImportContext, node, node_name: str, directives: dict) 
 def _softmax(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
     if len(node.input) != 1:
         raise ValueError(f'{node_name}: Softmax must have exactly 1 input.')
+    ctx.require_identity_order(node.input[0], node_name)
     src = ctx.source_for(node.input[0], node_name)
     in_shape = ctx.output_shape(node.input[0], node_name)
     axis = normalize_axis(int(attr(node, 'axis', -1)), len(in_shape), node_name, 'Softmax')

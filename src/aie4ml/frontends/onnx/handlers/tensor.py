@@ -1,12 +1,13 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shape/view ops: Transpose, Slice, Split, Concat."""
+"""Shape/view ops: Transpose, Flatten/Reshape, Slice, Split, Concat."""
 
 from __future__ import annotations
 
 import numpy as np
 
+from ....ir.graph import VIEW_FLATTEN_2D
 from ..context import OnnxImportContext
 from ..registry import onnx_handler
 from ..shapes import normalize_axis
@@ -15,6 +16,10 @@ from ..utils import attr
 
 @onnx_handler('Transpose')
 def _transpose(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
+    """A transpose of an activation is a change of view, not of data: it composes into how the
+    ONNX value sees its canonical tensor. A consumer that needs the canonical order refuses a
+    non-identity view; one that reads the view (Conv) says so.
+    """
     if len(node.input) != 1:
         raise ValueError(f'{node_name}: Transpose must have exactly 1 input.')
     src = ctx.source_for(node.input[0], node_name)
@@ -23,23 +28,45 @@ def _transpose(ctx: OnnxImportContext, node, node_name: str, directives: dict) -
     if sorted(perm) != list(range(len(in_shape))):
         raise ValueError(f'{node_name}: invalid permutation {perm} for rank {len(in_shape)}.')
     out_name = node.output[0]
-    out_shape = ctx.output_shape(out_name, node_name)
 
     if src.is_parameter:
         data = np.transpose(np.asarray(src.data, dtype=np.float64), axes=perm)
         ctx.bind(out_name, ctx.param_tensor(out_name, data, src.precision))
         return
 
+    view = ctx.order_of(node.input[0]) or tuple(range(len(in_shape)))
+    ctx.bind(out_name, src)
+    ctx.set_order(out_name, [view[axis] for axis in perm], node_name)
+
+
+@onnx_handler('Flatten', 'Reshape')
+def _flatten(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
+    """Flatten one sample to [1, K]. The canonical tensor is unchanged, so the op only records
+    which row order the ONNX value implies -- a consumer's weight rows follow that order.
+    """
+    src_name = node.input[0]
+    src = ctx.source_for(src_name, node_name)
+    out_name = node.output[0]
+    out_shape = tuple(int(d) for d in ctx.output_shape(out_name, node_name))
+    logical = tuple(int(d) for d in src.shape)
+    if len(out_shape) != 2 or int(out_shape[0]) != 1 or int(np.prod(logical[1:])) != int(out_shape[1]):
+        raise NotImplementedError(f'{node_name}: only a flatten of one sample to [1, K] is supported, got {out_shape}.')
+    # The flattened row is canonical; `source_order` records how the view ravelled the axes, so
+    # the fold can hand that order to whoever reduces over the row.
+    ctx.set_order(out_name, None, node_name)
+
     ctx.emit(
-        'transpose',
+        'reshape',
         node_name,
         inputs=[src],
         outputs=[(out_name, out_shape, src.precision)],
         roles=['lhs'],
         metadata={
-            'perm': perm,
-            'data_format': 'channels_last',
-            'layer_class': 'Transpose',
+            'view': VIEW_FLATTEN_2D,
+            # Which order the axes were ravelled in: the ONNX value's own, which may differ from
+            # the canonical order of the tensor it views.
+            'axis_order': ctx.order_of(src_name) or tuple(range(len(logical))),
+            'layer_class': node.op_type,
             'source_layer': node_name,
         },
         directives=directives,
@@ -103,6 +130,7 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
             ranges.append((offset, size))
             offset += size
 
+    ctx.require_identity_order(src_name, node_name)
     source = ctx.source_for(src_name, node_name)
     outputs = [(out_name, ctx.output_shape(out_name, node_name), source.precision) for out_name in node.output]
     ctx.emit(
@@ -126,6 +154,8 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
 def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
     if len(node.input) < 1:
         raise ValueError(f'{node_name}: Concat must have at least one input.')
+    for name in node.input:
+        ctx.require_identity_order(name, node_name)
     sources = [ctx.source_for(name, node_name) for name in node.input]
     if any(src.is_parameter for src in sources):
         raise ValueError(f'{node_name}: Concat currently supports activation tensors only.')
