@@ -53,8 +53,10 @@ class IOPortLayout:
 
     @property
     def tiling_dimension(self) -> List[int]:
-        # Files stream IO tiles, not kernel tiles.
-        return [int(x) for x in self.staging['io_tiling_dimension']]
+        # The shape a PLIO file carries per iteration: the logical IO tile for a DMA-fed buffer
+        # port, the whole padded port tile for a stream port. `io_tiling_dimension` bounds the
+        # logical elements inside it either way.
+        return [int(x) for x in self.staging['tiling_dimension']]
 
     @property
     def numpy_boundary_shape(self) -> Tuple[int, ...]:
@@ -252,7 +254,7 @@ def _extract_port_tile(data: np.ndarray, port: IOPortLayout) -> np.ndarray:
     for d in range(rank):
         axis = rank - d
         start = int(port.offset[d])
-        size = int(port.tiling_dimension[d])
+        size = int(port.io_tiling_dimension[d])
         bound = int(port.io_boundary_dimension[d])
         take = min(size, max(0, bound - start))
 
@@ -270,7 +272,7 @@ def _insert_port_tile(out: np.ndarray, tile: np.ndarray, port: IOPortLayout) -> 
     for d in range(rank):
         axis = rank - d
         start = int(port.offset[d])
-        size = int(port.tiling_dimension[d])
+        size = int(port.io_tiling_dimension[d])
         bound = int(port.io_boundary_dimension[d])
         take = min(size, max(0, bound - start))
 

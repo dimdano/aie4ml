@@ -6,7 +6,7 @@ from typing import Any, Dict
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant
-from ...common_types import PortBinding, PortMap
+from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
 from ...utils import (
     ParallelismConfig,
@@ -284,19 +284,8 @@ class AddOpImplVariant(OpImplVariant):
         n = int(config.parallelism.cas_num)
         return PortMap(
             inputs={
-                lhs_tensor.name: PortBinding(group='in1', count=n),
-                rhs_tensor.name: PortBinding(group='in2', count=n),
+                lhs_tensor.name: PortBinding('in1', n, endpoints=kernel_endpoints(n, 'in[0]')),
+                rhs_tensor.name: PortBinding('in2', n, endpoints=kernel_endpoints(n, 'in[1]')),
             },
-            outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
+            outputs={node.outputs[0].name: PortBinding('out1', n, endpoints=kernel_endpoints(n, 'out[0]'))},
         )
-
-    def boundary_input_access_endpoints(
-        self, _config: AddConfig, port: int, group: str | None = None
-    ) -> tuple[str, ...]:
-        kernel_port = {'in1': 0, 'in2': 1}.get(group)
-        if kernel_port is None:
-            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
-        return (f'kk[{int(port)}].in[{kernel_port}]',)
-
-    def boundary_output_access_endpoints(self, _config: AddConfig, port: int) -> tuple[str, ...]:
-        return (f'kk[{int(port)}].out[0]',)

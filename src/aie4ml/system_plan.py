@@ -166,8 +166,8 @@ def emits_system(model_or_ctx) -> bool:
     return str(ctx.aie_config.get('Target', 'aie')).lower() == 'hardware'
 
 
-def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
-    """Return (per-sample feature count, element bytes) for a single graph IO tensor.
+def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int) -> int:
+    """Per-sample feature count of a single graph IO tensor.
 
     Supports exactly one graph input and one graph output (multiple graph I/O tensors are
     not yet supported).
@@ -179,18 +179,19 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
         raise RuntimeError(
             f'graph {direction} {tensors[0]!r}: element count {total} is not divisible by batch {batch}.'
         )
-    return total // int(batch), int(port0.dtype.width) // 8
+    return total // int(batch)
 
 
-def _stream_words_512(batch: int, feat: int, elem_bytes: int, n_streams: int, direction: str) -> int:
-    """512-bit words per stream per iteration; requires 512-bit + per-stream alignment."""
-    total_bytes = int(batch) * int(feat) * int(elem_bytes)
-    if total_bytes % (_DDR_WORD_BYTES * int(n_streams)) != 0:
+def _stream_words_512(port, direction: str) -> int:
+    """512-bit words one PLIO stream carries per iteration: the port's transfer tile (the logical
+    slice of a DMA-fed buffer port, the padded tile of a stream port), which must be word-aligned."""
+    stream_bytes = int(math.prod(port.numpy_tile_shape)) * (int(port.dtype.width) // 8)
+    if stream_bytes % _DDR_WORD_BYTES != 0:
         raise NotImplementedError(
-            f'graph {direction}: {total_bytes} bytes is not a multiple of '
-            f'{_DDR_WORD_BYTES} B/word * {n_streams} stream(s); 512-bit/per-stream padding is not yet supported.'
+            f'graph {direction}: {stream_bytes} bytes per stream is not a multiple of '
+            f'{_DDR_WORD_BYTES} B/word; 512-bit/per-stream padding is not yet supported.'
         )
-    return total_bytes // (_DDR_WORD_BYTES * int(n_streams))
+    return stream_bytes // _DDR_WORD_BYTES
 
 
 def _kernel_entry(name: str, template_dir: str) -> Dict[str, str]:
@@ -338,8 +339,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
             f'got {len(layout.inputs)} and ({layout.outputs}). Multiple graph are not yet supported.'
         )
 
-    in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
-    out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
+    in_feat = _single_io_feat(layout.inputs, 'input', batch)
+    out_feat = _single_io_feat(layout.outputs, 'output', batch)
     # Per-PLIO-tile feature slices come from the GRAPH BOUNDARY ports -- the single graph
     # input and single graph output (already validated to be 1 each above).
     gin_port = next(iter(layout.inputs.values()))[0]
@@ -391,8 +392,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         raise NotImplementedError(
             f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
-    ifm_per_stream = _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input')
-    ofm_per_stream = _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output')
+    ifm_per_stream = _stream_words_512(gin_port, 'input')
+    ofm_per_stream = _stream_words_512(gout_port, 'output')
     iterations = int(ctx.aie_config['Iterations'])
 
     # On-chip pool selection -- common to every mover (all bind_storage to URAM or BRAM).

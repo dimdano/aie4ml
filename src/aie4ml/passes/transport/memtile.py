@@ -11,6 +11,7 @@ from .boundary import (
     graph_input_writer_port_descs,
 )
 from .descriptors import localize_descriptor, rebase_descriptor_offset
+from .legality import uses_stream
 from .model import GraphInputSpec, TransportUnit
 
 
@@ -39,7 +40,9 @@ class LegalizeMemtilePortLimits(AIEPass):
                     port_base = next_graph_input_port
                     next_graph_input_port += len(producer_ports)
                     descriptors = graph_input_port_descs(entry, ctx, port_base)
-                    entry.graph_input = GraphInputSpec(descriptors, graph_input_writer_port_descs(descriptors))
+                    entry.graph_input = GraphInputSpec(
+                        descriptors, graph_input_writer_port_descs(descriptors, stream=uses_stream(ctx, entry))
+                    )
                     producer_ports = tuple(port_base + index for index in range(len(producer_ports)))
                 entry.unit = TransportUnit(producer_ports, consumer_ports)
                 rewritten.append(entry)

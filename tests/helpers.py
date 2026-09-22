@@ -127,7 +127,9 @@ def microtiling(m: int, k: int, n: int) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def assert_x86_matches_onnx(model, feeds, directives, tmp_path, *, project='proj', batch, frac=4, max_code_diff=5):
+def assert_x86_matches_onnx(
+    model, feeds, directives, tmp_path, *, project='proj', batch, frac=4, max_code_diff=5, part=PART
+):
     """Compile a model for x86, simulate it, and check every output against onnxruntime.
 
     The reference runs the float ONNX graph; each AIE output is compared in the quantized int8
@@ -138,7 +140,7 @@ def assert_x86_matches_onnx(model, feeds, directives, tmp_path, *, project='proj
 
     aie_model = from_onnx(
         model,
-        {'Part': PART, 'AIEConfig': {'BatchSize': batch, 'Iterations': 1}, 'LayerDirectives': dict(directives)},
+        {'Part': part, 'AIEConfig': {'BatchSize': batch, 'Iterations': 1}, 'LayerDirectives': dict(directives)},
         output_dir=Path(tmp_path) / project,
         project_name=project,
     )

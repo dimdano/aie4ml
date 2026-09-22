@@ -61,7 +61,7 @@ class OnnxImportContext:
         self.precision_mirrors.append((target, source))
 
     def take_directives(self, node_name: str) -> Dict[str, Any]:
-        from .utils import normalize_directives
+        from ..common import normalize_directives
 
         directives = normalize_directives(node_name, self.layer_directives.get(node_name))
         if directives:

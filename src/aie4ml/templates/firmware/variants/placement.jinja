@@ -1,7 +1,9 @@
 {% macro buffer_locations(name, locations) %}
+{% if locations %}
   inline static constexpr aie4ml_buffer_location {{name}}[{{locations|length}}] = {
 {% for location in locations %}
     { {{location.rel_col}}, {{location.rel_row}}, {{location.banks|length}}, {{location.banks[0]}}, {{location.banks[1] if location.banks|length > 1 else -1}} }{{ "," if not loop.last else "" }}
 {% endfor %}
   };
+{% endif %}
 {% endmacro %}

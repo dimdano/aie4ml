@@ -12,6 +12,7 @@ from hls4ml.model.types import PrecisionType
 
 from ...aie_types import QuantIntent, RoundingMode, SaturationMode
 from ...ir import LogicalIR, TensorVar
+from ..common import normalize_directives
 
 
 def _to_quant_intent(precision: PrecisionType) -> QuantIntent:
@@ -68,56 +69,21 @@ def _get_post_activation_precision(layer, model) -> Optional[QuantIntent]:
 
 
 def extract_layer_directives(layer, model) -> Dict[str, Any]:
-    """Extract normalized compiler directives from the hls4ml config for one layer."""
-    directives: Dict[str, Any] = {}
+    """Compiler directives for one layer from the hls4ml config; flat keys win over the nested dicts."""
     cfg = model.config.get_layer_config_value
-
-    placement_cfg = cfg(layer, 'placement', {})
-    if isinstance(placement_cfg, dict):
-        placement: Dict[str, int] = {}
-        if 'col' in placement_cfg:
-            placement['col'] = int(placement_cfg['col'])
-        if 'row' in placement_cfg:
-            placement['row'] = int(placement_cfg['row'])
-        if placement:
-            directives['placement'] = placement
-
-    tiling: Dict[str, int] = {}
-    tiling_cfg = cfg(layer, 'microtiling', {})
-    for key in ('microtile_m', 'microtile_k', 'microtile_n'):
-        flat = cfg(layer, key)
-        if flat is not None:
-            tiling[key] = int(flat)
-        elif key in tiling_cfg:
-            tiling[key] = int(tiling_cfg[key])
-    if tiling:
-        directives['microtiling'] = tiling
-
-    parallelism: Dict[str, Any] = {}
-    parallel_cfg = cfg(layer, 'parallelism', {})
-    for key in ('cas_num', 'cas_length'):
-        flat = cfg(layer, key)
-        if flat is not None:
-            parallelism[key] = int(flat)
-        elif key in parallel_cfg:
-            parallelism[key] = int(parallel_cfg[key])
-    if 'parallel_factor' in parallel_cfg:
-        parallelism['parallel_factor'] = int(parallel_cfg['parallel_factor'])
-    contract = cfg(layer, 'contract') or parallel_cfg.get('contract')
-    if contract is not None:
-        parallelism['contract'] = str(contract)
-    if parallelism:
-        directives['parallelism'] = parallelism
-
-    layout = cfg(layer, 'layout')
-    if layout is not None:
-        directives['layout'] = str(layout)
-
-    io_route_cfg = cfg(layer, 'io_route', {})
-    if io_route_cfg:
-        directives['io_route'] = io_route_cfg
-
-    return directives
+    raw: Dict[str, Any] = {}
+    for key in ('placement', 'microtiling', 'parallelism', 'io_route', 'layout', 'ports'):
+        value = cfg(layer, key)
+        if value is not None:
+            raw[key] = value
+    for section, keys in (
+        ('microtiling', ('microtile_m', 'microtile_k', 'microtile_n')),
+        ('parallelism', ('cas_num', 'cas_length', 'contract')),
+    ):
+        flat = {key: cfg(layer, key) for key in keys if cfg(layer, key) is not None}
+        if flat:
+            raw[section] = {**dict(raw.get(section) or {}), **flat}
+    return normalize_directives(layer.name, raw)
 
 
 # TODO: _create_weight_tensors works around hls4ml's ReplaceMultidimensionalDenseWithConv,

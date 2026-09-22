@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 from typing import Any, Dict, List
 
+from ...op_impls.common_types import PORT_KIND_STREAM
 from ...op_impls.utils import STORAGE_LAYOUT_LINEAR
 from .descriptors import rebase_descriptor_offset
 
@@ -10,7 +11,8 @@ from .descriptors import rebase_descriptor_offset
 def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, Any]]:
     consumer = entry.single_consumer()
     inst = ctx.ir.execution.get(consumer.node.name)
-    consumer_ports = consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)
+    binding = inst.ports.inputs[consumer.tensor]
+    consumer_ports = consumer.selected_ports(binding.count)
     count = len(consumer_ports)
     if count != int(entry.producer_port_count):
         raise ValueError(
@@ -24,7 +26,18 @@ def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, An
             consumer.node, inst.config, consumer.tensor, int(port), None, None
         )
         rebase_descriptor_offset(descs[graph_port], consumer.offset_base)
+        if binding.kind == PORT_KIND_STREAM:
+            require_linear_stream_staging(entry.logical_tensor, descs[graph_port])
     return descs
+
+
+def require_linear_stream_staging(tensor: str, desc: Dict[str, Any]) -> None:
+    """A PLIO carries the tensor in linear order, so a stream endpoint on the boundary must too."""
+    if desc.get('storage_layout') != STORAGE_LAYOUT_LINEAR:
+        raise RuntimeError(
+            f'{tensor}: a stream port on the graph boundary must stage in linear order, '
+            f'got {desc.get("storage_layout")!r}.'
+        )
 
 
 def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
@@ -48,18 +61,58 @@ def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
     }
 
 
-def graph_input_writer_port_descs(read_descs: Dict[int, Dict[str, Any]]) -> Dict[int, Dict[str, Any]]:
+def host_offsets(desc: Dict[str, Any]) -> List[int]:
+    """Rebase a staging offset from padded kernel-buffer coordinates into logical tensor coordinates.
+
+    A port's offset is a whole number of padded slices along its partition axis; the host-visible
+    slice starts at the same number of logical (`io_tiling_dimension`) slices.
+    """
+    offsets = [int(x) for x in desc['offset']]
+    io_tile = [int(x) for x in desc['io_tiling_dimension']]
+    traversal = list(desc.get('tile_traversal', ()))
+
+    out: List[int] = []
+    for dim, offset in enumerate(offsets):
+        if offset == 0:
+            out.append(0)
+            continue
+        slice_extent = None
+        for item in traversal:
+            if int(item.get('dimension', -1)) != dim:
+                continue
+            stride = int(item.get('stride', 0))
+            wrap = int(item.get('wrap', 0))
+            if stride > 0 and wrap > 0:
+                slice_extent = stride * wrap
+                break
+        if slice_extent and offset % slice_extent == 0:
+            out.append((offset // slice_extent) * int(io_tile[dim]))
+        else:
+            out.append(offset)
+    return out
+
+
+def graph_input_writer_port_descs(
+    read_descs: Dict[int, Dict[str, Any]], *, stream: bool = False
+) -> Dict[int, Dict[str, Any]]:
+    """Host-visible descriptor per graph-input port.
+
+    A DMA-fed buffer receives only the logical elements (`io_tiling_dimension`) and the DMA
+    scatters them; a stream port receives the whole padded port tile, so its transfer shape
+    is the staging `tiling_dimension`. `io_tiling_dimension` names the logical slice either way.
+    """
     out: Dict[int, Dict[str, Any]] = {}
     for port, base in read_descs.items():
         io_tile = list(base['io_tiling_dimension'])
+        transfer = list(base['tiling_dimension']) if stream else list(io_tile)
         out[int(port)] = {
             'access': 'write',
             'storage_layout': STORAGE_LAYOUT_LINEAR,
             'buffer_dimension': list(base['buffer_dimension']),
-            'tiling_dimension': list(io_tile),
+            'tiling_dimension': transfer,
             'io_tiling_dimension': list(io_tile),
             'io_boundary_dimension': list(base['io_boundary_dimension']),
-            'offset': list(base['offset']),
+            'offset': host_offsets(base),
             'slice_dimension': int(base['slice_dimension']),
             'inner_dimension': int(base['inner_dimension']),
             'outer_dimension': int(base['outer_dimension']),

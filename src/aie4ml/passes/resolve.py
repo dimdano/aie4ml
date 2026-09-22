@@ -88,6 +88,7 @@ class Resolve(AIEPass):
             _check_transposed_views(node, config, variant)
             variant.validate_config(node, config, ctx.device)
             ports = variant.build_ports(node, config)
+            variant.validate_ports(node, ports, ctx.device)
 
             inst = ctx.ir.execution.get(node.name)
             if inst is not None and _same_execution_entry(inst, variant, ports, config):

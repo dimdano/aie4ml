@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from ..ir.graph import OpImplInstance, OpNode
-from .common_types import PortMap
+from .common_types import PORT_KIND_STREAM, PortMap
 
 
 @dataclass(frozen=True)
@@ -111,15 +111,23 @@ class OpImplVariant:
     ) -> Any:
         return None
 
-    def boundary_input_access_endpoints(self, _config: Any, _port: int, _group: str | None = None) -> tuple[str, ...]:
-        raise NotImplementedError(f'{self.variant_id}: direct graph-input buffer access is not implemented.')
-
-    def boundary_output_access_endpoints(self, _config: Any, _port: int) -> tuple[str, ...]:
-        raise NotImplementedError(f'{self.variant_id}: direct graph-output buffer access is not implemented.')
-
     def footprint(self, node: OpNode, config: Any) -> OpImplFootprint:
         raise NotImplementedError
 
     def build_ports(self, _node: OpNode, _config: Any) -> PortMap:
         """Assemble the PortMap for this variant.  Must be overridden."""
         raise NotImplementedError
+
+    def validate_ports(self, node: OpNode, ports: PortMap, device: Any) -> None:
+        """Every kernel of an op sees at most one port per group, so the stream groups must fit
+        the core's stream ports (two in/out on AIE, one in/out on AIE-ML)."""
+        for direction, bindings, budget in (
+            ('input', ports.inputs, int(device.core_stream_inputs)),
+            ('output', ports.outputs, int(device.core_stream_outputs)),
+        ):
+            streams = [name for name, binding in bindings.items() if binding.kind == PORT_KIND_STREAM]
+            if len(streams) > budget:
+                raise ValueError(
+                    f'{node.name}: {self.variant_id} needs {len(streams)} {direction} stream ports per kernel '
+                    f'({", ".join(streams)}) but {device.platform} cores have {budget}.'
+                )
