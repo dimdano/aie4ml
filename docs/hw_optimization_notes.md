@@ -19,7 +19,7 @@ When this limit appears:
 
 1. Prefer a layout whose packed order already matches linear I/O, so no access constraint is
    emitted. A one-row microtile is one example.
-2. Reduce the repeated extent (for example, a smaller per-invocation batch or outer dim) 
+2. Reduce the repeated extent (for example, a smaller per-invocation batch or outer dim)
 3. Split work across additional ports or tiles only when that also distributes the local DMA
    resources.
 4. Use a memory tile or explicit relayout kernel only after checking latency and throughput.

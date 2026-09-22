@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from aie4ml.device_catalog import resolve_device
 from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
-from aie4ml.op_impls.common_types import PortBinding, to_plain
+from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
 from aie4ml.op_impls.families.matmul.common import select_generation_key
 from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
 from aie4ml.op_impls.utils.precision import infer_accumulator_tag
@@ -31,18 +31,21 @@ def test_device_stream_switch_width(part, expected_width):
     assert device.stream_switch_width_bits == expected_width
 
 
-def test_matmul_boundary_dma_targets_concrete_kernel_ports():
+def test_matmul_ports_name_their_kernel_endpoints():
+    node = SimpleNamespace(
+        inputs=[SimpleNamespace(name='a'), SimpleNamespace(name='b')],
+        outputs=[SimpleNamespace(name='c')],
+        roles={'a': 'lhs', 'b': 'rhs'},
+    )
     inner = SimpleNamespace(parallelism=SimpleNamespace(cas_length=2, cas_num=3, contract='inner'))
     outer = SimpleNamespace(parallelism=SimpleNamespace(cas_length=2, cas_num=3, contract='outer'))
 
-    assert MatmulOpImplVariant().boundary_input_access_endpoints(inner, 1, 'inA') == (
-        'kk[1].in[0]',
-        'kk[3].in[0]',
-        'kk[5].in[0]',
-    )
-    assert MatmulRowWiseOpImplVariant().boundary_input_access_endpoints(outer, 4, 'inA') == ('kk[4].in[0]',)
-    assert MatmulRowWiseOpImplVariant().boundary_input_access_endpoints(outer, 4, 'inB') == ('kk[4].in[1]',)
-    assert MatmulRowWiseOpImplVariant().boundary_output_access_endpoints(outer, 2) == ('kk[5].out[0]',)
+    ports = MatmulOpImplVariant().build_ports(node, inner)
+    assert ports.inputs['a'].endpoints[1] == ('kk[1].in[0]', 'kk[3].in[0]', 'kk[5].in[0]')
+    ports = MatmulRowWiseOpImplVariant().build_ports(node, outer)
+    assert ports.inputs['a'].endpoints[4] == ('kk[4].in[0]',)
+    assert ports.inputs['b'].endpoints[4] == ('kk[4].in[1]',)
+    assert ports.outputs['c'].endpoints[2] == ('kk[5].out[0]',)
 
 
 def _qparams(prefix: str, elem_type: int, *, frac: int = 4) -> list:
@@ -377,10 +380,17 @@ def test_existing_ml_generation_default_resolution_is_unchanged(tmp_path, part, 
 
 
 def test_port_binding_default_is_an_explicit_buffer_in_serialization():
-    implicit = PortBinding(group='in1', count=2)
+    implicit = PortBinding('in1', 2, endpoints=kernel_endpoints(2, 'in[0]'))
 
-    assert implicit == PortBinding(group='in1', count=2, kind='buffer')
-    assert to_plain(implicit) == {'group': 'in1', 'count': 2, 'kind': 'buffer'}
+    assert implicit == PortBinding('in1', 2, 'buffer', (('kk[0].in[0]',), ('kk[1].in[0]',)))
+    assert to_plain(implicit) == {
+        'group': 'in1',
+        'count': 2,
+        'kind': 'buffer',
+        'endpoints': [['kk[0].in[0]'], ['kk[1].in[0]']],
+    }
+    with pytest.raises(ValueError, match='expected kernel endpoints'):
+        PortBinding('in1', 2)
 
 
 def test_aie1_direct_boundaries_publish_linear_io_and_dma_accesses(tmp_path):

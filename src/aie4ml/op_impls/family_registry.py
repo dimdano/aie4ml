@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, ClassVar, Dict, Optional, Tuple
 
+from .utils import requested_port_kind
+
 if TYPE_CHECKING:
     from .base import OpImplVariant
 
@@ -22,7 +24,10 @@ class FamilyResolver:
             if variant.matches(node, device):
                 config = variant.resolve(node, device, directives)
                 return config, variant
-        raise ValueError(f'{node.name}: no {self.op_type} variant matches ' f'(generation={device.generation!r}).')
+        raise ValueError(
+            f'{node.name}: no {self.op_type} variant matches '
+            f'(generation={device.generation!r}, ports={requested_port_kind(node)!r}).'
+        )
 
 
 class FamilyResolverRegistry:

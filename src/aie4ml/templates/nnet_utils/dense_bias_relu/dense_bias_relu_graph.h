@@ -5,6 +5,7 @@
 #include <adf.h>
 #include <vector>
 #include "dense_bias_relu.h"
+#include "dense_bias_relu_stream.h"
 #include "parameters.h"
 
 using namespace adf;
@@ -27,6 +28,7 @@ public:
   // (chain, column) tile its own row slice, so the port array is per-tile.
   static constexpr bool PARALLELISM_CONTRACT_OUTER = ConfigT::PARALLELISM_CONTRACT_OUTER;
   static constexpr unsigned LHS_PORTS = PARALLELISM_CONTRACT_OUTER ? CAS_NUM * CAS_LENGTH : CAS_LENGTH;
+  static constexpr bool STREAM_IO = ConfigT::STREAM_IO;
 
   input_port  in1[LHS_PORTS];
   adf::port<adf::direction::in> wts[CAS_NUM * CAS_LENGTH];
@@ -44,33 +46,37 @@ void place_graph(int COL_START, int ROW_START)
     const bool reverse = ConfigT::ALTERNATING_HORIZONTAL && ((ROW_START + chain) % 2 != 0);
     const int tileCol = COL_START + (reverse ? CAS_LENGTH - 1 - pos : pos);
     const int tileRow = ROW_START + chain;
-    const auto inputLocation = ConfigT::IN1_BUFFER_LOCATIONS[idx];
 
     adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
 
-    if (inputLocation.bank_count == 1) {
-      adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
-        COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0);
-    } else {
-      adf::location<adf::buffer>(kk[idx].in[0]) = {
-        adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0),
-        adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank1)
-      };
+    if constexpr (!STREAM_IO) {
+      const auto inputLocation = ConfigT::IN1_BUFFER_LOCATIONS[idx];
+      if (inputLocation.bank_count == 1) {
+        adf::location<adf::buffer>(kk[idx].in[0]) = adf::bank(
+          COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0);
+      } else {
+        adf::location<adf::buffer>(kk[idx].in[0]) = {
+          adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank0),
+          adf::bank(COL_START + inputLocation.col, ROW_START + inputLocation.row, inputLocation.bank1)
+        };
+      }
     }
 
     adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
     adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
 
     if (is_last) {
-      const auto outputLocation = ConfigT::OUT1_BUFFER_LOCATIONS[idx / CAS_LENGTH];
-      if (outputLocation.bank_count == 1) {
-        adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
-          COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0);
-      } else {
-        adf::location<adf::buffer>(kk[idx].out[0]) = {
-          adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0),
-          adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
-        };
+      if constexpr (!STREAM_IO) {
+        const auto outputLocation = ConfigT::OUT1_BUFFER_LOCATIONS[idx / CAS_LENGTH];
+        if (outputLocation.bank_count == 1) {
+          adf::location<adf::buffer>(kk[idx].out[0]) = adf::bank(
+            COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0);
+        } else {
+          adf::location<adf::buffer>(kk[idx].out[0]) = {
+            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank0),
+            adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
+          };
+        }
       }
 
       if constexpr (CAS_LENGTH == 1) {
@@ -87,7 +93,20 @@ void place_graph(int COL_START, int ROW_START)
 
     for (int chain = 0; chain < CAS_NUM; ++chain) {
         if constexpr (CAS_LENGTH == 1) {
-            kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_single<ConfigT>>();
+            if constexpr (STREAM_IO) {
+                kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_single_stream<ConfigT>>();
+            } else {
+                kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_single<ConfigT>>();
+            }
+        }
+        else if constexpr (STREAM_IO) {
+            kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_first_stream<ConfigT>>();
+            if constexpr (CAS_LENGTH > 2) {
+                for (int c = 1; c < CAS_LENGTH - 1; ++c) {
+                    kk[chain * CAS_LENGTH + c] = kernel::create_object<dense_middle_stream<ConfigT>>();
+                }
+            }
+            kk[chain * CAS_LENGTH + (CAS_LENGTH - 1)] = kernel::create_object<dense_last_stream<ConfigT>>();
         }
         else {
             kk[chain * CAS_LENGTH + 0] = kernel::create_object<dense_first<ConfigT>>();
@@ -103,7 +122,7 @@ void place_graph(int COL_START, int ROW_START)
     for (int idx = 0; idx < CAS_LENGTH * CAS_NUM; ++idx) {
         int col = idx % CAS_LENGTH;
         int row = idx / CAS_LENGTH;
-        source(kk[idx])        = "dense_bias_relu.cpp";
+        source(kk[idx])        = STREAM_IO ? "dense_bias_relu_stream.cpp" : "dense_bias_relu.cpp";
         runtime<ratio>(kk[idx]) = 1.0;
         single_buffer(kk[idx].in[1]);
         connect<parameter>(wts[idx], async(kk[idx].in[1]));
@@ -123,14 +142,18 @@ void place_graph(int COL_START, int ROW_START)
       for (unsigned ch = 0; ch < CAS_NUM; ++ch) {
         int idx = ch*CAS_LENGTH + col;
         connect<>( in1[PARALLELISM_CONTRACT_OUTER ? idx : col], kk[idx].in[0] );
-        dimensions( kk[idx].in[0] ) = { padded_independent_extent * IN_FEAT_SLICE };
+        if constexpr (!STREAM_IO) {
+          dimensions( kk[idx].in[0] ) = { padded_independent_extent * IN_FEAT_SLICE };
+        }
       }
     }
 
     for (int chain = 0; chain < CAS_NUM; ++chain) {
         const int last_idx = chain * CAS_LENGTH + (CAS_LENGTH - 1);
         connect<>( kk[last_idx].out[0], out1[chain] );
-        dimensions( kk[last_idx].out[0] ) = { padded_independent_extent * OUT_FEAT_SLICE };
+        if constexpr (!STREAM_IO) {
+          dimensions( kk[last_idx].out[0] ) = { padded_independent_extent * OUT_FEAT_SLICE };
+        }
     }
 
     if constexpr (CAS_LENGTH > 1) {

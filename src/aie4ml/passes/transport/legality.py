@@ -2,9 +2,27 @@ from __future__ import annotations
 
 import copy
 
+from ...op_impls.common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM
 from ...op_impls.utils.io import normalized_staging
 from .descriptors import localize_descriptor
 from .model import Endpoint
+
+
+def endpoint_port_kind(ctx, endpoint: Endpoint) -> str:
+    """The ADF port kind behind a kernel endpoint; a graph boundary (PLIO) takes either kind."""
+    if endpoint.node is None:
+        return PORT_KIND_BUFFER
+    inst = ctx.ir.execution.get(endpoint.node.name)
+    if inst is None:
+        raise RuntimeError(f'{endpoint.tensor}: endpoint {endpoint.node.name!r} has no resolved execution instance.')
+    bindings = inst.ports.outputs if endpoint.tensor in inst.ports.outputs else inst.ports.inputs
+    return bindings[endpoint.tensor].kind
+
+
+def uses_stream(ctx, entry) -> bool:
+    """Whether any kernel endpoint of a transport entry is a stream port."""
+    endpoints = [entry.producer] + [conn.consumer for conn in entry.consumers if conn.consumer is not None]
+    return any(endpoint_port_kind(ctx, endpoint) == PORT_KIND_STREAM for endpoint in endpoints)
 
 
 def direct_transport_failure(
@@ -19,6 +37,15 @@ def direct_transport_failure(
     consumer_inst = ctx.ir.execution.get(consumer.node.name)
     if producer_inst is None or consumer_inst is None:
         raise RuntimeError(f'{logical_tensor}: direct transport legality requires resolved execution instances.')
+
+    producer_kind = producer_inst.ports.outputs[producer.tensor].kind
+    consumer_kind = consumer_inst.ports.inputs[consumer.tensor].kind
+    if producer_kind != consumer_kind:
+        # ADF could bridge the two through the tile DMA; refuse until a kernel needs that bridge.
+        return (
+            f'producer {producer.node.name}.{producer.group} is a {producer_kind} port but consumer '
+            f'{consumer.node.name}.{consumer.group} is a {consumer_kind} port'
+        )
 
     producer_ports = producer.selected_ports(producer_inst.ports.outputs[producer.tensor].count)
     consumer_ports = consumer.selected_ports(consumer_inst.ports.inputs[consumer.tensor].count)

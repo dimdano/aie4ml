@@ -45,15 +45,15 @@ def _analyze_aie_out_interval(output_dir: Path, pipeline: Optional[Dict[str, Any
     elements_by_port = _output_elements_per_inference(pipeline or {})
     per_file = {}
     all_lat = []
-    first_out = []
+    first_complete = []
 
     for fp in sorted(data_dir.glob('y_p*.txt')):
-        stamps = _timestamps(fp)
-        if stamps:
-            first_out.append(min(stamps))
         port_match = re.fullmatch(r'y_p(\d+)\.txt', fp.name)
         port = int(port_match.group(1)) if port_match else None
-        lst = _parse_timing(fp, elements_by_port.get(port))
+        completions = _parse_timing(fp, elements_by_port.get(port))
+        if completions:
+            first_complete.append(completions[0])
+        lst = [current - previous for previous, current in zip(completions, completions[1:]) if current >= previous]
         if lst:
             per_file[fp.name] = {
                 'min_ns': round(min(lst), 3),
@@ -73,23 +73,12 @@ def _analyze_aie_out_interval(output_dir: Path, pipeline: Optional[Dict[str, Any
             'avg_ns': round(sum(all_lat) / len(all_lat), 3),
             'samples': len(all_lat),
         },
-        # When the first result leaves the graph: one sample's whole trip, including the DMA
-        # and memtile hops that the per-kernel cycle counts do not see.
-        'first_output_ns': round(min(first_out), 3) if first_out else None,
+        # When the first inference is complete on every output port (its last TLAST): one
+        # sample's whole trip, including the DMA and memtile hops that the per-kernel cycle
+        # counts do not see. Same definition as an HLS latency: start to last output.
+        'first_output_ns': round(max(first_complete), 3) if first_complete else None,
         'per_port': per_file,
     }
-
-
-def _timestamps(path: Path) -> List[float]:
-    """Absolute 'T <value> <unit>' marks the simulator writes ahead of each output line."""
-    unit_ns = {'ps': 1e-3, 'ns': 1.0, 'us': 1e3, 'ms': 1e6}
-    out = []
-    with open(path) as handle:
-        for line in handle:
-            m = re.match(r'T\s+([\d.]+)\s*(ps|ns|us|ms)', line)
-            if m:
-                out.append(float(m.group(1)) * unit_ns[m.group(2)])
-    return out
 
 
 def _output_elements_per_inference(pipeline: Dict[str, Any]) -> Dict[int, int]:
@@ -99,9 +88,12 @@ def _output_elements_per_inference(pipeline: Dict[str, Any]) -> Dict[int, int]:
     for item in plan.get('io_ports') or []:
         if item.get('direction') != 'output':
             continue
-        dims = (item.get('staging') or {}).get('io_tiling_dimension')
+        # The file carries the port's transfer tile: the logical slice for a DMA-fed buffer
+        # port, the whole padded tile for a stream port (same rule as simulation.IOPortLayout).
+        staging = item.get('staging') or {}
+        dims = staging.get('tiling_dimension') or staging.get('io_tiling_dimension')
         if not dims:
-            raise ValueError(f'{item.get("tensor", "output")}: missing output IO tiling dimensions in pipeline plan.')
+            raise ValueError(f'{item.get("tensor", "output")}: missing output tiling dimensions in pipeline plan.')
         elements = 1
         for dim in dims:
             elements *= int(dim)
@@ -110,7 +102,7 @@ def _output_elements_per_inference(pipeline: Dict[str, Any]) -> Dict[int, int]:
 
 
 def _parse_timing(path: Path, elements_per_inference: Optional[int] = None) -> List[float]:
-    """Return logical-inference completion intervals (in nanoseconds).
+    """Return logical-inference completion times (in nanoseconds).
 
     A simulator TLAST can terminate a row or another DMA frame rather than a whole
     inference. When the emitted plan is available, accumulate frames until the output
@@ -157,9 +149,7 @@ def _parse_timing(path: Path, elements_per_inference: Optional[int] = None) -> L
     if elements_per_inference is not None and inference_elements:
         raise ValueError(f'{path}: incomplete output inference containing {inference_elements} elements.')
 
-    return [
-        current - previous for previous, current in zip(completion_times, completion_times[1:]) if current >= previous
-    ]
+    return completion_times
 
 
 def _convert_to_ns(value: float, unit: str) -> float:
@@ -636,13 +626,19 @@ def format_report(report: Dict[str, Any]) -> str:
         add('')
         add('Latency  (one sample, input to output)')
         if first:
-            add(f'    end to end     {first * ASSUMED_AIE_CLOCK_GHZ:12,.0f} cc  {first:12,.1f} ns   measured')
+            add(
+                f'    end to end     {first * ASSUMED_AIE_CLOCK_GHZ:12,.0f} cc  {first:12,.1f} ns   '
+                'measured, first inference complete'
+            )
         if critical:
             add(
                 f'      compute      {critical["cycles"]:12,d} cc  {ns(critical["cycles"]):12,.1f} ns   '
                 f'critical path, {len(critical["chain"])} stages'
             )
-        if split:
+        if split and split['data_movement_ns'] < 0:
+            # A stream kernel emits its first rows before it finishes, so the residual has no meaning.
+            add('      data move             n/a   (output streams out before the kernel finishes)')
+        elif split:
             add(
                 f'      data move    {split["data_movement_ns"] * ASSUMED_AIE_CLOCK_GHZ:12,.0f} cc  '
                 f'{split["data_movement_ns"]:12,.1f} ns   {split["data_movement_pct"]}% memtile/DMA/lock etc.'

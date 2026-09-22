@@ -128,35 +128,27 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
         return tuple(locations)
 
     def build_ports(self, node: OpNode, config: MatmulConfig):
+        cas_length = int(config.parallelism.cas_length)
+        cas_num = int(config.parallelism.cas_num)
+        tiles = cas_length * cas_num
+        if config.parallelism.contract == 'outer':
+            lhs_endpoints = tuple((f'kk[{port}].in[0]',) for port in range(tiles))
+        else:
+            lhs_endpoints = tuple(
+                tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(cas_num))
+                for port in range(cas_length)
+            )
+        rhs_endpoints = tuple((f'kk[{port}].in[1]',) for port in range(tiles))
+        out_endpoints = tuple((f'kk[{chain * cas_length + cas_length - 1}].out[0]',) for chain in range(cas_num))
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         return PortMap(
             inputs={
-                lhs_tensor.name: PortBinding(group='inA', count=self.lhs_port_count(config)),
-                rhs_tensor.name: PortBinding(
-                    group='inB',
-                    count=int(config.parallelism.cas_length) * int(config.parallelism.cas_num),
-                ),
+                lhs_tensor.name: PortBinding('inA', len(lhs_endpoints), endpoints=lhs_endpoints),
+                rhs_tensor.name: PortBinding('inB', tiles, endpoints=rhs_endpoints),
             },
-            outputs={node.outputs[0].name: PortBinding(group='outC', count=int(config.parallelism.cas_num))},
+            outputs={node.outputs[0].name: PortBinding('outC', cas_num, endpoints=out_endpoints)},
         )
-
-    def boundary_input_access_endpoints(
-        self, config: MatmulConfig, port: int, group: str | None = None
-    ) -> tuple[str, ...]:
-        port = int(port)
-        cas_length = int(config.parallelism.cas_length)
-        if group == 'inB':
-            return (f'kk[{port}].in[1]',)
-        if group != 'inA':
-            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
-        if config.parallelism.contract == 'outer':
-            return (f'kk[{port}].in[0]',)
-        return tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(int(config.parallelism.cas_num)))
-
-    def boundary_output_access_endpoints(self, config: MatmulConfig, port: int) -> tuple[str, ...]:
-        index = int(port) * int(config.parallelism.cas_length) + int(config.parallelism.cas_length) - 1
-        return (f'kk[{index}].out[0]',)
 
 
 @register_variant
@@ -168,10 +160,6 @@ class MatmulOpImplVariant(_MatmulVariantBase):
 
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_full_outer
-
-    def lhs_port_count(self, config: MatmulConfig) -> int:
-        # One lhs slice per cascade column, multicast across every chain.
-        return int(config.parallelism.cas_length)
 
     def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
         view = config.io_views[tensor_name]
@@ -192,10 +180,6 @@ class MatmulRowWiseOpImplVariant(_MatmulVariantBase):
 
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_tile_outer
-
-    def lhs_port_count(self, config: MatmulConfig) -> int:
-        # Every (chain, column) tile reads its own row slice, so the lhs port array is per-tile.
-        return int(config.parallelism.cas_length) * int(config.parallelism.cas_num)
 
     def describe_input_staging(self, node, config, tensor_name, port, buf_dims=None, _producer=None):
         view = config.io_views[tensor_name]

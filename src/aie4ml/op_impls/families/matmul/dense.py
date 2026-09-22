@@ -8,11 +8,12 @@ from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant
-from ...common_types import PortBinding, PortMap
+from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, inherited_microtile, parse_directives
+from ...utils import ParallelismConfig, inherited_microtile, parse_directives, requested_port_kind
 from ...utils.precision import (
     aie_rounding_token,
+    element_bytes,
     resolve_accumulator_output_shift,
 )
 from .common import (
@@ -21,6 +22,7 @@ from .common import (
     describe_inner_output_staging,
     describe_outer_lhs_staging,
     describe_outer_output_staging,
+    describe_stream_staging,
     np_bias_dtype_for_spec,
     np_dtype_for_spec,
     pack_as_float,
@@ -44,6 +46,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     """Unregistered shared base for Dense and Matmul variants."""
 
     contract: ClassVar[str]
+    port_kind: ClassVar[str] = PORT_KIND_BUFFER
 
     def build_template_params(self, node, config, placement):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -60,14 +63,11 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_rhs_raw=output_view.tile_raw_inner,
         )
         params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
+        params['stream_io'] = self.port_kind == PORT_KIND_STREAM
         return params
 
     def kernel_outer_extent(self, lhs_view):
         """Rows this kernel loops over. Contract-specific: declared by each variant."""
-        raise NotImplementedError
-
-    def lhs_port_count(self, config) -> int:
-        """LHS ports this variant needs. Contract-specific: declared by each variant."""
         raise NotImplementedError
 
     def output_staging_contract(self, _node, config, _tensor_name: str):
@@ -85,7 +85,11 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
+        return (
+            requested_contract(node) == self.contract
+            and requested_port_kind(node) == self.port_kind
+            and bitwidths_supported(node, device)
+        )
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
@@ -94,10 +98,13 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         required_microtile = None
         producer_contract = input_contracts.get(lhs_tensor.name)
-        if not device.has_memtile and self.contract == 'inner' and producer_contract is not None:
+        # A hand-off with no memory tile to re-shard it (AIE1, or any stream port) takes the
+        # producer's port count as its cas_length and, for buffers, inherits its microtile.
+        direct_only = not device.has_memtile or self.port_kind == PORT_KIND_STREAM
+        if direct_only and self.contract == 'inner' and producer_contract is not None:
             if producer_contract.contract != 'inner':
                 raise ValueError(
-                    f'{node.name}: AIE1 dense inner contract cannot directly consume producer '
+                    f'{node.name}: dense inner contract cannot directly consume producer '
                     f'{producer_contract.contract!r} staging.'
                 )
             required_cas_length = len(producer_contract.port_staging)
@@ -262,27 +269,21 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             raise ValueError(f'{node.name}: dense accumulator output shift must be non-negative, got {config.shift}.')
 
     def build_ports(self, node: OpNode, config: DenseConfig):
-        n_in = self.lhs_port_count(config)
-        n_out = int(config.parallelism.cas_num)
-        data_inputs = [t for t in node.inputs if not t.is_parameter]
-        return PortMap(
-            inputs={t.name: PortBinding(group=f'in{i + 1}', count=n_in) for i, t in enumerate(data_inputs)},
-            outputs={t.name: PortBinding(group=f'out{i + 1}', count=n_out) for i, t in enumerate(node.outputs)},
-        )
-
-    def boundary_input_access_endpoints(
-        self, config: DenseConfig, port: int, _group: str | None = None
-    ) -> tuple[str, ...]:
-        port = int(port)
         cas_length = int(config.parallelism.cas_length)
         cas_num = int(config.parallelism.cas_num)
         if config.parallelism.contract == 'outer':
-            return (f'kk[{port}].in[0]',)
-        return tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(cas_num))
-
-    def boundary_output_access_endpoints(self, config: DenseConfig, port: int) -> tuple[str, ...]:
-        index = int(port) * int(config.parallelism.cas_length) + int(config.parallelism.cas_length) - 1
-        return (f'kk[{index}].out[0]',)
+            lhs_endpoints = tuple((f'kk[{port}].in[0]',) for port in range(cas_length * cas_num))
+        else:
+            lhs_endpoints = tuple(
+                tuple(f'kk[{chain * cas_length + port}].in[0]' for chain in range(cas_num))
+                for port in range(cas_length)
+            )
+        out_endpoints = tuple((f'kk[{chain * cas_length + cas_length - 1}].out[0]',) for chain in range(cas_num))
+        lhs_tensor = input_tensor_for_role(node, 'lhs')
+        return PortMap(
+            inputs={lhs_tensor.name: PortBinding('in1', len(lhs_endpoints), self.port_kind, lhs_endpoints)},
+            outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.port_kind, out_endpoints)},
+        )
 
 
 @register_variant
@@ -294,10 +295,6 @@ class DenseOpImplVariant(_DenseVariantBase):
 
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_full_outer
-
-    def lhs_port_count(self, config: DenseConfig) -> int:
-        # One LHS slice per cascade column, multicast across every chain.
-        return int(config.parallelism.cas_length)
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         return describe_inner_lhs_staging(config.io_views[tensor_name], port, buf_dims)
@@ -350,10 +347,6 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
     def kernel_outer_extent(self, lhs_view):
         return lhs_view.compacted_tile_outer
 
-    def lhs_port_count(self, config: DenseConfig) -> int:
-        # Every (chain, column) tile reads its own row slice, so the LHS port array is per-tile.
-        return int(config.parallelism.cas_length) * int(config.parallelism.cas_num)
-
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
         return describe_outer_lhs_staging(config.io_views[tensor_name], config.parallelism, port, buf_dims)
 
@@ -394,3 +387,56 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
             )
             packed_B = np.repeat(packed_B, cas_num, axis=0)
         return {'packed_weights': packed_W, 'packed_bias': packed_B}
+
+
+class _StreamDenseMixin:
+    """Stream-port flavour of a dense variant."""
+
+    port_kind: ClassVar[str] = PORT_KIND_STREAM
+
+    def buffer_locations(self, _node, _config, _anchor_row):
+        return ()
+
+    def footprint(self, _node, config) -> OpImplFootprint:
+        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
+
+    def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):
+        return describe_stream_staging(
+            config.io_views[tensor_name], port, 'read', self.contract, config.parallelism.cas_length, buf_dims
+        )
+
+    def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
+        return describe_stream_staging(config.io_views[tensor_name], port, 'write', self.contract, buf_dims=buf_dims)
+
+    def validate_config(self, node: OpNode, config: DenseConfig, device) -> None:
+        super().validate_config(node, config, device)
+        if config.flags.transpose_lhs:
+            raise ValueError(f'{node.name}: a stream port carries the tensor in linear order; it cannot transpose it.')
+        # The kernel reads and writes the stream in 128-bit chunks and re-tiles a row band in
+        # registers: a microtile row must be one or more whole chunks, or half a chunk zipped
+        # from an even number of rows.
+        m = int(config.microtiling.microtile_m)
+        for axis, extent, spec in (
+            ('K', int(config.microtiling.microtile_k), config.precision['lhs']),
+            ('N', int(config.microtiling.microtile_n), config.precision['output']),
+        ):
+            row_bytes = extent * element_bytes(spec)
+            if row_bytes == 8 and m % 2 == 0:
+                continue
+            if row_bytes >= 16 and row_bytes % 16 == 0:
+                continue
+            raise ValueError(
+                f'{node.name}: microtile {axis}={extent} of {element_bytes(spec)}-byte elements ({row_bytes} B '
+                f'per row, M={m}) cannot be staged from a stream; a row must be a multiple of 16 B, '
+                'or 8 B with an even M.'
+            )
+
+
+@register_variant
+class DenseStreamOpImplVariant(_StreamDenseMixin, DenseOpImplVariant):
+    variant_id = 'dense.b.r.stream.v1'
+
+
+@register_variant
+class DenseRowWiseStreamOpImplVariant(_StreamDenseMixin, DenseRowWiseOpImplVariant):
+    variant_id = 'dense.b.r.row.stream.v1'

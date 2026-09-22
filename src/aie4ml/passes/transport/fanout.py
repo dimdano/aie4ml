@@ -38,6 +38,12 @@ class LegalizeFanoutEntries(AIEPass):
                 replica = copy.copy(entry)
                 replica.consumers = [conn]
                 replica.graph_output = False
+                if entry.producer.node is None:
+                    # Each consumer of a graph input gets its own PLIO ports, sized for it alone.
+                    inst = ctx.ir.execution.get(conn.consumer.node.name)
+                    replica.producer_port_count = len(
+                        conn.consumer.selected_ports(inst.ports.inputs[conn.consumer.tensor].count)
+                    )
                 rewritten.append(replica)
 
         state['entries'] = rewritten

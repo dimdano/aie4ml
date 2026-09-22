@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ...ir import get_backend_context
 from ..base import AIEPass
-from .legality import direct_transport_failure
+from .legality import direct_transport_failure, uses_stream
 from .model import TransportDecision
 
 
@@ -27,6 +27,21 @@ class ClassifyTransportEntries(AIEPass):
         route = self._route_policy(entry, ctx)
         is_boundary = entry.producer.node is None or entry.graph_output
         has_memtile = bool(ctx.device.has_memtile)
+
+        if uses_stream(ctx, entry):
+            # A stream port has no buffer for a memory tile to stage, so the leg is
+            # point-to-point (or PLIO) and must already agree on its element order.
+            if route == 'memtile':
+                raise RuntimeError(f'{entry.logical_tensor}: io_route=memtile requested on a stream port.')
+            if not is_boundary:
+                consumer = entry.single_consumer()
+                if self._has_consumer_perm(consumer):
+                    failure = f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
+                else:
+                    failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
+                if failure is not None:
+                    raise RuntimeError(f'{entry.logical_tensor}: stream ports cannot connect directly: {failure}.')
+            return TransportDecision('direct', True)
 
         if is_boundary:
             if route == 'memtile' and not has_memtile:

@@ -7,7 +7,14 @@ import numpy as np
 from ....aie_types import FLOAT_FORMATS, FloatIntent
 from ....ir.graph import STAGING_CONTRACTS, input_tensor_for_role
 from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
-from ...utils import AxisPlan, TensorView, build_staging_descriptor, canonical_buffer_axes
+from ...utils import (
+    STORAGE_LAYOUT_LINEAR,
+    AxisPlan,
+    TensorView,
+    build_staging_descriptor,
+    canonical_buffer_axes,
+    ordered_view_shape,
+)
 from ...utils.precision import resolve_exact_storage_dtype
 
 # Keys are canonical format-string pairs (lhs_format, rhs_format).
@@ -171,6 +178,43 @@ def describe_outer_output_staging(view: TensorView, port: int, buf_dims=None):
         io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
         buf_dims=buf_dims,
         slice_dim=outer_dim,
+    )
+
+
+def describe_stream_staging(
+    view: TensorView, port: int, access: str, contract: str, cas_length: int = 1, buf_dims=None
+):
+    """Staging of one stream port: the whole padded per-port tile, row by row.
+
+    A stream has no DMA to re-tile or de-pad, so this is exactly the element sequence the
+    kernel reads or writes: the padded slice of every partitioned axis (`tile`), every row of
+    the rest. The kernel still computes in microtiles, but that never reaches the wire, so the
+    layout is linear and a consumer inherits no microtile from it.
+    """
+    inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
+    full = ordered_view_shape(view, 'full')
+    in_slice, outer_slice = view.tile_inner, view.tile_outer
+
+    if contract == 'outer' and access == 'read':
+        row_group, k_chain = divmod(int(port), max(1, int(cas_length)))
+    elif contract == 'outer':
+        row_group, k_chain = int(port), 0
+    else:
+        row_group, k_chain = 0, int(port)
+
+    plans = {dim: AxisPlan(int(full[dim]), int(full[dim]), 1) for dim in traversal_dims}
+    plans[inner_dim] = AxisPlan(in_slice, in_slice, 1, k_chain * in_slice)
+    plans[outer_dim] = AxisPlan(outer_slice, outer_slice, 1, row_group * outer_slice)
+    return build_staging_descriptor(
+        view,
+        access=access,
+        plans=plans,
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        buf_dims=buf_dims,
+        slice_dim=outer_dim if contract == 'outer' else inner_dim,
+        boundary_shape='logical' if access == 'read' else None,
+        extras={'storage_layout': STORAGE_LAYOUT_LINEAR},
     )
 
 

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ...ir.graph import TENSOR_LAYOUTS
+from ..common_types import PORT_KIND_BUFFER, PORT_KINDS
 from .tensor_view import microtile_from_staging
 
 
@@ -56,6 +57,14 @@ def requested_layout(node) -> str:
     if layout not in TENSOR_LAYOUTS:
         raise ValueError(f'{node.name}: unknown layout {layout!r}; expected one of {sorted(TENSOR_LAYOUTS)}.')
     return layout
+
+
+def requested_port_kind(node) -> str:
+    """The ADF port kind asked of this node's data ports (``buffer`` when omitted)."""
+    kind = str(node.directives.get('ports', PORT_KIND_BUFFER))
+    if kind not in PORT_KINDS:
+        raise ValueError(f'{node.name}: unknown ports directive {kind!r}; expected one of {sorted(PORT_KINDS)}.')
+    return kind
 
 
 def layout_variant_matches(node, layout: str) -> bool:

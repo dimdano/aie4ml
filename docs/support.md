@@ -51,5 +51,14 @@
   leg with incompatible staging may use a memory tile on AIE-ML/AIE-MLv2; cross-port slices and consumer ports spanning
   multiple Concat sources are rejected before transport selection on every generation.
 - Graph boundaries may expose multiple ports for partitioned tensors.
+- A variant's `PortMap` is its port contract: per tensor the ADF group, port count, port kind (`buffer` or
+  `stream`) and the kernel endpoints behind each hierarchical port, which is where DMA access constraints bind.
+- `ports: stream` selects a variant whose data ports are core streams (currently Dense, both contracts, every
+  cascade shape; other ops fail explicitly). A stream port carries its padded per-port tile in linear row order: no buffer to place, no bank
+  contract, no DMA descriptor and no microtile on the wire; the kernel re-tiles a row band in registers. Stream legs
+  are always direct: stream-to-stream requires identical staging descriptors, a PLIO feeds the padded tile (the host
+  pads and trims), and a stream-to-buffer leg, a memory-tile route or a transposed view is rejected explicitly. The
+  stream groups of one kernel must fit the core's stream ports (two in/out on AIE, one on AIE-ML). A microtile row
+  must be a multiple of 16 bytes, or 8 bytes with an even M.
 - Multi-stage relay transport is not implemented. Topologies requiring an additional relay stage fail explicitly.
 - Internal AIE-to-PL-to-AIE bridge points and complete Versal system-link generation are not yet implemented.

@@ -6,7 +6,7 @@ from typing import Any, ClassVar, Dict
 from ....aie_types import AIEDataType, FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant
-from ...common_types import PortBinding, PortMap
+from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
 from ...utils import (
     MicrotileShape,
@@ -222,19 +222,9 @@ class _SoftmaxVariantBase(OpImplVariant):
         in_tensor = input_tensor_for_role(node, 'lhs')
         n = int(config.parallelism.cas_num)
         return PortMap(
-            inputs={in_tensor.name: PortBinding(group='in1', count=n)},
-            outputs={node.outputs[0].name: PortBinding(group='out1', count=n)},
+            inputs={in_tensor.name: PortBinding('in1', n, endpoints=kernel_endpoints(n, 'in[0]'))},
+            outputs={node.outputs[0].name: PortBinding('out1', n, endpoints=kernel_endpoints(n, 'out[0]'))},
         )
-
-    def boundary_input_access_endpoints(
-        self, _config: SoftmaxConfig, port: int, group: str | None = None
-    ) -> tuple[str, ...]:
-        if group != 'in1':
-            raise ValueError(f'{self.variant_id}: unknown input port group {group!r}.')
-        return (f'kk[{int(port)}].in[0]',)
-
-    def boundary_output_access_endpoints(self, _config: SoftmaxConfig, port: int) -> tuple[str, ...]:
-        return (f'kk[{int(port)}].out[0]',)
 
 
 class _SoftmaxTiledMixin:
