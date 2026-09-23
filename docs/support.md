@@ -86,10 +86,11 @@
   kernel builds everything its compute core needs around that data, keeping one band of the image (its output rows plus
   the window span) rather than the whole of it. So a stream carries a wire order, while `inner_blocked` describes buffer
   memory. It is also the only way more than one channel block crosses the graph boundary in one port. Partitioning a
-  streamed Conv2D across tiles is not implemented. It buys legality, not speed:
-  measured on AIE1 (8x8 image, 3x3 kernel, one channel block) a conv runs in 1,279 cycles through buffer ports and
-  2,157 through streams. A stream port carries its padded per-port tile in linear row order: no buffer to place, no bank
-  contract, no DMA descriptor and no microtile on the wire; the kernel re-tiles a row band in registers. Stream legs
+  streamed Conv2D across tiles is not implemented. It buys legality, not speed: see the measured
+  comparison below. What a stream port carries depends on the op -- a Dense port carries its padded per-port tile in
+  linear row order and the kernel re-tiles it in registers, while a Conv2D port carries the logical tensor described
+  above and the kernel builds the padded frame itself. Either way there is no buffer to place, no bank contract, no DMA
+  descriptor and no microtile on the wire. Stream legs
   are always direct: stream-to-stream requires identical staging descriptors, a PLIO feeds the padded tile (the host
   pads and trims), and a stream-to-buffer leg, a memory-tile route or a transposed view is rejected explicitly. The
   stream groups of one kernel must fit the core's stream ports (two in/out on AIE, one on AIE-ML). A microtile row

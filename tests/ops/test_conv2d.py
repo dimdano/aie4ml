@@ -130,6 +130,21 @@ def _frame_model(channels_in=CIN, channels_out=C3, name='conv_frame'):
     )
 
 
+def _nchw_output_model():
+    """The graph output keeps ONNX's own NCHW order, which the conv's NHWC frame does not have."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'y', 'b', CIN, C1, 3, pad=1, relu=True, seed=21)
+    return make_model(
+        'conv_nchw_out',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
+        outputs=[('y', TensorProto.FLOAT, [1, C1, H, W])],
+        initializers=inits,
+    )
+
+
 def _band_model():
     return _frame_model(name='conv_bands')
 
@@ -367,6 +382,36 @@ def test_stream_conv_matches_onnx(tmp_path, part):
     feed = np.random.default_rng(12).integers(-40, 40, size=(1, H, W, C1), dtype=np.int8)
     assert_x86_matches_onnx(
         _stream_model(), {'x_q': feed}, STREAM_DIRECTIVES, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+    )
+
+
+def test_graph_output_keeps_the_order_onnx_declares(tmp_path):
+    """A pending axis order on a graph output is realized or refused -- never quietly ignored,
+    which would expose a differently shaped tensor than the ONNX graph promises."""
+    with pytest.raises(NotImplementedError, match=r"transpose feeds graph output 'y'"):
+        lower(_nchw_output_model(), tmp_path, part=AIE1_PART)
+
+
+def test_conv2d_refuses_directives_it_does_not_implement(tmp_path):
+    """The kernel fixes its own register tiling, so a microtiling request is refused, not ignored."""
+    with pytest.raises(NotImplementedError, match='microtiling'):
+        lower(_frame_model(), tmp_path, {'b': {'microtiling': {'microtile_m': 999}}}, part=AIE1_PART)
+
+
+@pytest.mark.requires_vitis
+def test_stream_conv_moves_partial_channel_blocks(tmp_path):
+    """Cin=11 is one whole channel block and a tail, so the reader has to shift a block across a
+    beat boundary -- the path that neither a blocked nor an all-tail input reaches."""
+    feed = np.random.default_rng(3).integers(-40, 40, size=(1, H, W, 11), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _frame_model(channels_in=11, channels_out=C1, name='conv_tail'),
+        {'x_q': feed},
+        STREAM_DIRECTIVES,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=1,
+        part=AIE1_PART,
     )
 
 

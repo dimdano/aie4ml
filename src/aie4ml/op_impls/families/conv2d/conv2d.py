@@ -71,19 +71,28 @@ class Conv2dOpImplVariant(OpImplVariant):
     param_template = 'conv2d'
     plevel = 10
     port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    supported_directives: ClassVar[frozenset] = frozenset({'ports', 'io_route', 'input_contracts', 'parallelism'})
 
     def matches(self, node: OpNode, device) -> bool:
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')
-        if isinstance(lhs.precision, FloatIntent) or isinstance(rhs.precision, FloatIntent):
+        out = node.outputs[0]
+        if any(isinstance(t.precision, FloatIntent) for t in (lhs, rhs, out)):
             return False
         widths = (
             resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name).width,
             resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name).width,
+            resolve_exact_storage_dtype(out.precision, namespace='output', layer_name=node.name).width,
         )
-        return requested_port_kind(node) == self.port_kind and widths == (8, 8)
+        return requested_port_kind(node) == self.port_kind and widths == (8, 8, 8)
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
+        unsupported = sorted(set(directives or {}) - self.supported_directives)
+        if unsupported:
+            raise NotImplementedError(
+                f'{node.name}: {self.variant_id} does not implement the directive(s) '
+                f'{unsupported}; it supports {sorted(self.supported_directives)}.'
+            )
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')

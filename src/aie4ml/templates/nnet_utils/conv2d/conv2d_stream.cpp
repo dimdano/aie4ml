@@ -46,20 +46,22 @@ struct conv2d_wire_reader {
   // One channel block from wherever the wire has reached, spanning a beat boundary when it must.
   // Only the source offset varies, which a shift can serve; the destination is block-aligned.
   inline void take_group(input_stream<data_t>* wire, data_t* target) {
+    constexpr int GROUP = conv2d_wire<ConfigT>::GROUP;
+    const int offset = used;  // where the block starts in `pair`, before the cursor moves on
     aie::vector<data_t, 2 * BEAT> pair;
-    if (used + conv2d_wire<ConfigT>::GROUP > BEAT) {
+    if (used + GROUP > BEAT) {
       const aie::vector<data_t, BEAT> next = readincr_v<BEAT>(wire);
       pair = aie::concat(beat, next);
       beat = next;
-      used -= BEAT;
+      used += GROUP - BEAT;
     } else {
       pair = aie::concat(beat, beat);
+      used += GROUP;
     }
-    const auto words = aie::vector_cast<int32>(aie::shuffle_down(pair, used));
+    const auto words = aie::vector_cast<int32>(aie::shuffle_down(pair, offset));
     int32* const out = reinterpret_cast<int32*>(target);
     out[0] = words.get(0);
     out[1] = words.get(1);
-    used += conv2d_wire<ConfigT>::GROUP;
   }
 
   inline data_t take_byte(input_stream<data_t>* wire) {
