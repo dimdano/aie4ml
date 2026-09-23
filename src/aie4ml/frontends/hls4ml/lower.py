@@ -93,6 +93,13 @@ class LowerToAieIr(ModelOptimizerPass):
 
             if node.op_type in ('dense', 'conv2d'):
                 weight_tv, bias_tv = _create_weight_tensors(layer, graph)
+                if layer.class_name == 'DepthwiseConv2D':
+                    # Keras keeps a depthwise filter per input channel, [kh, kw, Cin, multiplier];
+                    # the canonical form is one group per channel, [kh, kw, Cin/groups, Cout].
+                    data = np.asarray(weight_tv.data)
+                    kh, kw, channels, multiplier = data.shape
+                    weight_tv.data = data.reshape(kh, kw, 1, channels * multiplier)
+                    weight_tv.shape = (kh, kw, 1, channels * multiplier)
                 param_tensors[layer.name] = (weight_tv, bias_tv)
 
             if node.op_type == 'layer_norm':
@@ -256,7 +263,12 @@ class LowerToAieIr(ModelOptimizerPass):
     def _map_op_type(self, layer) -> str:
         if layer.class_name in ('Dense',) or is_pointwise_dense(layer):
             return 'dense'
-        if layer.class_name in ('Conv2D', 'DepthwiseConv2D', 'SeparableConv2D'):
+        if layer.class_name == 'SeparableConv2D':
+            raise NotImplementedError(
+                f'{layer.name}: a separable convolution is a depthwise and a pointwise convolution; '
+                'split it in the model so each lowers to its own conv2d.'
+            )
+        if layer.class_name in ('Conv2D', 'DepthwiseConv2D'):
             return 'conv2d'
         if layer.class_name in ('Reshape', 'Flatten'):
             return 'reshape'

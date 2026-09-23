@@ -15,8 +15,8 @@ from ...op_impls.utils import (
 BD_MAX_WRAP = 255
 """Steps one buffer-descriptor dimension can take (measured: Vitis rejects 720)."""
 
-ELEMENT_BITS = 8
-"""Inner-blocked frames are int8 today, and a BD counts 32-bit words."""
+BD_WORD_BITS = 32
+"""A buffer descriptor counts 32-bit words."""
 
 
 def describes_natural_order(desc: Dict[str, Any]) -> bool:
@@ -40,8 +40,14 @@ def describes_natural_order(desc: Dict[str, Any]) -> bool:
     return sorted(walked) == list(walked)
 
 
-def boundary_access_descriptor(base: Dict[str, Any], *, project_to_io_boundary: bool = False) -> Dict[str, Any]:
-    """Lower a staging layout to an ADF graph-boundary access descriptor."""
+def boundary_access_descriptor(
+    base: Dict[str, Any], *, element_bits: int, project_to_io_boundary: bool = False
+) -> Dict[str, Any]:
+    """Lower a staging layout to an ADF graph-boundary access descriptor.
+
+    `element_bits` is the port's element width: a storage layout says how a buffer is arranged,
+    not what it holds, while a buffer descriptor counts words.
+    """
 
     storage_layout = base.get('storage_layout')
     if storage_layout not in STORAGE_LAYOUTS:
@@ -51,7 +57,7 @@ def boundary_access_descriptor(base: Dict[str, Any], *, project_to_io_boundary: 
     if storage_layout == STORAGE_LAYOUT_INNER_BLOCKED:
         if project_to_io_boundary:
             raise NotImplementedError('A blocked frame is transferred whole; the host trims it.')
-        return _inner_blocked_access_descriptor(base)
+        return _inner_blocked_access_descriptor(base, int(element_bits))
     if storage_layout != STORAGE_LAYOUT_MICROTILED:
         raise NotImplementedError(f'No boundary DMA lowering for storage_layout {storage_layout!r}.')
 
@@ -117,7 +123,7 @@ def boundary_access_descriptor(base: Dict[str, Any], *, project_to_io_boundary: 
     return descriptor
 
 
-def _inner_blocked_access_descriptor(base: Dict[str, Any]) -> Dict[str, Any]:
+def _inner_blocked_access_descriptor(base: Dict[str, Any], element_bits: int) -> Dict[str, Any]:
     """Boundary DMA for an inner-blocked buffer ([c/B][...][B] memory, linear wire order).
 
     One block of the inner axis is one contiguous region whose wire order is already its memory
@@ -145,13 +151,13 @@ def _inner_blocked_access_descriptor(base: Dict[str, Any]) -> Dict[str, Any]:
     chunk = list(dims)
     traversal = []
     for dim in range(inner + 1, len(dims)):
-        if int(np.prod(chunk[: dim + 1])) * ELEMENT_BITS // 32 <= BD_MAX_WRAP and not traversal:
+        if int(np.prod(chunk[: dim + 1])) * element_bits // BD_WORD_BITS <= BD_MAX_WRAP and not traversal:
             continue
         chunk[dim] = 1
         if int(dims[dim]) > 1:
             traversal.append({'dimension': dim, 'stride': 1, 'wrap': int(dims[dim])})
     over = [step for step in traversal if step['wrap'] > BD_MAX_WRAP]
-    if over or int(np.prod(chunk)) * ELEMENT_BITS // 32 > BD_MAX_WRAP:
+    if over or int(np.prod(chunk)) * element_bits // BD_WORD_BITS > BD_MAX_WRAP:
         raise NotImplementedError(
             f"An inner-blocked boundary transfer of {dims} needs a descriptor beyond a BD's {BD_MAX_WRAP} "
             'steps; split the tensor across ports.'

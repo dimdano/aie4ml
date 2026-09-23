@@ -182,10 +182,14 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int) -> in
     return total // int(batch)
 
 
+def port_transfer_bytes(port) -> int:
+    """Bytes one port moves per iteration: its transfer tile, whatever the layout behind it."""
+    return int(math.prod(port.numpy_tile_shape)) * (int(port.dtype.width) // 8)
+
+
 def _stream_words_512(port, direction: str) -> int:
-    """512-bit words one PLIO stream carries per iteration: the port's transfer tile (the logical
-    slice of a DMA-fed buffer port, the padded tile of a stream port), which must be word-aligned."""
-    stream_bytes = int(math.prod(port.numpy_tile_shape)) * (int(port.dtype.width) // 8)
+    """512-bit words one PLIO stream carries per iteration, which must be word-aligned."""
+    stream_bytes = port_transfer_bytes(port)
     if stream_bytes % _DDR_WORD_BYTES != 0:
         raise NotImplementedError(
             f'graph {direction}: {stream_bytes} bytes per stream is not a multiple of '
@@ -531,7 +535,6 @@ def pack_host_data(model_or_ctx, X=None):
     layout = build_io_layout(ctx)
     in_tensor = next(iter(layout.inputs))
     in_ports = layout.inputs[in_tensor]
-    out_port0 = layout.outputs[next(iter(layout.outputs))][0]
 
     boundary = in_ports[0].numpy_boundary_shape  # full n-D shape; no (batch, feat) assumption
 
@@ -546,7 +549,9 @@ def pack_host_data(model_or_ctx, X=None):
         in_tiles.append(tile)
     ifm_packed = _pack_ports_to_ddr(in_tiles, len(in_ports))
 
-    out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
+    # What the graph actually emits, port by port -- the same transfer the PL movers carry, which
+    # is not the logical tensor when a port's tile is padded.
+    out_total_bytes = sum(port_transfer_bytes(port) for ports in layout.outputs.values() for port in ports)
     if out_total_bytes % 4 != 0:
         raise NotImplementedError(f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).')
     ofm_size_words = out_total_bytes // 4

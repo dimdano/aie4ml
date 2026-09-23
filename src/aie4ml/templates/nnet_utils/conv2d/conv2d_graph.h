@@ -4,6 +4,7 @@
 #pragma once
 #include <adf.h>
 #include "conv2d.h"
+#include "conv2d_stream.h"
 #include "parameters.h"
 
 using namespace adf;
@@ -24,6 +25,8 @@ public:
   output_port out1[CAS_NUM];
   kernel kk[CAS_NUM * CAS_LENGTH];
 
+  static constexpr bool STREAM_IO = ConfigT::STREAM_IO;
+
   void place_graph(int COL_START, int ROW_START)
   {
     for (unsigned idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx) {
@@ -39,7 +42,9 @@ public:
   {
     for (unsigned chain = 0; chain < CAS_NUM; ++chain) {
       const unsigned base = chain * CAS_LENGTH;
-      if constexpr (CAS_LENGTH == 1) {
+      if constexpr (STREAM_IO) {
+        kk[base] = kernel::create_object<conv2d_stream<ConfigT>>();
+      } else if constexpr (CAS_LENGTH == 1) {
         kk[base] = kernel::create_object<conv2d_single<ConfigT>>();
       } else {
         kk[base] = kernel::create_object<conv2d_first<ConfigT>>();
@@ -55,19 +60,23 @@ public:
     for (unsigned idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx) {
       const unsigned col = idx % CAS_LENGTH;
       const unsigned chain = idx / CAS_LENGTH;
-      source(kk[idx]) = "conv2d.cpp";
+      source(kk[idx]) = STREAM_IO ? "conv2d_stream.cpp" : "conv2d.cpp";
       runtime<ratio>(kk[idx]) = 1.0;
       single_buffer(kk[idx].in[1]);
       connect<parameter>(wts[idx], async(kk[idx].in[1]));
       connect<>(in1[OUTER ? idx : col], kk[idx].in[0]);
-      dimensions(kk[idx].in[0]) = { ConfigT::IN_BYTES };
+      if constexpr (!STREAM_IO) {
+        dimensions(kk[idx].in[0]) = { ConfigT::IN_BYTES };
+      }
       if (col == CAS_LENGTH - 1) {
         // The bias argument follows the cascade input on every chain longer than one tile.
         const unsigned bias_port = (CAS_LENGTH == 1) ? 2 : 3;
         connect<parameter>(bias[chain], async(kk[idx].in[bias_port]));
         single_buffer(kk[idx].in[bias_port]);
         connect<>(kk[idx].out[0], out1[chain]);
-        dimensions(kk[idx].out[0]) = { ConfigT::OUT_BYTES };
+        if constexpr (!STREAM_IO) {
+          dimensions(kk[idx].out[0]) = { ConfigT::OUT_BYTES };
+        }
       }
     }
 

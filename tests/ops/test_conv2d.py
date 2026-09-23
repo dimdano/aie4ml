@@ -110,27 +110,38 @@ def _valid_model(k: int):
     return _model(f'conv2d_valid_k{k}', nodes, inits)
 
 
-def _band_model():
-    """A same-padded conv straight from the graph input, split into row bands.
+def _frame_model(channels_in=CIN, channels_out=C3, name='conv_frame'):
+    """A same-padded conv straight from the graph input, writing its frame to the boundary.
 
-    Bands stay bands: nothing gathers them back, so the chain ends at the boundary, where the
-    host reassembles the two band outputs.
+    Nothing gathers row bands back together, so a banded chain ends here; a streamed conv also
+    has to start here, because its frame must arrive with the border already in it.
     """
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
-    _conv(nodes, inits, 'x_nchw', 'a', 'b', CIN, C3, 3, pad=1, relu=True, seed=21)
+    _conv(nodes, inits, 'x_nchw', 'a', 'b', channels_in, channels_out, 3, pad=1, relu=True, seed=21)
     nodes.append(helper.make_node('Transpose', ['a'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
     return make_model(
-        'conv_bands',
+        name,
         nodes=nodes,
-        inputs=[('x_q', TensorProto.INT8, [1, H, W, CIN])],
-        outputs=[('y', TensorProto.FLOAT, [1, H, W, C3])],
+        inputs=[('x_q', TensorProto.INT8, [1, H, W, channels_in])],
+        outputs=[('y', TensorProto.FLOAT, [1, H, W, channels_out])],
         initializers=inits,
     )
 
 
+def _band_model():
+    return _frame_model(name='conv_bands')
+
+
+def _stream_model():
+    """Several channel blocks, so the wire order and the blocked frame really differ -- and more
+    than one block crosses the boundary, which a DMA-fed frame cannot do."""
+    return _frame_model(channels_in=C1, channels_out=C2, name='conv_stream')
+
+
 BAND_DIRECTIVES = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
+STREAM_DIRECTIVES = {'b': {'ports': 'stream'}}
 
 
 def _feed() -> np.ndarray:
@@ -304,6 +315,29 @@ def test_outer_splits_rows_into_overlapping_bands(tmp_path):
     assert {('b_aie.out1[0]', 'ofm[0]'), ('b_aie.out1[1]', 'ofm[1]')} <= edges
 
 
+def test_stream_conv_carries_the_logical_tensor(tmp_path):
+    """A stream carries a wire order, not a memory layout, and the wire is the tensor itself: no
+    border, no padded channels, no computed-width tail. The kernel owns all of that."""
+    ctx = lower(_stream_model(), tmp_path, STREAM_DIRECTIVES, part=AIE1_PART)
+    conv = ctx.ir.execution.get('b_aie')
+    assert conv.variant.variant_id == 'conv2d.s.r.v1'
+    assert int(conv.config.io_views[conv.node.inputs[0].name].full[-1]) // 8 == 3  # three blocks
+    assert {b.kind for b in (*conv.ports.inputs.values(), *conv.ports.outputs.values())} == {'stream'}
+
+    logical = [C2, W, H, 1]  # buffer order: channels, columns, rows, batch
+    for staging in (
+        conv.variant.describe_input_staging(conv.node, conv.config, conv.node.inputs[0].name, 0),
+        conv.variant.describe_output_staging(conv.node, conv.config, conv.node.outputs[0].name, 0),
+    ):
+        assert staging['storage_layout'] == 'linear'
+        assert staging['tiling_dimension'] == staging['buffer_dimension'] == logical
+        assert staging['logical_origin'] == [0, 0, 0, 0]  # the window is the tensor
+
+    plan = ctx.ir.physical.plan
+    assert plan['buffers'] == [] and plan['kernel_write_accesses'] == []
+    assert ('ifm[0]', 'b_aie.in1[0]') in {(e['source'], e['target']) for e in plan['direct_edges']}
+
+
 def test_conv_refuses_stride(tmp_path):
     nodes: list = []
     inits: list = []
@@ -324,6 +358,34 @@ def test_conv_refuses_stride(tmp_path):
 # --------------------------------------------------------------------------- #
 # numerics
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
+def test_stream_conv_matches_onnx(tmp_path, part):
+    """The wire order and the blocked frame must agree, or the image lands scrambled."""
+    feed = np.random.default_rng(12).integers(-40, 40, size=(1, H, W, C1), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _stream_model(), {'x_q': feed}, STREAM_DIRECTIVES, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+    )
+
+
+@pytest.mark.requires_vitis
+def test_stream_conv_repeats_without_stale_state(tmp_path):
+    """The band frame and the beat cursor outlive the call, so a second inference must not inherit
+    the rows and the half beat the first one left behind."""
+    feed = np.random.default_rng(12).integers(-40, 40, size=(1, H, W, C1), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _stream_model(),
+        {'x_q': feed},
+        STREAM_DIRECTIVES,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=1,
+        part=AIE1_PART,
+        iterations=2,
+    )
 
 
 @pytest.mark.requires_vitis

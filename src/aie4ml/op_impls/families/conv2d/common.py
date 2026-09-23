@@ -5,6 +5,7 @@ from __future__ import annotations
 from ....ir.graph import OpNode
 from ...utils import (
     STORAGE_LAYOUT_INNER_BLOCKED,
+    STORAGE_LAYOUT_LINEAR,
     AxisPlan,
     SpatialAccess2D,
     TensorView,
@@ -43,6 +44,31 @@ def frame_view(tensor, *, column_block: int, column_align: int, channel_slices: 
         inner_slices=channel_slices,
         row_slices=bands,
         row_bytes_align=ROW_ALIGN_PIXELS,
+    )
+
+
+def describe_stream_frame_staging(view: TensorView, access: str):
+    """Staging of an activation on a core stream: the logical tensor, in its own order.
+
+    A stream carries a wire order, not a memory layout. The wire order is the tensor itself --
+    rows, then columns, then channels -- and the padding the kernel computes with (a zero border,
+    channels rounded to a block, a width rounded to whole register tiles) stays inside the kernel,
+    where it belongs. So this publishes the logical window, not the execution frame.
+    """
+    # The wire's "buffer" is the tensor, so the descriptor is built on a view of it: the execution
+    # frame is the kernel's business and never reaches the port.
+    wire = TensorView(logical=view.logical, full=view.logical, tile=view.logical, tile_raw=view.logical)
+    inner_dim, _outer_dim, traversal_dims = canonical_buffer_axes(wire)
+    shape = ordered_view_shape(wire, 'logical')
+    return build_staging_descriptor(
+        wire,
+        access=access,
+        plans={dim: AxisPlan(int(shape[dim]), int(shape[dim]), 1) for dim in traversal_dims},
+        order=traversal_dims,
+        io_tiling_base='logical',
+        boundary_shape='logical' if access == 'read' else None,
+        slice_dim=inner_dim,
+        extras={'storage_layout': STORAGE_LAYOUT_LINEAR},
     )
 
 

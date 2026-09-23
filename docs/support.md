@@ -10,7 +10,7 @@
 | Elementwise Add | Generation-dependent integer and float formats | Exact-shape inputs for residual and elementwise connections; broadcasting is not supported. BF16 is supported on AIE-ML and FP8 on AIE-MLv2. |
 | LayerNorm | Signed int8 | Last-axis normalization using integer mean/variance and reciprocal-square-root approximation. Input and output storage are currently signed int8 and require supported static quantization. |
 | Softmax | Int8 to uint8/int16 | Accurate integer exponential or an opt-in surrogate (needs explicit parameters + QAT). Linear or microtile layout; the exp variant is not yet perf-optimized. |
-| Conv2D | Signed int8, stride 1 | NHWC frames; 1x1 to 7x7 kernels, asymmetric zero padding, `groups` (including depthwise), optional bias and fused ReLU. A layer spans several tiles through the Dense parallelism directive on the channel-block axis: `cas_length` splits the reduction along a cascade chain, `cas_num` splits the output channels ('inner') or the output rows ('outer') across chains. Row bands overlap by the window span, so a banded input comes from the graph boundary (the host delivers each band's window); a halo-free consumer such as a 1x1 conv inherits the bands, and nothing gathers them back, so a banded chain ends at the boundary. Batch > 1, stride, dilation and float are rejected explicitly. A flattened conv output feeds Dense directly (one chain only). A conv frame crossing the graph boundary must fit one 8-channel block per port. |
+| Conv2D | Signed int8, stride 1 | NHWC frames; any kernel that fits tile memory (validated to 7x7), asymmetric zero padding, `groups` (including depthwise), optional bias and fused ReLU. A layer spans several tiles through the Dense parallelism directive on the channel-block axis: `cas_length` splits the reduction along a cascade chain, `cas_num` splits the output channels ('inner') or the output rows ('outer') across chains. Row bands overlap by the window span, so a banded input comes from the graph boundary (the host delivers each band's window); a halo-free consumer such as a 1x1 conv inherits the bands, and nothing gathers them back, so a banded chain ends at the boundary. Batch > 1, stride, dilation and float are rejected explicitly. A flattened conv output feeds Dense directly (one chain only). A conv frame crossing the graph boundary must fit one 8-channel block per port. |
 | Flatten / Reshape | Folded into the producing op | One sample to `[1, K]`, written directly by a producer that lists `flatten_2d` among its output views (today Conv2D), so no kernel or copy is instantiated. A view that ravels the axes in a different order hands that row order to the consuming family, which folds it into its constants. |
 | Transpose / Permute | Folded view with memtile fallback | Permutation of the final two axes only. AIE1 rejects permutations that require relayout because it has no memory-tile fallback. |
 | Split / Slice | Direct or per-slice memtile | No Split/Slice kernel. A slice must be an exact union of complete producer-port regions. Cross-port slices require an unimplemented relay/repacking path and are rejected on every generation. Graph-boundary slices and chained views are not supported. |
@@ -23,8 +23,8 @@
 
 | Frontend | Current support | Notes and limitations |
 | --- | --- | --- |
-| ONNX | Recommended operator-level frontend | Supports explicit graphs composed from supported operators and quantized Q/DQ boundaries. A Transpose of an activation is a change of view, not of data: it composes into how the ONNX value sees its canonical tensor, so ONNX NCHW convolutions run on canonical NHWC tensors with no relayout. |
-| hls4ml | Optional Keras/QKeras frontend | Dense stacks and Conv2D/DepthwiseConv2D: hls4ml is already channels-last with `[kh, kw, Cin/groups, Cout]` weights, so it reaches the same conv2d contract as ONNX with no backend change. Install `hls4ml` separately when using this path. |
+| ONNX | Recommended operator-level frontend | Supports explicit graphs composed from supported operators and quantized Q/DQ boundaries. A Transpose of an activation is a change of view, not of data: it composes into how the ONNX value sees its canonical tensor, and a consumer that needs the canonical order materializes the view as a folded transpose. A convolution therefore needs the NCHW view to be explicit -- export channels-last, as `input [N,H,W,C] -> Transpose(0,3,1,2) -> Conv` -- because a graph whose input is itself NCHW is not silently re-interpreted as NHWC. |
+| hls4ml | Optional Keras/QKeras frontend | Dense stacks, Conv2D and DepthwiseConv2D: hls4ml is already channels-last, so it reaches the same conv2d contract as ONNX with no backend change (a depthwise layer's per-channel filters are rearranged into the compact group form). A SeparableConv2D is rejected; split it into its depthwise and pointwise convolutions. Install `hls4ml` separately when using this path. |
 
 
 ## Tensor and View Contracts
@@ -80,8 +80,15 @@
   question: an `inner_blocked` leg is routed point-to-point, and an explicit `io_route=memtile` on it fails saying so.
 - A variant's `PortMap` is its port contract: per tensor the ADF group, port count, port kind (`buffer` or
   `stream`) and the kernel endpoints behind each hierarchical port, which is where DMA access constraints bind.
-- `ports: stream` selects a variant whose data ports are core streams (currently Dense, both contracts, every
-  cascade shape; other ops fail explicitly). A stream port carries its padded per-port tile in linear row order: no buffer to place, no bank
+- `ports: stream` selects a variant whose data ports are core streams (Dense in both contracts and every
+  cascade shape, and a single-tile Conv2D; other ops fail explicitly). A streamed conv carries the *logical* tensor on the
+  wire -- rows, then columns, then channels, with no border, no padded channels and no computed-width tail -- and the
+  kernel builds everything its compute core needs around that data, keeping one band of the image (its output rows plus
+  the window span) rather than the whole of it. So a stream carries a wire order, while `inner_blocked` describes buffer
+  memory. It is also the only way more than one channel block crosses the graph boundary in one port. Partitioning a
+  streamed Conv2D across tiles is not implemented. It buys legality, not speed:
+  measured on AIE1 (8x8 image, 3x3 kernel, one channel block) a conv runs in 1,279 cycles through buffer ports and
+  2,157 through streams. A stream port carries its padded per-port tile in linear row order: no buffer to place, no bank
   contract, no DMA descriptor and no microtile on the wire; the kernel re-tiles a row band in registers. Stream legs
   are always direct: stream-to-stream requires identical staging descriptors, a PLIO feeds the padded tile (the host
   pads and trims), and a stream-to-buffer leg, a memory-tile route or a transposed view is rejected explicitly. The

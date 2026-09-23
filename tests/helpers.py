@@ -128,19 +128,26 @@ def microtiling(m: int, k: int, n: int) -> dict:
 
 
 def assert_x86_matches_onnx(
-    model, feeds, directives, tmp_path, *, project='proj', batch, frac=4, max_code_diff=5, part=PART
+    model, feeds, directives, tmp_path, *, project='proj', batch, frac=4, max_code_diff=5, part=PART, iterations=1
 ):
     """Compile a model for x86, simulate it, and check every output against onnxruntime.
 
     The reference runs the float ONNX graph; each AIE output is compared in the quantized int8
     code space, tolerating a small rounding difference. One compile+sim covers every output the
     model exposes, which is why an ops/ test packs several configurations into one graph.
+
+    Every iteration is fed the same input and checked against the same reference, so asking for
+    more than one catches a kernel that carries state from one inference into the next.
     """
     import onnxruntime as ort
 
     aie_model = from_onnx(
         model,
-        {'Part': part, 'AIEConfig': {'BatchSize': batch, 'Iterations': 1}, 'LayerDirectives': dict(directives)},
+        {
+            'Part': part,
+            'AIEConfig': {'BatchSize': batch, 'Iterations': iterations},
+            'LayerDirectives': dict(directives),
+        },
         output_dir=Path(tmp_path) / project,
         project_name=project,
     )
@@ -156,6 +163,10 @@ def assert_x86_matches_onnx(
     scale = float(2.0**-frac)
     for name, want_deq in ref.items():
         want = np.clip(np.rint(np.asarray(want_deq, np.float32) / scale), -128, 127).astype(np.int8)
-        have = np.asarray(got[name])[:batch].astype(np.int8)
-        diff = np.abs(have.astype(np.int16) - want.astype(np.int16))
-        assert int(diff.max()) <= max_code_diff, f'{name}: max code diff {int(diff.max())} > {max_code_diff}'
+        produced = np.asarray(got[name]).astype(np.int8)
+        for iteration in range(iterations):
+            have = produced[iteration * batch : (iteration + 1) * batch]
+            diff = np.abs(have.astype(np.int16) - want.astype(np.int16))
+            assert (
+                int(diff.max()) <= max_code_diff
+            ), f'{name}: iteration {iteration} max code diff {int(diff.max())} > {max_code_diff}'

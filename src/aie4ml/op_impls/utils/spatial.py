@@ -111,13 +111,14 @@ def build_padded_spatial_view(
             f'{padded_channels} channels do not split into {inner_slices} ports of whole {inner_block}-blocks.'
         )
     span_h = access.window[0] if access else 1
+    stride_h = int(access.strides[0]) if access else 1
     out_height = access.output_extent(height, width)[0] if access else height
     if out_height % int(row_slices):
         raise ValueError(f'{out_height} output rows do not split into {row_slices} equal bands.')
     full = (batch, top + height + bottom, align_up(columns, max(1, int(row_bytes_align))), padded_channels)
     tile = (
         batch,
-        out_height // int(row_slices) + span_h - 1,
+        (out_height // int(row_slices) - 1) * stride_h + span_h,
         full[2],
         padded_channels // int(inner_slices),
     )

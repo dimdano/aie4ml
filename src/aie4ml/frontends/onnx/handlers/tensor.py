@@ -130,8 +130,7 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
             ranges.append((offset, size))
             offset += size
 
-    ctx.require_identity_order(src_name, node_name)
-    source = ctx.source_for(src_name, node_name)
+    source = ctx.canonical_source(src_name, node_name)
     outputs = [(out_name, ctx.output_shape(out_name, node_name), source.precision) for out_name in node.output]
     ctx.emit(
         op_type.lower(),
@@ -154,9 +153,7 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
 def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
     if len(node.input) < 1:
         raise ValueError(f'{node_name}: Concat must have at least one input.')
-    for name in node.input:
-        ctx.require_identity_order(name, node_name)
-    sources = [ctx.source_for(name, node_name) for name in node.input]
+    sources = [ctx.canonical_source(name, node_name) for name in node.input]
     if any(src.is_parameter for src in sources):
         raise ValueError(f'{node_name}: Concat currently supports activation tensors only.')
 

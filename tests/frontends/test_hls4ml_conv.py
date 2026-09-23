@@ -1,10 +1,11 @@
 """hls4ml/QKeras frontend: a QConv2D stack lowered to the canonical conv2d contract.
 
-The point of this test is the frontend boundary: hls4ml is channels-last and already stores
-`[kh, kw, Cin/groups, Cout]` weights, so it reaches the same IR as the ONNX path without any
-op_impls change.
+The point of this test is the frontend boundary: hls4ml is channels-last, so it reaches the same
+IR as the ONNX path without any op_impls change -- only the attribute names and, for a depthwise
+layer, the weight arrangement differ.
 """
 
+import numpy as np
 import pytest
 
 tf = pytest.importorskip('tensorflow')
@@ -18,7 +19,7 @@ def lowered(tmp_path):
     hls4ml = pytest.importorskip('hls4ml')
     pytest.importorskip('qkeras')
     from keras.models import Sequential
-    from qkeras import QActivation, QConv2D, QDense, quantized_bits, quantized_relu
+    from qkeras import QActivation, QConv2D, QDense, QDepthwiseConv2D, quantized_bits, quantized_relu
 
     tf.keras.utils.set_random_seed(7)
     q_w = quantized_bits(BITS, 2, alpha=1)
@@ -27,6 +28,8 @@ def lowered(tmp_path):
             tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
             QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
             QActivation(quantized_relu(BITS, 2), name='relu'),
+            QDepthwiseConv2D((3, 3), padding='same', depthwise_quantizer=q_w, bias_quantizer=q_w, name='dw'),
+            QActivation(quantized_relu(BITS, 2), name='dwrelu'),
             tf.keras.layers.Flatten(name='flatten'),
             QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
         ]
@@ -62,3 +65,15 @@ def test_hls4ml_conv_reaches_the_canonical_contract(lowered):
     inst = lowered.ir.execution.get(conv.name)
     assert inst.variant.variant_id == 'conv2d.b.r.v1'
     assert 'fused_activation' in conv.traits  # the QActivation folded in
+
+
+def test_hls4ml_depthwise_reaches_the_compact_group_contract(lowered):
+    """Keras keeps a filter per input channel; the canonical form is one group per channel."""
+    dw = next(node for node in lowered.ir.logical if node.metadata.get('groups', 1) > 1)
+    assert tuple(dw.inputs[1].shape) == (3, 3, 1, COUT)  # [kh, kw, Cin/groups, Cout]
+    assert dw.metadata['groups'] == COUT
+    tiles = lowered.ir.execution.get(dw.name).artifacts['packed_weights']
+    blocks = COUT // 8
+    padded = blocks + blocks % 2
+    grid = tiles.reshape(9, blocks, padded, 8, 8)
+    assert np.count_nonzero(grid[0, 0, 0]) == np.count_nonzero(np.diag(grid[0, 0, 0]))

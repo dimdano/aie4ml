@@ -20,11 +20,17 @@ struct {{L.struct_name}} {
   // FILLS_BORDER: this kernel zeroes the frame's border, because the kernel upstream wrote only
   // the image. At the graph boundary the host delivers the padded window instead.
   static constexpr bool FILLS_BORDER = {{ 'true' if P.fills_border else 'false' }};
+  // STREAM_IO: the frame arrives and leaves on core streams in linear row order, and the kernel
+  // lands it in the channel-blocked layout the compute core reads.
+  static constexpr bool STREAM_IO = {{ 'true' if P.stream_io else 'false' }};
   static constexpr int IN_H = {{P.in_h}}, IN_W = {{P.in_w}};
   static constexpr int IN_ROWS = {{P.in_rows}}, IN_COLS = {{P.in_cols}};
   static constexpr int IN_ORIGIN_R = {{P.in_origin_r}}, IN_ORIGIN_C = {{P.in_origin_c}};
   // Outputs are produced in whole register tiles, so OUT_W_COMPUTED >= OUT_W columns are written.
+  // OUT_H is what one call of the compute core covers: the whole tile for a buffer port, one band
+  // for a streamed one, which walks the image in BANDS of them.
   static constexpr int OUT_H = {{P.out_h}}, OUT_W = {{P.out_w}}, OUT_W_COMPUTED = {{P.out_w_computed}};
+  static constexpr int BANDS = {{P.bands}};
   static constexpr bool FLATTEN = {{ 'true' if P.flags.emit_flattened else 'false' }};
   // Output: [NB][OUT_ROWS][OUT_COLS][8] frame, or one Dense LHS row of FLAT_K_PADDED elements.
   static constexpr int OUT_ROWS = {{P.out_rows}}, OUT_COLS = {{P.out_cols}};

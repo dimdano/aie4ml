@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, ClassVar, Dict
 
 import numpy as np
 
@@ -10,7 +10,7 @@ from ....aie_types import FloatIntent
 from ....ir.graph import STAGING_CONTRACTS, VIEW_FLATTEN_2D, OpImplInstance, OpNode, input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import OpImplFootprint, OpImplVariant
-from ...common_types import PORT_KIND_BUFFER, PortBinding, PortMap
+from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives, requested_port_kind
 from ...utils.math import align_up
@@ -31,8 +31,21 @@ from ..matmul.common import (
     select_generation_key,
 )
 from ..matmul.config import MatmulMicrotileConfig
-from .common import CHANNEL_BLOCK, describe_frame_staging, frame_view, spatial_access_of
+from .common import (
+    CHANNEL_BLOCK,
+    describe_frame_staging,
+    describe_stream_frame_staging,
+    frame_view,
+    spatial_access_of,
+)
 from .config import Conv2dConfig, Conv2dFlags
+
+STREAM_BAND_ROWS = 4
+"""Output rows a streamed kernel computes per core call: the band it keeps in local memory.
+
+Four rows keep the halo copy between bands (window - 1 rows) small relative to the work, while
+the frame it holds stays a fraction of the whole image.
+"""
 
 _SPATIAL_BLOCKS = {'AIE': 2, 'AIE-ML': 4, 'AIE-MLV2': 4}
 """Register blocking measured best per generation: mmul row tiles per accumulator set.
@@ -46,9 +59,9 @@ Measured on AIE-ML (3x3, Cin 8 -> Cout 32): at OUT_W 16 the 4-tile blocking is 2
 class Conv2dOpImplVariant(OpImplVariant):
     """int8 Conv2D as an implicit GEMM over the Dense mmul core, on channel-blocked NHWC frames.
 
-    Partitioning uses the Dense vocabulary on the frame's channel-block axis: `cas_length` splits
-    the reduction (input channel blocks) across a cascade chain, `cas_num` splits the output
-    channel blocks across chains. The `outer` (spatial band) contract is not implemented.
+    Partitioning uses the Dense vocabulary on the frame: `cas_length` splits the reduction (input
+    channel blocks) across a cascade chain, and `cas_num` splits either the output channel blocks
+    ('inner') or the output rows ('outer', row bands that overlap by the window span).
     """
 
     variant_id = 'conv2d.b.r.v1'
@@ -57,6 +70,7 @@ class Conv2dOpImplVariant(OpImplVariant):
     graph_name = 'conv2d_graph'
     param_template = 'conv2d'
     plevel = 10
+    port_kind: ClassVar[str] = PORT_KIND_BUFFER
 
     def matches(self, node: OpNode, device) -> bool:
         lhs = input_tensor_for_role(node, 'lhs')
@@ -67,7 +81,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             resolve_exact_storage_dtype(lhs.precision, namespace='lhs', layer_name=node.name).width,
             resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name).width,
         )
-        return requested_port_kind(node) == PORT_KIND_BUFFER and widths == (8, 8)
+        return requested_port_kind(node) == self.port_kind and widths == (8, 8)
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
@@ -250,13 +264,29 @@ class Conv2dOpImplVariant(OpImplVariant):
                 f'{node.name}: the kernel reads {read_span} frame columns but the padded frame has '
                 f'{params["in_cols"]}.'
             )
-        tile_bytes = 2 * (params['in_bytes'] + params['out_bytes']) + params['weight_count'] + 4 * params['bias_count']
+        # A buffer port ping-pongs; the stream wrapper owns one frame each way.
+        copies = 2 if self.port_kind == PORT_KIND_BUFFER else 1
+        tile_bytes = (
+            copies * (params['in_bytes'] + params['out_bytes']) + params['weight_count'] + 4 * params['bias_count']
+        )
         if tile_bytes > int(device.tile_mem_bytes):
             raise ValueError(
                 f'{node.name}: one tile needs {tile_bytes} B for its frames, weights and bias but a '
                 f'{device.platform} tile has {device.tile_mem_bytes} B; split the layer with '
                 '`parallelism: {cas_num: .., cas_length: ..}`.'
             )
+
+    def band_rows(self, node, config: Conv2dConfig) -> int:
+        """Output rows one core call covers. A buffer kernel does the whole tile in one call; a
+        stream kernel walks the image in bands, keeping only a window of it."""
+        lhs = input_tensor_for_role(node, 'lhs')
+        out_rows = spatial_access_of(node).output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        if self.port_kind == PORT_KIND_BUFFER:
+            return out_rows // int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else out_rows
+        band = min(STREAM_BAND_ROWS, out_rows)
+        while out_rows % band:
+            band -= 1
+        return band
 
     def build_template_params(self, node, config: Conv2dConfig, _placement):
         lhs = input_tensor_for_role(node, 'lhs')
@@ -265,6 +295,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         _, in_rows, in_cols, in_channels = (int(x) for x in in_view.tile)
         kh, kw = config.kernel_shape
         _, in_h, in_w, cin = (int(x) for x in lhs.shape)
+        outer = config.parallelism.contract == 'outer'
         cout = int(input_tensor_for_role(node, 'rhs').shape[-1])
         # 'inner' chains own a share of the output channels; 'outer' chains own rows and each
         # computes every channel.
@@ -273,12 +304,16 @@ class Conv2dOpImplVariant(OpImplVariant):
             out_blocks //= int(config.parallelism.cas_num)
         out_blocks_padded = out_blocks + out_blocks % 2
         out_h, out_w = spatial_access_of(node).output_extent(in_h, in_w)
-        outer = config.parallelism.contract == 'outer'
+        band = self.band_rows(node, config)
+        streamed = self.port_kind == PORT_KIND_STREAM
         if outer:
             out_h //= int(config.parallelism.cas_num)
-        # The kernel zero-fills the border of a frame a producing kernel wrote; at the graph
-        # boundary the host delivers the padded window itself, band by band.
-        fills_border = lhs.producer is not None
+        # Who puts the zeros around the image: the kernel re-fills the border of a buffer another
+        # kernel wrote, the host delivers it with the padded window at the boundary, and the stream
+        # wrapper keeps it in a frame it owns.
+        fills_border = lhs.producer is not None and self.port_kind == PORT_KIND_BUFFER
+        # A band's window starts mid-image, so the image no longer sits at the frame's origin.
+        whole_image = not outer
         params = {field: getattr(config, field) for field in config.__dataclass_fields__}
         params.update(
             cin=cin,
@@ -286,12 +321,14 @@ class Conv2dOpImplVariant(OpImplVariant):
             in_blocks=in_channels // CHANNEL_BLOCK,
             out_blocks=out_blocks,
             out_blocks_padded=out_blocks_padded,
-            in_h=in_h if fills_border else in_rows,
+            in_h=in_h if whole_image else in_rows,
+            band_rows=band,
+            bands=out_h // band,
             in_w=in_w,
             in_rows=in_rows,
             fills_border=fills_border,
             in_cols=in_cols,
-            in_origin_r=int(in_view.origin[1]) if fills_border else 0,
+            in_origin_r=int(in_view.origin[1]) if whole_image else 0,
             in_origin_c=int(in_view.origin[2]),
             out_h=out_h,
             out_w=out_w,
@@ -301,7 +338,24 @@ class Conv2dOpImplVariant(OpImplVariant):
             weight_count=kh * kw * (in_channels // CHANNEL_BLOCK) * out_blocks_padded * CHANNEL_BLOCK**2,
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
             buffer_locations=(),
+            stream_io=self.port_kind == PORT_KIND_STREAM,
         )
+        if streamed:
+            # A streamed kernel holds one band, not the image: the rows its window reads and the
+            # rows it writes. Everything else about the frame is unchanged.
+            span_h = spatial_access_of(node).window[0]
+            params.update(
+                in_rows=band + span_h - 1,
+                out_h=band,
+                out_rows=band,
+                out_origin_r=0,
+                out_cols=int(out_view.tile[2]),
+                out_origin_c=int(out_view.origin[2]),
+                flat_k_padded=0,
+                in_bytes=params['in_blocks'] * (band + span_h - 1) * in_cols * CHANNEL_BLOCK,
+                out_bytes=params['out_blocks'] * band * int(out_view.tile[2]) * CHANNEL_BLOCK,
+            )
+            return params
         if config.flags.emit_flattened:
             params.update(out_rows=1, out_cols=1, out_origin_r=0, out_origin_c=0, flat_k_padded=int(out_view.full[-1]))
         else:
@@ -332,6 +386,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         return out_rows // int(config.parallelism.cas_num)
 
     def describe_input_staging(self, node, config, tensor_name, port, _buf_dims=None, _producer=None):
+        if self.port_kind == PORT_KIND_STREAM:
+            return describe_stream_frame_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one
         # (band, channel slice) tile, so it selects both.
         cas_length = int(config.parallelism.cas_length)
@@ -347,6 +403,8 @@ class Conv2dOpImplVariant(OpImplVariant):
 
     def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
         view = config.io_views[tensor_name]
+        if self.port_kind == PORT_KIND_STREAM:
+            return describe_stream_frame_staging(view, 'write')
         if config.flags.emit_flattened:
             return describe_inner_output_staging(view, port, buf_dims)
         outer = config.parallelism.contract == 'outer'
@@ -373,8 +431,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         out_endpoints = tuple((f'kk[{chain * cas_length + cas_length - 1}].out[0]',) for chain in range(cas_num))
         lhs = input_tensor_for_role(node, 'lhs')
         return PortMap(
-            inputs={lhs.name: PortBinding('in1', len(lhs_endpoints), PORT_KIND_BUFFER, lhs_endpoints)},
-            outputs={node.outputs[0].name: PortBinding('out1', cas_num, PORT_KIND_BUFFER, out_endpoints)},
+            inputs={lhs.name: PortBinding('in1', len(lhs_endpoints), self.port_kind, lhs_endpoints)},
+            outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.port_kind, out_endpoints)},
         )
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
@@ -446,7 +504,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 quantize_to_int(
                     bias.data,
                     lhs.precision.frac + wi.frac,
-                    32,
+                    int(p.precision['bias'].width),
                     signed=bi.signed,
                     rounding_mode=bi.rounding,
                     saturation_mode=bi.saturation,
@@ -483,3 +541,51 @@ class Conv2dOpImplVariant(OpImplVariant):
                 'port': 'bias',
             },
         ]
+
+
+@register_variant
+class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
+    """The same Conv2D on core streams: the frame crosses on the wire in linear row order and the
+    kernel lands it in the blocked layout the compute core reads (`ports: stream`).
+
+    It buys legality rather than speed: a frame of several channel blocks crosses the graph
+    boundary in one port, which a DMA-fed frame cannot do. Measured on AIE1 (8x8, 3x3, one channel
+    block): 1,279 cycles through buffer ports against 2,157 through streams, the difference being
+    the wire and the landing loop.
+
+    One tile only: a cascade would need its partial sums to share the core's two stream ports.
+    """
+
+    variant_id = 'conv2d.s.r.v1'
+    port_kind = PORT_KIND_STREAM
+
+    def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
+        config = super().resolve(node, device, directives)
+        if config.parallelism.cas_num != 1 or config.parallelism.cas_length != 1:
+            raise NotImplementedError(f'{node.name}: {self.variant_id} does not implement partitioning yet.')
+        if config.flags.emit_flattened:
+            raise NotImplementedError(f'{node.name}: {self.variant_id} writes a frame, not a flattened row.')
+        return config
+
+    def validate_config(self, node: OpNode, config: Conv2dConfig, device) -> None:
+        super().validate_config(node, config, device)
+        params = self.build_template_params(node, config, {'row': 0, 'col': 0})
+        lhs = input_tensor_for_role(node, 'lhs')
+        out_rows = spatial_access_of(node).output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        if int(params['bands']) * int(params['band_rows']) != out_rows:
+            raise NotImplementedError(
+                f'{node.name}: {out_rows} output rows do not divide into whole bands of {params["band_rows"]}.'
+            )
+        beat = 16  # bytes in one 128-bit stream access
+        for name, elements in (
+            ('input', int(np.prod(lhs.shape))),
+            ('output', int(np.prod(node.outputs[0].shape))),
+        ):
+            if elements % beat:
+                raise NotImplementedError(
+                    f'{node.name}: its {name} is {elements} bytes, which is not a whole number of '
+                    f'{beat}-byte stream beats.'
+                )
+
+    def footprint(self, _node, _config) -> OpImplFootprint:
+        return OpImplFootprint(width=1, height=1)

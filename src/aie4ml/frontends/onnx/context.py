@@ -131,14 +131,36 @@ class OnnxImportContext:
         else:
             self.value_orders[dst] = order
 
-    def require_identity_order(self, name: str, node_name: str) -> None:
-        """Refuse a value whose axes are not in its canonical order."""
+    def canonical_source(self, name: str, node_name: str) -> TensorVar:
+        """An activation in its own axis order, materializing a folded view if one is pending.
+
+        A handler that reads a tensor axis by axis calls this instead of `source_for`: a value
+        that still carries a view becomes a `transpose` op, which the view passes fold into the
+        consumer that can realize it -- and refuse on the consumer that cannot.
+        """
+        tensor = self.source_for(name, node_name)
         order = self.value_orders.get(name)
-        if order is not None:
-            raise ValueError(
-                f'{node_name}: input {name} views its tensor as {order}, not in its canonical order; '
-                f'{node_name} reads the canonical order, so materialize the permutation first.'
-            )
+        if order is None:
+            return tensor
+        view_name = f'{name}_as_viewed'
+        self.emit(
+            'transpose',
+            view_name,
+            inputs=[tensor],
+            outputs=[(view_name, self.output_shape(name, node_name), tensor.precision)],
+            roles=['lhs'],
+            metadata={
+                'perm': [int(axis) for axis in order],
+                'data_format': 'channels_last',
+                'layer_class': 'Transpose',
+                'source_layer': node_name,
+            },
+            directives={},
+        )
+        materialized = self.value_tensors[view_name]
+        self.bind(name, materialized)  # the value is now in its own order for every later reader
+        self.set_order(name, None, node_name)
+        return materialized
 
     def common_order(self, names: Sequence[str], node_name: str) -> Optional[Tuple[int, ...]]:
         """The axis order shared by these values, for an op that reads them element for element."""

@@ -43,8 +43,7 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
         # canonicalization first if that subset is ever needed.
         rhs_is_constant = True
 
-    ctx.require_identity_order(lhs_name, node_name)
-    lhs_tensor = ctx.source_for(lhs_name, node_name)
+    lhs_tensor = ctx.canonical_source(lhs_name, node_name)
     if lhs_tensor.is_parameter:
         raise ValueError(f'{node_name}: activation input cannot be constant.')
     out_name = node.output[0]
@@ -54,8 +53,7 @@ def _matmul_gemm(ctx: OnnxImportContext, node, node_name: str, directives: dict)
     if not rhs_is_constant:
         if bias_name is not None:
             raise ValueError(f'{node_name}: dynamic MatMul does not support fused bias.')
-        ctx.require_identity_order(rhs_name, node_name)
-        rhs_tensor = ctx.source_for(rhs_name, node_name)
+        rhs_tensor = ctx.canonical_source(rhs_name, node_name)
         rhs_shape = ctx.output_shape(rhs_name, node_name)
         n_in = int(rhs_shape[0] if len(rhs_shape) == 1 else rhs_shape[-2])
         n_out = int(1 if len(rhs_shape) == 1 else rhs_shape[-1])

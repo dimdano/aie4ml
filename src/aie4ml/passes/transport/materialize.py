@@ -184,7 +184,8 @@ class _MemoryPlanMaterializer:
         consumer = entry.single_consumer()
         consumer_id = sanitize_identifier(consumer.node.name)
         inst = self._kernel_inst(consumer.node)
-        dtype = self._graph_input_dtype(entry).to_dict()
+        element = self._graph_input_dtype(entry)
+        dtype = element.to_dict()
 
         binding = inst.ports.inputs[consumer.tensor]
         stream = binding.kind == PORT_KIND_STREAM
@@ -206,7 +207,7 @@ class _MemoryPlanMaterializer:
                 # Vitis accepts access constraints on hierarchical ports but does not apply their buffer
                 # reorder; bind them to the kernel ports. A stream port has no DMA to constrain, and
                 # neither does a transfer that already moves the buffer in its own order.
-                descriptor = boundary_access_descriptor(descriptor)
+                descriptor = boundary_access_descriptor(descriptor, element_bits=int(element.width))
                 if not describes_natural_order(descriptor):
                     self.kernel_write_accesses.extend(
                         {'endpoint': f'{consumer_id}.{endpoint}', 'descriptor': descriptor}
@@ -229,7 +230,8 @@ class _MemoryPlanMaterializer:
         producer = entry.producer
         producer_id = sanitize_identifier(producer.node.name)
         inst = self._kernel_inst(producer.node)
-        dtype = self._graph_output_dtype(entry).to_dict()
+        element = self._graph_output_dtype(entry)
+        dtype = element.to_dict()
 
         binding = inst.ports.outputs[producer.tensor]
         stream = binding.kind == PORT_KIND_STREAM
@@ -257,7 +259,11 @@ class _MemoryPlanMaterializer:
             else:
                 elements = int(prod(staging_tile_shape(descriptor)))
                 logical_elements = int(prod(int(value) for value in staging['io_tiling_dimension']))
-                descriptor = boundary_access_descriptor(descriptor, project_to_io_boundary=logical_elements != elements)
+                descriptor = boundary_access_descriptor(
+                    descriptor,
+                    element_bits=int(element.width),
+                    project_to_io_boundary=logical_elements != elements,
+                )
                 # What the PLIO carries per iteration: the projected transfer (logical rows, columns
                 # rounded up to the microtile) or the whole tile; the host trims to io_tiling.
                 transfer = descriptor.pop('transfer_shape', None) or list(staging['tiling_dimension'])
