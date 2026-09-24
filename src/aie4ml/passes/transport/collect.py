@@ -8,122 +8,84 @@ from .model import Connection, EdgeEntry, Endpoint
 
 
 class TransportCollector:
-    """Expand logical tensor/view connectivity into semantic transport entries."""
+    """Expand the execution graph's connectivity, views included, into semantic transport entries.
+
+    It reads the execution IR only: entries, the values they read and write, and the graph boundary.
+    """
 
     def __init__(self, ctx):
         self.ctx = ctx
+        self.execution = ctx.ir.execution
 
-    def collect(self, nodes: List[OpNode]) -> List[EdgeEntry]:
-        return self._group_edges(self._collect_connections(nodes))
+    def collect(self) -> List[EdgeEntry]:
+        return self._group_edges(self._collect_connections())
 
-    def _collect_connections(self, nodes: List[OpNode]) -> List[Connection]:
+    def _collect_connections(self) -> List[Connection]:
         producers: Dict[str, Tuple[OpNode, str]] = {}
-
-        # collect producers
-        for n in nodes:
-            inst = self._kernel_inst(n)
-            if not inst:
-                continue
-            for t in getattr(n, 'outputs', []):
-                tname = t.name
-                pg = inst.ports.outputs[tname].group
-                producers[tname] = (n, pg)
+        for inst in self.execution:
+            for tname in inst.outputs:
+                producers[tname] = (inst.node, inst.ports.outputs[tname].group)
 
         connections: List[Connection] = []
         seen_outputs: set[str] = set()
-        graph_output_names = set(self.ctx.ir.logical.output_tensor_names)
+        graph_output_names = set(self.execution.graph_outputs)
         for name in graph_output_names:
-            tensor = self.ctx.ir.logical.tensors[name]
-            if tensor.producer is not None and tensor.producer.op_type in ('slice', 'split', 'concat'):
-                raise NotImplementedError(
-                    f'{name}: {tensor.producer.op_type}-backed graph outputs are not implemented.'
-                )
+            view = self.execution.values[name].view
+            if view is not None:
+                raise NotImplementedError(f'{name}: {view.kind}-backed graph outputs are not implemented.')
 
-        # inputs — skip parameter tensors
-        for n in nodes:
-            inst = self._kernel_inst(n)
-            if not inst:
-                continue
-            for t in getattr(n, 'inputs', []):
-                if t.is_parameter:
-                    continue
-                tname = t.name
+        for inst in self.execution:
+            n = inst.node
+            for item in inst.inputs:
+                tname = item.tensor
                 cg = inst.ports.inputs[tname].group
-                concat_view = self._concat_view_for_tensor(t)
+                concat_view = self._concat_view_for_tensor(tname)
                 if concat_view is not None:
-                    connections.extend(self._concat_connections(n, t, cg, concat_view, producers))
+                    connections.extend(self._concat_connections(n, tname, cg, concat_view, producers))
                     seen_outputs.add(tname)
-                    for item in concat_view.get('slices', []):
-                        seen_outputs.add(str(item['input']))
+                    for view_item in concat_view.get('slices', []):
+                        seen_outputs.add(str(view_item['input']))
                     continue
-                slice_view = self._slice_view_for_tensor(t)
+                slice_view = self._slice_view_for_tensor(tname)
                 if slice_view is not None:
-                    connections.append(self._slice_connection(n, t, cg, slice_view, producers))
+                    connections.append(self._slice_connection(n, tname, cg, slice_view, producers))
                     seen_outputs.add(tname)
                     seen_outputs.add(str(slice_view['source']))
                     continue
                 if tname in producers:
                     p, pg = producers[tname]
-                    connections.append(
-                        Connection(
-                            tname,
-                            Endpoint(p, tname, pg),
-                            Endpoint(n, tname, cg),
-                        )
-                    )
+                    connections.append(Connection(tname, Endpoint(p, tname, pg), Endpoint(n, tname, cg)))
                     seen_outputs.add(tname)
                 else:
-                    connections.append(
-                        Connection(
-                            tname,
-                            Endpoint(None, tname, 'graph_input'),
-                            Endpoint(n, tname, cg),
-                        )
-                    )
+                    connections.append(Connection(tname, Endpoint(None, tname, 'graph_input'), Endpoint(n, tname, cg)))
 
         # graph outputs
-        for n in nodes:
-            inst = self._kernel_inst(n)
-            if not inst:
-                continue
-            for t in getattr(n, 'outputs', []):
-                tname = t.name
+        for inst in self.execution:
+            for tname in inst.outputs:
                 if tname not in graph_output_names and tname in seen_outputs:
                     continue
                 pg = inst.ports.outputs[tname].group
-                connections.append(
-                    Connection(
-                        tname,
-                        Endpoint(n, tname, pg),
-                        None,
-                    )
-                )
+                connections.append(Connection(tname, Endpoint(inst.node, tname, pg), None))
 
         return connections
 
-    def _concat_view_for_tensor(self, tensor) -> Optional[Dict[str, Any]]:
-        producer = tensor.producer
-        if producer is None or producer.op_type != 'concat':
+    def _concat_view_for_tensor(self, tensor: str) -> Optional[Dict[str, Any]]:
+        view = self.execution.values[tensor].view
+        if view is None or view.kind != 'concat':
             return None
-        trait = producer.traits.get('concat_view')
-        if trait is None:
-            raise ValueError(f'{producer.name}: concat node is missing concat_view trait.')
-        data = dict(trait.data)
-        if data.get('output') != tensor.name:
-            raise ValueError(f'{producer.name}: concat_view output does not match tensor {tensor.name!r}.')
+        data = dict(view.data)
+        if data.get('output') != tensor:
+            raise ValueError(f'{view.node}: concat_view output does not match tensor {tensor!r}.')
         return data
 
-    def _slice_view_for_tensor(self, tensor) -> Optional[Dict[str, Any]]:
-        producer = tensor.producer
-        if producer is None or producer.op_type not in ('slice', 'split'):
+    def _slice_view_for_tensor(self, tensor: str) -> Optional[Dict[str, Any]]:
+        view = self.execution.values[tensor].view
+        if view is None or view.kind not in ('slice', 'split'):
             return None
-        trait = producer.traits.get('slice_view')
-        if trait is None:
-            raise ValueError(f'{producer.name}: {producer.op_type} node is missing slice_view trait.')
-        data = dict(trait.data)
-        matches = [item for item in data.get('slices', []) if item.get('output') == tensor.name]
+        data = dict(view.data)
+        matches = [item for item in data.get('slices', []) if item.get('output') == tensor]
         if len(matches) != 1:
-            raise ValueError(f'{producer.name}: slice_view does not define output tensor {tensor.name!r} exactly once.')
+            raise ValueError(f'{view.node}: slice_view does not define output tensor {tensor!r} exactly once.')
         return {
             'source': str(data['source']),
             'axis': int(data['axis']),
@@ -134,14 +96,14 @@ class TransportCollector:
     def _slice_connection(
         self,
         consumer: OpNode,
-        slice_tensor,
+        slice_tensor: str,
         consumer_group: str,
         slice_view: Dict[str, Any],
         producers: Dict[str, Tuple[OpNode, str]],
     ) -> Connection:
         source_name = str(slice_view['source'])
         producer, producer_group = self._kernel_source(
-            slice_tensor.name,
+            slice_tensor,
             source_name,
             producers,
             view_kind='slice',
@@ -154,7 +116,7 @@ class TransportCollector:
             int(slice_view['extent']),
         )
         return Connection(
-            slice_tensor.name,
+            slice_tensor,
             Endpoint(
                 producer,
                 source_name,
@@ -163,7 +125,7 @@ class TransportCollector:
                 offset_base=offset_base,
                 buffer_dimension=buffer_dimension,
             ),
-            Endpoint(consumer, slice_tensor.name, consumer_group),
+            Endpoint(consumer, slice_tensor, consumer_group),
         )
 
     def _slice_producer_ports(
@@ -205,34 +167,32 @@ class TransportCollector:
     def _concat_connections(
         self,
         consumer: OpNode,
-        concat_tensor,
+        concat_tensor: str,
         consumer_group: str,
         concat_view: Dict[str, Any],
         producers: Dict[str, Tuple[OpNode, str]],
     ) -> List[Connection]:
-        ports_by_source = self._concat_consumer_ports(consumer, concat_tensor.name, concat_view)
+        ports_by_source = self._concat_consumer_ports(consumer, concat_tensor, concat_view)
         conns: List[Connection] = []
         for item in concat_view.get('slices', []):
             source_name = str(item['input'])
             ports = tuple(ports_by_source.get(source_name, ()))
             if not ports:
                 continue
-            offset_base = self._concat_consumer_offset_base(
-                consumer, concat_tensor.name, concat_view, int(item['start'])
-            )
+            offset_base = self._concat_consumer_offset_base(consumer, concat_tensor, concat_view, int(item['start']))
             producer, producer_group = self._kernel_source(
-                concat_tensor.name,
+                concat_tensor,
                 source_name,
                 producers,
                 view_kind='concat',
             )
             conns.append(
                 Connection(
-                    concat_tensor.name,
+                    concat_tensor,
                     Endpoint(producer, source_name, producer_group),
                     Endpoint(
                         consumer,
-                        concat_tensor.name,
+                        concat_tensor,
                         consumer_group,
                         ports=ports,
                         offset_base=offset_base,
@@ -345,20 +305,19 @@ class TransportCollector:
         if source_name in producers:
             return producers[source_name]
 
-        tensor = self.ctx.ir.logical.tensors.get(source_name)
-        if tensor is None:
+        value = self.execution.values.get(source_name)
+        if value is None:
             raise ValueError(f'{logical_tensor}: {view_kind} source tensor {source_name!r} does not exist.')
-        if tensor.producer is not None and tensor.producer.is_placeholder:
+        if value.view is not None:
             raise NotImplementedError(
-                f'{logical_tensor}: chained view transport through {tensor.producer.op_type} '
-                f'{tensor.producer.name!r} is not implemented.'
+                f'{logical_tensor}: chained view transport through {value.view.kind} '
+                f'{value.view.node!r} is not implemented.'
             )
-        if tensor.producer is not None:
+        if value.producer is not None:
             raise RuntimeError(
-                f'{logical_tensor}: {view_kind} source producer {tensor.producer.name!r} has no resolved '
-                'execution output.'
+                f'{logical_tensor}: {view_kind} source producer {value.producer!r} has no resolved ' 'execution output.'
             )
-        if source_name not in self.ctx.ir.logical.input_tensor_names:
+        if source_name not in self.execution.graph_inputs:
             raise RuntimeError(
                 f'{logical_tensor}: {view_kind} source tensor {source_name!r} has no producer and is not a '
                 'declared graph input.'

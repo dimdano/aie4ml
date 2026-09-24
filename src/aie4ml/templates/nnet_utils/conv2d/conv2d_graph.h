@@ -9,6 +9,16 @@
 
 using namespace adf;
 
+// Pins one buffer port where the op contract lists it (see BufferLocation): ping and pong one per bank.
+template<typename PortT, typename LocationT>
+void conv2d_pin_buffer(PortT& port, const LocationT& at, int COL_START, int ROW_START)
+{
+  adf::location<adf::buffer>(port) = {
+    adf::bank(COL_START + at.col, ROW_START + at.row, at.bank0),
+    adf::bank(COL_START + at.col, ROW_START + at.row, at.bank1)
+  };
+}
+
 template<typename ConfigT>
 class conv2d_graph : public graph {
 public:
@@ -33,8 +43,20 @@ public:
       const unsigned pos = idx % CAS_LENGTH;
       const unsigned chain = idx / CAS_LENGTH;
       const bool reverse = ConfigT::ALTERNATING_HORIZONTAL && ((ROW_START + chain) % 2 != 0);
-      adf::location<adf::kernel>(kk[idx]) =
-        adf::tile(COL_START + (reverse ? CAS_LENGTH - 1 - pos : pos), ROW_START + chain);
+      const int tileCol = COL_START + (reverse ? CAS_LENGTH - 1 - pos : pos);
+      const int tileRow = ROW_START + chain;
+      adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
+      if constexpr (!STREAM_IO) {
+        // The Dense bank schedule: stack and bias in bank 1, weights in bank 2, and the activations
+        // where IN1/OUT1_BUFFER_LOCATIONS put them -- one copy per bank.
+        conv2d_pin_buffer(kk[idx].in[0], ConfigT::IN1_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
+        adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
+        adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
+        if (pos == CAS_LENGTH - 1) {
+          conv2d_pin_buffer(kk[idx].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[chain], COL_START, ROW_START);
+          adf::location<adf::buffer>(kk[idx].in[CAS_LENGTH == 1 ? 2 : 3]) = adf::bank(tileCol, tileRow, 1);
+        }
+      }
     }
   }
 

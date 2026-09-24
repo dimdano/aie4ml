@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_role, input_tensor_for_role
-from ...base import BufferLocation, OpImplFootprint
+from ...base import BufferLocation, OpImplFootprint, row_flow
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, parse_directives
@@ -102,7 +102,6 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
         return OpImplFootprint(
             width=int(config.parallelism.cas_length),
             height=int(config.parallelism.cas_num),
-            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
         )
 
     def buffer_locations(self, _node, config, anchor_row):
@@ -111,16 +110,15 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
         cas_length = int(config.parallelism.cas_length)
         outer = config.parallelism.contract == 'outer'
         for row in range(cas_num):
-            reverse = bool(config.alternating_horizontal and (int(anchor_row) + row) % 2)
+            flow = row_flow(config.alternating_horizontal, int(anchor_row) + row, cas_length)
             for pos in range(cas_length):
                 idx = row * cas_length + pos
-                tile_col = cas_length - 1 - pos if reverse else pos
+                tile_col = cas_length - 1 - pos if flow.reversed else pos
                 lhs_port = idx if outer else pos
-                locations.append(
-                    BufferLocation('inA', lhs_port, tile_col + 1 if reverse else tile_col - 1, row, (0, 3))
-                )
+                locations.append(BufferLocation('inA', lhs_port, tile_col + flow.input_col, row, (0, 3)))
                 locations.append(BufferLocation('inB', idx, tile_col, row, (1, 2)))
-            locations.append(BufferLocation('outC', row, 0 if reverse else cas_length - 1, row, (0, 3)))
+            last = 0 if flow.reversed else cas_length - 1
+            locations.append(BufferLocation('outC', row, last + flow.output_col, row, (0, 3)))
         return tuple(locations)
 
     def build_ports(self, node: OpNode, config: MatmulConfig):

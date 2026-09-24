@@ -38,39 +38,13 @@ struct conv2d_wire_reader {
   using data_t = typename ConfigT::data_t;
   static constexpr int BEAT = conv2d_wire<ConfigT>::BEAT;
 
-  aie::vector<data_t, BEAT> beat;
-  int used = BEAT;       // bytes of `beat` already taken (tail path)
-  int32 spare[2];        // the half beat a previous band did not use (block path)
+  // What a band leaves part-way through a beat belongs to the next band, so the beat state lives
+  // across calls, not inside one.
+  alignas(BEAT) data_t staged[BEAT];
+  int used = 0;    // bytes of `staged` already taken
+  int valid = 0;   // bytes of `staged` holding wire data
+  int32 spare[2];  // the half beat a previous band did not use (block path)
   bool held = false;
-
-  // One channel block from wherever the wire has reached, spanning a beat boundary when it must.
-  // Only the source offset varies, which a shift can serve; the destination is block-aligned.
-  inline void take_group(input_stream<data_t>* wire, data_t* target) {
-    constexpr int GROUP = conv2d_wire<ConfigT>::GROUP;
-    const int offset = used;  // where the block starts in `pair`, before the cursor moves on
-    aie::vector<data_t, 2 * BEAT> pair;
-    if (used + GROUP > BEAT) {
-      const aie::vector<data_t, BEAT> next = readincr_v<BEAT>(wire);
-      pair = aie::concat(beat, next);
-      beat = next;
-      used += GROUP - BEAT;
-    } else {
-      pair = aie::concat(beat, beat);
-      used += GROUP;
-    }
-    const auto words = aie::vector_cast<int32>(aie::shuffle_down(pair, offset));
-    int32* const out = reinterpret_cast<int32*>(target);
-    out[0] = words.get(0);
-    out[1] = words.get(1);
-  }
-
-  inline data_t take_byte(input_stream<data_t>* wire) {
-    if (used == BEAT) {
-      beat = readincr_v<BEAT>(wire);
-      used = 0;
-    }
-    return beat.get(used++);
-  }
 };
 
 template<typename ConfigT>
@@ -80,22 +54,12 @@ struct conv2d_wire_writer {
 
   int32 spare[2];  // a half beat this band could not fill (block path)
   bool held = false;
-  result_t staged[BEAT];  // bytes not yet sent (tail path)
-  int filled = 0;
+  alignas(BEAT) result_t carry[BEAT];  // an unfinished beat, waiting for the next band (tail path)
+  int carried = 0;
   int beats = 0;  // beats sent, which is how the last one is known
 
   inline void send(output_stream<result_t>* wire, const aie::vector<int32, BEAT / 4>& words) {
     writeincr(wire, aie::vector_cast<result_t>(words), ++beats == conv2d_wire<ConfigT>::OUT_BEATS);
-  }
-
-  // A beat's worth of bytes, one at a time: unlike a read, a write cannot shift its destination
-  // into place, so a channel tail leaves the whole pixel byte-wise.
-  inline void put_byte(output_stream<result_t>* wire, result_t value) {
-    staged[filled++] = value;
-    if (filled == BEAT) {
-      send(wire, aie::vector_cast<int32>(aie::load_v<BEAT>(staged)));
-      filled = 0;
-    }
   }
 };
 
@@ -129,7 +93,7 @@ static inline void conv2d_wire_rows(input_stream<typename ConfigT::data_t>* wire
     const int groups = loaded * ConfigT::IN_W * BLOCKS;
     int group = 0;
     if (reader.held && groups > 0) {
-      int32* const out = reinterpret_cast<int32*>(target(0, BLOCKS));
+      conv2d_word_t* const out = reinterpret_cast<conv2d_word_t*>(target(0, BLOCKS));
       out[0] = reader.spare[0];
       out[1] = reader.spare[1];
       reader.held = false;
@@ -139,8 +103,8 @@ static inline void conv2d_wire_rows(input_stream<typename ConfigT::data_t>* wire
       chess_prepare_for_pipelining
     {
       const auto words = aie::vector_cast<int32>(readincr_v<W::BEAT>(wire));
-      int32* const lo = reinterpret_cast<int32*>(target(group, BLOCKS));
-      int32* const hi = reinterpret_cast<int32*>(target(group + 1, BLOCKS));
+      conv2d_word_t* const lo = reinterpret_cast<conv2d_word_t*>(target(group, BLOCKS));
+      conv2d_word_t* const hi = reinterpret_cast<conv2d_word_t*>(target(group + 1, BLOCKS));
       lo[0] = words.get(0);
       lo[1] = words.get(1);
       hi[0] = words.get(2);
@@ -148,7 +112,7 @@ static inline void conv2d_wire_rows(input_stream<typename ConfigT::data_t>* wire
     }
     if (group < groups) {  // an odd group count: the other half of the beat is the next band's
       const auto words = aie::vector_cast<int32>(readincr_v<W::BEAT>(wire));
-      int32* const lo = reinterpret_cast<int32*>(target(group, BLOCKS));
+      conv2d_word_t* const lo = reinterpret_cast<conv2d_word_t*>(target(group, BLOCKS));
       lo[0] = words.get(0);
       lo[1] = words.get(1);
       reader.spare[0] = words.get(2);
@@ -156,15 +120,43 @@ static inline void conv2d_wire_rows(input_stream<typename ConfigT::data_t>* wire
       reader.held = true;
     }
   } else {
-    // Channels that do not fill a block: whole blocks still move as blocks, only the leftover
-    // channels go one by one, and the rest of their block keeps its zeros.
+    // A channel count that does not fill a block leaves a pixel's bytes at unaligned places in the
+    // wire, so they are placed one at a time -- but the stream read stays out of that loop. A read
+    // inside it stops the loop pipelining, and a byte then costs twenty-five cycles instead of one.
+    // Read first, place afterwards. Each loop is then free of the other's constraint: the read
+    // moves whole beats, and the placement uses constant offsets with no stream operation in
+    // sight. Interleaving them costs twenty to eighty cycles a byte instead of about one -- a
+    // conditional stream read stops the placement loop pipelining, and a flat byte index needs a
+    // divide by the channel count and another by the width for every byte.
+    static data_t wired[ConfigT::IN_ROWS * ConfigT::IN_W * ConfigT::CIN + W::BEAT];
+    const int bytes = loaded * ConfigT::IN_W * ConfigT::CIN;
+    int filled = 0;
+    while (reader.used < reader.valid && filled < bytes)  // what the band before left in a beat
+      wired[filled++] = reader.staged[reader.used++];
+    for (; filled + W::BEAT <= bytes; filled += W::BEAT)
+      chess_prepare_for_pipelining
+    {
+      aie::store_unaligned_v(wired + filled, readincr_v<W::BEAT>(wire));
+    }
+    if (filled < bytes) {  // the beat this band ends in carries on into the next one
+      aie::store_v(reader.staged, readincr_v<W::BEAT>(wire));
+      reader.used = 0;
+      reader.valid = W::BEAT;
+      while (filled < bytes) wired[filled++] = reader.staged[reader.used++];
+    }
+
+    const data_t* source = wired;
     for (int row = 0; row < loaded; ++row) {
-      for (int column = 0; column < ConfigT::IN_W; ++column) {
+      for (int column = 0; column < ConfigT::IN_W; ++column)
+        chess_prepare_for_pipelining
+      {
         data_t* const pixel = base + row * G::RB + column * 8;
         for (int block = 0; block < W::IN_BLOCKS; ++block)
-          reader.take_group(wire, pixel + block * G::CHB);
-        for (int channel = 0; channel < W::IN_TAIL; ++channel)
-          pixel[W::IN_BLOCKS * G::CHB + channel] = reader.take_byte(wire);
+          for (int lane = 0; lane < W::GROUP; ++lane)
+            pixel[block * G::CHB + lane] = source[block * W::GROUP + lane];
+        for (int lane = 0; lane < W::IN_TAIL; ++lane)
+          pixel[W::IN_BLOCKS * G::CHB + lane] = source[W::IN_BLOCKS * W::GROUP + lane];
+        source += ConfigT::CIN;
       }
     }
   }
@@ -195,13 +187,13 @@ static inline void conv2d_wire_band(output_stream<typename ConfigT::result_t>* w
     constexpr int GROUPS = W::BAND * ConfigT::OUT_W * BLOCKS;
     auto source = [&](int index) {
       const int pixel = index / BLOCKS;
-      return reinterpret_cast<const int32*>(image + (index % BLOCKS) * PLANE +
+      return reinterpret_cast<const conv2d_word_t*>(image + (index % BLOCKS) * PLANE +
                                             (pixel / ConfigT::OUT_W) * ROW + (pixel % ConfigT::OUT_W) * 8);
     };
     aie::vector<int32, W::BEAT / 4> beat;
     int group = 0;
     if (writer.held) {
-      const int32* const hi = source(0);
+      const conv2d_word_t* const hi = source(0);
       beat.set(writer.spare[0], 0);
       beat.set(writer.spare[1], 1);
       beat.set(hi[0], 2);
@@ -213,8 +205,8 @@ static inline void conv2d_wire_band(output_stream<typename ConfigT::result_t>* w
     for (; group + 1 < GROUPS; group += 2)
       chess_prepare_for_pipelining
     {
-      const int32* const lo = source(group);
-      const int32* const hi = source(group + 1);
+      const conv2d_word_t* const lo = source(group);
+      const conv2d_word_t* const hi = source(group + 1);
       beat.set(lo[0], 0);
       beat.set(lo[1], 1);
       beat.set(hi[0], 2);
@@ -222,22 +214,39 @@ static inline void conv2d_wire_band(output_stream<typename ConfigT::result_t>* w
       writer.send(wire, beat);
     }
     if (group < GROUPS) {  // an odd group count: the next band fills the rest of the beat
-      const int32* const lo = source(group);
+      const conv2d_word_t* const lo = source(group);
       writer.spare[0] = lo[0];
       writer.spare[1] = lo[1];
       writer.held = true;
     }
   } else {
+    // Gather first, write afterwards -- the mirror of how the input reads before it places. A
+    // stream write inside the gather loop stops it pipelining, and the band's bytes do not
+    // divide into whole beats, so the remainder waits here for the next band.
+    static result_t wired[W::BAND * ConfigT::OUT_W * ConfigT::COUT + W::BEAT];
+    for (int byte = 0; byte < writer.carried; ++byte) wired[byte] = writer.carry[byte];
+    int filled = writer.carried;
     for (int row = 0; row < W::BAND; ++row) {
-      for (int column = 0; column < ConfigT::OUT_W; ++column) {
+      for (int column = 0; column < ConfigT::OUT_W; ++column)
+        chess_prepare_for_pipelining
+      {
         const result_t* const pixel = image + row * ROW + column * 8;
         for (int block = 0; block < W::OUT_BLOCKS; ++block)
-          for (int channel = 0; channel < W::GROUP; ++channel)
-            writer.put_byte(wire, pixel[block * PLANE + channel]);
-        for (int channel = 0; channel < W::OUT_TAIL; ++channel)
-          writer.put_byte(wire, pixel[W::OUT_BLOCKS * PLANE + channel]);
+          for (int lane = 0; lane < W::GROUP; ++lane)
+            wired[filled + block * W::GROUP + lane] = pixel[block * PLANE + lane];
+        for (int lane = 0; lane < W::OUT_TAIL; ++lane)
+          wired[filled + W::OUT_BLOCKS * W::GROUP + lane] = pixel[W::OUT_BLOCKS * PLANE + lane];
+        filled += ConfigT::COUT;
       }
     }
+    int sent = 0;
+    for (; sent + W::BEAT <= filled; sent += W::BEAT)
+      chess_prepare_for_pipelining
+    {
+      writer.send(wire, aie::vector_cast<int32>(aie::load_unaligned_v<W::BEAT>(wired + sent)));
+    }
+    writer.carried = filled - sent;  // the beat this band ends in belongs to the next one too
+    for (int byte = 0; byte < writer.carried; ++byte) writer.carry[byte] = wired[sent + byte];
   }
 }
 

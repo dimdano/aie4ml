@@ -35,7 +35,9 @@ def describes_natural_order(desc: Dict[str, Any]) -> bool:
         if step is None:
             if chunk[dim] != extent:
                 return False
-        elif int(step['stride']) != 1 or int(step['wrap']) * chunk[dim] != extent:
+        elif int(step['wrap']) * chunk[dim] != extent:
+            return False
+        elif int(step['wrap']) > 1 and int(step['stride']) != 1:  # one tile never uses its stride
             return False
     return sorted(walked) == list(walked)
 

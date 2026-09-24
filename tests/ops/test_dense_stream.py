@@ -115,6 +115,8 @@ def test_stream_dense_plan_has_no_buffers_or_dma(stream_dense_model, tmp_path, p
         ('lo_aie.out1[0]', 'ofm[1]'),
         ('lo_aie.out1[1]', 'ofm[2]'),
     }
+    # A kernel-to-kernel stream edge has no buffer to share or copy.
+    assert {edge['realization'] for edge in plan['direct_edges'] if 'realization' in edge} == {'stream'}
 
 
 def test_stream_dense_io_ports_carry_padded_tiles(stream_dense_model, tmp_path):

@@ -45,6 +45,11 @@ def memtile_staging_failure(ctx, entry) -> str | None:
                 f'{endpoint.node.name}.{endpoint.group} stages an inner-blocked buffer, which memtile '
                 'sharding does not implement'
             )
+        if 'transfer_bytes' in desc:
+            return (
+                f'{endpoint.node.name}.{endpoint.group} frames each inference as a padded transfer, which '
+                'memtile staging does not implement'
+            )
     return None
 
 

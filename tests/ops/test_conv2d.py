@@ -4,7 +4,19 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-from helpers import PART, TensorProto, assert_x86_matches_onnx, helper, lower, make_model, numpy_helper, qdq
+from helpers import (
+    PART,
+    TensorProto,
+    assert_aie_matches_onnx,
+    assert_x86_matches_onnx,
+    direct_edges,
+    helper,
+    lower,
+    make_model,
+    numpy_helper,
+    output_staging,
+    qdq,
+)
 
 AIE1_PART = 'xcvp2802-vsva5601-2MHP-e-S'
 # 24 channels = 3 blocks, so one model covers a 3-chain split and the first/middle/last cascade;
@@ -20,7 +32,7 @@ def _qparams(prefix: str, *, frac: int, elem_type: int = TensorProto.INT8) -> li
     ]
 
 
-def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed):
+def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed, stride=1):
     """Conv(x, W, b) [-> Relu] -> Q -> DQ with int8 weights and an int32 bias in the accumulator scale."""
     rng = np.random.default_rng(seed)
     w = rng.integers(-6, 6, size=(cout, cin // groups, k, k), dtype=np.int8)
@@ -46,6 +58,7 @@ def _conv(nodes, inits, x, out, name, cin, cout, k, *, pad, groups=1, relu, seed
             name=name,
             kernel_shape=[k, k],
             pads=[pad, pad, pad, pad],
+            strides=list(stride) if isinstance(stride, tuple) else [stride, stride],
             group=groups,
         )
     )
@@ -126,6 +139,48 @@ def _frame_model(channels_in=CIN, channels_out=C3, name='conv_frame'):
         nodes=nodes,
         inputs=[('x_q', TensorProto.INT8, [1, H, W, channels_in])],
         outputs=[('y', TensorProto.FLOAT, [1, H, W, channels_out])],
+        initializers=inits,
+    )
+
+
+def _strided_model(stride=2, k=3, channels_in=8, channels_out=8, size=16, name='conv_strided', pad=0):
+    """A strided conv reading the graph boundary.
+
+    A strided window reads every stride-th column, so the frame keeps its columns grouped by that
+    residue. The boundary carries the tensor in plain order and a retiler builds the frame.
+    """
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'b', channels_in, channels_out, k, pad=pad, relu=True, seed=41, stride=stride)
+    nodes.append(helper.make_node('Transpose', ['a'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    stride_h, stride_w = stride if isinstance(stride, tuple) else (stride, stride)
+    out_h, out_w = (size + 2 * pad - k) // stride_h + 1, (size + 2 * pad - k) // stride_w + 1
+    return make_model(
+        name,
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, size, size, channels_in])],
+        outputs=[('y', TensorProto.FLOAT, [1, out_h, out_w, channels_out])],
+        initializers=inits,
+    )
+
+
+def _beat_carry_model():
+    """6x6 with Cin=4 and Cout=12, where a band is not a whole number of stream beats.
+
+    An 8-wide image never exercises that: four rows of eight pixels are a whole number of beats
+    whatever the channel count, so the wire's carry between bands stays unused. Six is.
+    """
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'b', 4, 12, 3, pad=1, relu=True, seed=31)
+    nodes.append(helper.make_node('Transpose', ['a'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    return make_model(
+        'conv_beat_carry',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, 6, 6, 4])],
+        outputs=[('y', TensorProto.FLOAT, [1, 6, 6, 12])],
         initializers=inits,
     )
 
@@ -353,7 +408,7 @@ def test_stream_conv_carries_the_logical_tensor(tmp_path):
     assert ('ifm[0]', 'b_aie.in1[0]') in {(e['source'], e['target']) for e in plan['direct_edges']}
 
 
-def test_conv_refuses_stride(tmp_path):
+def test_conv_refuses_dilation(tmp_path):
     nodes: list = []
     inits: list = []
     _start(nodes, inits)
@@ -363,11 +418,13 @@ def test_conv_refuses_stride(tmp_path):
         *_qparams('co', frac=FRAC),
     ]
     nodes.append(helper.make_node('DequantizeLinear', ['w_q', 'w_scale', 'w_zp'], ['w']))
-    nodes.append(helper.make_node('Conv', ['x_nchw', 'w'], ['cv'], kernel_shape=[3, 3], strides=[2, 2], name='conv'))
+    nodes.append(helper.make_node('Conv', ['x_nchw', 'w'], ['cv'], kernel_shape=[3, 3], dilations=[2, 2], name='conv'))
     qdq(nodes, 'cv', 'a', 'co')
-    _head(nodes, inits, 'a', 3 * 3 * C3, seed=9)
-    with pytest.raises(NotImplementedError, match='strides'):
-        lower(_model('conv_stride', nodes, inits), tmp_path, part=AIE1_PART)
+    _head(nodes, inits, 'a', 4 * 4 * C3, seed=9)
+    # A dilated window skips input pixels the way a strided one skips outputs, but it does not
+    # group into polyphase classes the same way, so it is still refused rather than misread.
+    with pytest.raises(NotImplementedError, match='dilations'):
+        lower(_model('conv_dilation', nodes, inits), tmp_path, part=AIE1_PART)
 
 
 # --------------------------------------------------------------------------- #
@@ -412,6 +469,329 @@ def test_stream_conv_moves_partial_channel_blocks(tmp_path):
         frac=FRAC,
         max_code_diff=1,
         part=AIE1_PART,
+    )
+
+
+@pytest.mark.requires_vitis
+def test_stream_conv_sends_partial_channel_blocks(tmp_path):
+    """Cout=11 is one whole channel block and a tail, so a band's bytes do not divide into beats
+    and the writer carries the remainder into the next band.
+
+    This checks the ordering and that carry. It cannot check the alignment the path also needs:
+    x86 loads unaligned addresses happily, so only a native run sees that.
+    """
+    feed = np.random.default_rng(4).integers(-40, 40, size=(1, H, W, C1), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _frame_model(channels_in=C1, channels_out=11, name='conv_send_tail'),
+        {'x_q': feed},
+        STREAM_DIRECTIVES,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=1,
+        part=AIE1_PART,
+    )
+
+
+def _strided_chain_model(size=16, first_stride=1, name='conv_strided_chain'):
+    """A same-padded conv, 8 -> 16 channels, feeding a stride-2 one: the strided conv reads another
+    kernel's frame, two channel blocks of it."""
+    nodes: list = []
+    inits: list = []
+    _start(nodes, inits)
+    _conv(nodes, inits, 'x_nchw', 'a', 'first', 8, 16, 3, pad=1, relu=True, seed=5, stride=first_stride)
+    _conv(nodes, inits, 'a', 'b', 'second', 16, 8, 3, pad=1, relu=True, seed=6, stride=2)
+    nodes.append(helper.make_node('Transpose', ['b'], ['y'], perm=[0, 2, 3, 1], name='to_nhwc'))
+    out = ((size - 1) // first_stride) // 2 + 1
+    return make_model(
+        name,
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [1, size, size, 8])],
+        outputs=[('y', TensorProto.FLOAT, [1, out, out, 8])],
+        initializers=inits,
+    )
+
+
+def test_strided_conv_retiles_its_producers_frame(tmp_path):
+    """A producer writes whole register tiles, which span every residue group, so a retiler -- a
+    kernel of its own in the execution graph, not in the model -- reads the frame as written and
+    hands the conv the grouped one. The execution graph alone says so; the logical graph keeps the
+    model's two convs. The frame's hand-over must be shared memory, so both of its ports are pinned
+    to one memory; the producer's is an ordinary direct edge."""
+    from aie4ml.ir import ExecutionInput
+
+    ctx = lower(_strided_chain_model(), tmp_path, part=AIE1_PART)
+    assert [inst.name for inst in ctx.ir.execution] == ['first_aie', 'second_aie_retile', 'second_aie']
+    assert [node.name for node in ctx.ir.logical if not node.is_placeholder] == ['first_aie', 'second_aie']
+    logical = next(node for node in ctx.ir.logical if node.name == 'second_aie')
+    assert [t.name for t in logical.inputs if t.data is None] == ['first_relu']  # untouched by lowering
+
+    retile, second = ctx.ir.execution.get('second_aie_retile'), ctx.ir.execution.get('second_aie')
+    frame = second.variant.retiled_frame(second.node)
+    assert retile.inputs == (ExecutionInput('first_relu', 'lhs', shared_memory=False),)
+    assert second.inputs == (ExecutionInput(frame, 'lhs', shared_memory=True),)
+    assert ctx.ir.execution.values[frame].producer == 'second_aie_retile'
+    assert {('first_aie', 'second_aie_retile'), ('second_aie_retile', 'second_aie')} <= direct_edges(ctx)
+
+    # The retiler reads the producer's frame as written; only a retiler writes a column-grouped one.
+    write = output_staging(ctx, 'first_aie')
+    read = retile.variant.describe_input_staging(retile.node, retile.config, 'first_relu', 0)
+    assert write['tile_traversal'] == read['tile_traversal'] and write['offset'] == read['offset']
+    assert 'column_phases' not in write and 'transfer_bytes' not in read
+    assert second.variant.describe_input_staging(second.node, second.config, frame, 0)['column_phases'] == 2
+    assert not second.variant.build_template_params(second.node, second.config, {'row': 0, 'col': 0})['fills_border']
+
+    def pinned(inst, group):
+        where = ctx.ir.physical.placements[inst.name]
+        return {
+            (where['col'] + loc.rel_col, where['row'] + loc.rel_row, loc.banks)
+            for loc in inst.variant.buffer_locations(inst.node, inst.config, where['row'])
+            if loc.port_group == group
+        }
+
+    assert pinned(retile, 'out1') == pinned(second, 'in1') != set()
+
+
+def test_shared_edge_needs_room_for_one_buffer(tmp_path):
+    """Pinning the strided conv right beside its producer puts the conv's input memory in the
+    producer's tile, where no buffer of theirs is shared, and leaves no tile for the retiler whose
+    frame it must share: placement refuses rather than accept a DMA hop."""
+    directives = {'first': {'placement': {'col': 7, 'row': 0}}, 'second': {'placement': {'col': 8, 'row': 0}}}
+    with pytest.raises(ValueError, match='conflicts with another anchor'):
+        lower(_strided_chain_model(), tmp_path, directives, part=AIE1_PART)
+
+
+@pytest.mark.requires_vitis
+@pytest.mark.parametrize(
+    'stride,k,cin,size', [(2, 3, 8, 16), (2, 7, 3, 18), (3, 3, 8, 15)], ids=['s2k3', 's2k7-lowc', 's3k3']
+)
+def test_strided_conv_matches_onnx(tmp_path, stride, k, cin, size):
+    """The retiler groups the frame's columns by residue and the conv reads them as it reads a
+    dense window, so a strided conv must be exact for every stride, kernel and channel count.
+
+    Six different inputs, because two of these tensors are not whole 16-byte units and travel with
+    padding after them: a transfer framed wrongly shifts every later inference, which repeating one
+    input would hide.
+    """
+    feeds = np.random.default_rng(21).integers(-40, 40, size=(6, 1, size, size, cin), dtype=np.int8)
+    assert_x86_matches_onnx(
+        _strided_model(stride=stride, k=k, channels_in=cin, size=size),
+        {'x_q': feeds},
+        {},
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=AIE1_PART,
+        iterations=6,
+        per_iteration=True,
+    )
+
+
+@pytest.mark.requires_vitis
+def test_vertical_only_stride_takes_the_plain_boundary(tmp_path):
+    """A stride along rows only skips whole frame rows, which the conv does by itself: no column
+    grouping, so no retiler, and the boundary is the one an unstrided conv reads."""
+    model = _strided_model(stride=(2, 1), k=3, channels_in=8, size=16, name='conv_row_stride')
+    entry = lower(model, tmp_path / 'lowered', part=AIE1_PART).ir.execution.get('b_aie')
+    assert not entry.variant.retiles_input(entry.config)
+    assert entry.ports.inputs['x_q'].endpoints == (('kk[0].in[0]',),)
+
+    feeds = np.random.default_rng(29).integers(-40, 40, size=(3, 1, 16, 16, 8), dtype=np.int8)
+    assert_x86_matches_onnx(
+        model,
+        {'x_q': feeds},
+        {},
+        tmp_path / 'numeric',
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=AIE1_PART,
+        iterations=3,
+        per_iteration=True,
+    )
+
+
+def _single_channel_strided_conv():
+    """One input channel, 18x18, 7x7 stride 2, five filters: the conv reads 17 of the 18 rows, 306
+    bytes, not whole units."""
+    return _strided_model(stride=2, k=7, channels_in=1, channels_out=5, size=18, name='conv_single_channel_s2')
+
+
+def test_strided_boundary_conv_is_retiled(tmp_path):
+    """The boundary carries the rows the conv reads, in plain order, and a retiler builds the frame.
+    Those rows are 306 bytes and one inference moves 320: the two are kept apart."""
+    from aie4ml.simulation import build_io_layout
+
+    ctx = lower(_single_channel_strided_conv(), tmp_path, part=AIE1_PART)
+    retile, conv = ctx.ir.execution.get('b_aie_retile'), ctx.ir.execution.get('b_aie')
+    assert retile.op_type == 'frame_retile' and conv.variant.retiles_input(conv.config)
+    assert list(retile.ports.inputs) == ['x_q'] and 'x_q' not in conv.ports.inputs
+
+    port = build_io_layout(ctx).inputs['x_q'][0]
+    assert port.numpy_tile_shape == (1, 17, 18, 1)  # stride 2 never reaches row 18; nothing around them
+    assert port.transfer_bytes == 320
+    assert port.staging['storage_layout'] == 'linear'
+
+
+def _banded_strided_conv():
+    """18x18, 3x3 stride 2, padded: nine output rows, three bands of three."""
+    return _strided_model(stride=2, k=3, channels_in=8, channels_out=8, size=18, name='conv_banded_s2', pad=1)
+
+
+BANDS = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 3}}}
+
+
+def test_strided_conv_splits_into_row_bands(tmp_path):
+    """Each row band gets a retiler kernel of its own, beside the band's conv tile, reading only the rows
+    of the tensor its window covers -- the first band's window opens on the top pad, which that kernel
+    builds -- and handing its frame over as one shared buffer on every row. A channel split is refused."""
+    from aie4ml.op_impls.families.conv2d.config import RetileWindow
+
+    ctx = lower(_banded_strided_conv(), tmp_path / 'bands', BANDS, part=AIE1_PART)
+    retile, conv = ctx.ir.execution.get('b_aie_retile'), ctx.ir.execution.get('b_aie')
+    # Output rows 3b..3b+2 read frame rows 6b..6b+6: tensor rows 6b-1..6b+5, clipped to the tensor.
+    assert retile.config.windows == (
+        RetileWindow(first_row=0, rows=6, origin_row=1, transfer_bytes=864),
+        RetileWindow(first_row=5, rows=7, origin_row=0, transfer_bytes=1008),
+        RetileWindow(first_row=11, rows=7, origin_row=0, transfer_bytes=1008),
+    )
+    reads = [conv.variant.describe_input_staging(conv.node, conv.config, conv.inputs[0].tensor, b) for b in range(3)]
+    writes = [retile.variant.describe_output_staging(retile.node, retile.config, '', b) for b in range(3)]
+    assert [d['offset'] for d in reads] == [d['offset'] for d in writes]
+    assert [d['offset'][2] for d in reads] == [0, 6, 12]  # three output rows a band, stride 2
+    edges = [e for e in ctx.ir.physical.plan['direct_edges'] if e['tensor'] == conv.inputs[0].tensor]
+    assert [e['realization'] for e in edges] == ['shared_memory'] * 3
+
+    two_blocks = _strided_model(stride=2, k=3, channels_in=8, channels_out=16, size=16)
+    with pytest.raises(NotImplementedError, match='only into row bands'):
+        lower(two_blocks, tmp_path / 'inner', {'b': {'parallelism': {'cas_num': 2}}}, part=AIE1_PART)
+
+
+def test_physical_plan_proves_each_shared_edge(tmp_path):
+    """A shared edge is proven before any code exists: the verifier re-derives it from the finished
+    plan and refuses one whose ports no longer name one memory, or that a DMA access pattern would
+    turn into a copy."""
+    from aie4ml.passes.verify_physical import verify_physical
+
+    ctx = lower(_strided_chain_model(), tmp_path, part=AIE1_PART)
+    verify_physical(ctx)
+    edges = {e['tensor']: e for e in ctx.ir.physical.plan['direct_edges']}
+    assert edges[ctx.ir.execution.get('second_aie').inputs[0].tensor]['realization'] == 'shared_memory'
+    # Not required, but placement put the producer where its output and the retiler's input coincide.
+    assert edges['first_relu']['realization'] == 'shared_memory'
+
+    ctx.ir.physical.plan['kernel_read_accesses'].append({'endpoint': 'second_aie.kk[0].in[0]'})
+    with pytest.raises(RuntimeError, match='DMA access pattern'):
+        verify_physical(ctx)
+    ctx.ir.physical.plan['kernel_read_accesses'].pop()
+
+    ctx.ir.physical.placements['second_aie_retile']['row'] += 1
+    with pytest.raises(RuntimeError, match='not one memory'):
+        verify_physical(ctx)
+
+
+def test_generated_graph_pins_the_frame(tmp_path):
+    """The frame's hand-over is one buffer because both ops' graphs pin their ends of it to the same
+    banks -- the retiler's output and the conv's input, banks 0 and 3 of the retiler's tile -- so the
+    compiler places that one buffer or refuses. Nothing is pinned from outside the op graphs, and the
+    build needs no check of its own afterwards."""
+    from aie4ml import from_onnx
+
+    config = {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 1, 'Iterations': 1}, 'LayerDirectives': {}}
+    from_onnx(_strided_chain_model(), config, output_dir=tmp_path, project_name='strided').write()
+    params = (tmp_path / 'src' / 'parameters.h').read_text()
+    assert '{ 0, 0, 2, 0, 3 }' in params  # the retiler's frame: its own tile
+    assert '{ -1, 0, 2, 0, 3 }' in params  # the conv's input: its west neighbour, the retiler
+    assert 'location<buffer>' not in (tmp_path / 'src' / 'graph_plan.h').read_text()
+    assert 'python3' not in (tmp_path / 'Makefile').read_text()
+
+
+def test_frame_larger_than_a_bank_is_refused(tmp_path):
+    """Each activation copy sits in one bank, as for Dense: AIE-MLv2's 16x16x16 frame is 19.6 KB, over its
+    16 KB bank, so the layer must be split rather than placed some other way."""
+    with pytest.raises(ValueError, match='memory bank holds'):
+        lower(_strided_chain_model(), tmp_path, part='vek385_base')
+
+
+def _compiled_buffers(project, port: str):
+    """The buffers the AIE compiler gave one kernel port, from its own report."""
+    import json
+
+    report = json.loads((project / 'Work' / 'reports' / 'compiler_report.json').read_text())
+    ids = [i for i, info in report['portInstances'].items() if info['qualifiedName'].endswith(f'.{port}')]
+    assert len(ids) == 1, port
+    return sorted(b['generatedName'] for b in report['mapping']['portInstanceMapping'][ids[0]]['bufferInfo'])
+
+
+@pytest.mark.requires_vitis
+def test_strided_conv_matches_onnx_on_the_core(tmp_path):
+    """Two stride-2 convs through aiesim, each behind a retiler: the first reads the boundary, an
+    odd-width tensor whose rows start off the vector grid and whose 1800 bytes travel framed to
+    1808; the second reads the first's two-block frame. Six different inputs, exact, and every
+    hand-over but the boundary's is one buffer in shared memory."""
+    feeds = np.random.default_rng(23).integers(-40, 40, size=(6, 1, 15, 15, 8), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _strided_chain_model(size=15, first_stride=2, name='conv_strided_pair'),
+        {'x_q': feeds},
+        {},
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=AIE1_PART,
+        iterations=6,
+        per_iteration=True,
+    )
+    # A regression check on the compiler, not a gate the design relies on: each hand-over is one buffer.
+    for writer, reader in (
+        ('first_aie_retile.kk[0].out[0]', 'first_aie.kk[0].in[0]'),
+        ('second_aie_retile.kk[0].out[0]', 'second_aie.kk[0].in[0]'),
+        ('first_aie.kk[0].out[0]', 'second_aie_retile.kk[0].in[0]'),  # not required; placement put them side by side
+    ):
+        assert _compiled_buffers(tmp_path / 'proj', writer) == _compiled_buffers(tmp_path / 'proj', reader)
+
+
+@pytest.mark.requires_vitis
+def test_banded_strided_conv_matches_onnx_on_the_core(tmp_path):
+    """Three row bands through aiesim, each behind its own retiler kernel -- the first band's window
+    opening on the top pad, the middle band on AIE's odd row -- over six different inputs, exact."""
+    feeds = np.random.default_rng(29).integers(-40, 40, size=(6, 1, 18, 18, 8), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _banded_strided_conv(),
+        {'x_q': feeds},
+        BANDS,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=AIE1_PART,
+        iterations=6,
+        per_iteration=True,
+    )
+
+
+@pytest.mark.requires_vitis
+def test_stream_conv_matches_onnx_on_the_core(tmp_path):
+    """One shape on aiesim, twice over, as the smoke test for what x86 cannot see.
+
+    x86 loads unaligned addresses happily and schedules nothing, so alignment and pipelining
+    failures pass there; both have reached the benchmark from a green suite. The shape is picked to
+    touch what the x86 tests miss in one build: an input and an output channel count that each
+    leave a partial block, a band whose bytes do not divide into beats, and a second inference over
+    whatever the first one left behind.
+    """
+    feed = np.random.default_rng(15).integers(-40, 40, size=(1, 6, 6, 4), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _beat_carry_model(),
+        {'x_q': feed},
+        STREAM_DIRECTIVES,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=1,
+        part=AIE1_PART,
+        iterations=2,
     )
 
 

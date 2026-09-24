@@ -3,13 +3,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from ..ir.graph import OpImplInstance, OpNode
+from ..ir.graph import ExecutionValue, OpImplInstance, OpNode
 from .common_types import PORT_KIND_STREAM, PortMap
 
 
 @dataclass(frozen=True)
 class BufferLocation:
-    """One transport-visible buffer's footprint-relative location."""
+    """One transport-visible buffer's footprint-relative location.
+
+    Only an op's input and output buffers -- what a direct edge connects, per port -- are listed;
+    weights, stacks and cascade resources stay the op graph's own business. The op's graph pins every
+    listed buffer where it says, ping and pong one per bank, so each copy must fit one bank.
+    """
 
     port_group: str
     port: int
@@ -27,6 +32,52 @@ class BufferLocation:
             or any(bank not in range(4) for bank in self.banks)
         ):
             raise ValueError(f'Invalid ADF bank set {self.banks}.')
+
+
+@dataclass(frozen=True)
+class RowFlow:
+    """How one row of an op's kernels hands activations on, from the device's memory reach.
+
+    Data flows left to right, except along a cascade on a row whose cascade runs right to left (odd
+    rows on AIE), where the chain is reversed. Each hand-over buffer lives in the neighbouring tile
+    both kernels reach: the upstream one where the reading kernel reaches it, otherwise the reading
+    kernel's own. `input_col` offsets the tile holding a kernel's input from that kernel's column;
+    `output_col` offsets the tile holding a chain's output from its last kernel's column.
+    """
+
+    reversed: bool
+    input_col: int
+    output_col: int
+
+
+def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow:
+    """The flow on absolute row `row`. On AIE (`alternating_horizontal`) odd-row cores reach their
+    east neighbour's memory and even-row cores their west's; on AIE-ML every core reaches west."""
+    reaches_east = bool(alternating_horizontal and int(row) % 2)
+    if reaches_east and int(cas_length) > 1:
+        return RowFlow(reversed=True, input_col=1, output_col=0)
+    if reaches_east:
+        return RowFlow(reversed=False, input_col=0, output_col=1)
+    return RowFlow(reversed=False, input_col=-1, output_col=0)
+
+
+@dataclass(frozen=True)
+class LayoutConversion:
+    """A kernel graph that re-lays one input before the op reads it.
+
+    The op reads `target`, a value that exists only in the execution graph and that its ports bind,
+    instead of `source`; `variant` builds the converting graph from `config`, and `name` is that
+    graph's instance name. `shared_memory` requires the hand-over to the op to pass through a
+    memory both kernels reach, never a DMA -- a constraint the converter sets when a copy would be
+    illegal or is not accounted for, not merely preferred.
+    """
+
+    name: str
+    source: str
+    target: str
+    variant: 'OpImplVariant'
+    config: Any
+    shared_memory: bool
 
 
 @dataclass(frozen=True)
@@ -70,10 +121,23 @@ class OpImplVariant:
     def build_template_params(self, _node: OpNode, config: Any, _placement: Dict[str, int]) -> Dict[str, Any]:
         return config
 
+    def input_conversions(
+        self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
+    ) -> Tuple['LayoutConversion', ...]:
+        """Inputs this op reads in a layout their source does not write, each converted by a kernel
+        graph of its own that the layout legalization pass inserts ahead of the op.
+
+        `sources` maps each tensor the op reads to its execution value -- what actually writes it
+        (a kernel, a folded view, or the graph boundary), which decides the layout it arrives in.
+        """
+        return ()
+
     def buffer_locations(self, _node: OpNode, _config: Any, _anchor_row: int) -> Tuple[BufferLocation, ...]:
         """Return transport-visible buffers relative to an op anchor.
 
-        Repeated group/port pairs describe multicast graph ports.
+        Repeated group/port pairs describe multicast graph ports. An edge that must pass through
+        shared memory needs both of its ports listed, at the same place: placement accepts only
+        positions where they coincide.
         """
         return ()
 

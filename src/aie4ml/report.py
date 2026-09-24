@@ -330,15 +330,16 @@ def _kernel_cycles(project: Path, vitis: Dict[str, Any]) -> List[Dict[str, Any]]
             continue
         fields = run.split()
         try:
-            calls, total = int(fields[0]), int(fields[1])
+            calls, total = int(fields[0]), int(fields[6])
         except (IndexError, ValueError):
             continue
         match = _KERNEL_RE.search(run)
         kernel = match.group(2)[: int(match.group(1))] if match else '?'
-        # Columns are: calls, cycles, %-of-report, min, avg, max. The kernel's own share of
-        # the simulated window is its utilisation; the rest is time in main, i.e. blocked on
-        # an input buffer. Both come from the same total, so only one is worth reporting.
-        busy = fields[2].rstrip('%') if len(fields) > 2 else ''
+        # Columns come in two groups of six: the function alone, then the function with its
+        # callees. A kernel that moves its data through helper functions does that work too, so
+        # the second group is the kernel's cost -- reading the first would charge its callees to
+        # nobody and leave the difference looking like time blocked on a port.
+        busy = fields[7].rstrip('%') if len(fields) > 7 else ''
         tile = path.stem.replace('profile_funct_', '')
         rows.append(
             {
@@ -514,11 +515,16 @@ def _design(project: Path, vitis: Dict[str, Any]) -> Dict[str, Any]:
         return None
 
     plan = find(doc, 'direct_edges') or {}
-    aie_tiles = sum(
-        int((e.get('config') or {}).get('parallelism', {}).get('cas_num', 1))
-        * int((e.get('config') or {}).get('parallelism', {}).get('cas_length', 1))
-        for e in doc.get('execution', [])
-    )
+    placements = (doc.get('physical') or {}).get('placements') or {}
+    if placements and all('width' in p for p in placements.values()):
+        # What placement reserved, which counts tiles an op adds beyond its compute tiles.
+        aie_tiles = sum(int(p['width']) * int(p['height']) for p in placements.values())
+    else:  # a plan written before placements recorded their size
+        aie_tiles = sum(
+            int((e.get('config') or {}).get('parallelism', {}).get('cas_num', 1))
+            * int((e.get('config') or {}).get('parallelism', {}).get('cas_length', 1))
+            for e in doc.get('execution', [])
+        )
     return {
         'aie_tiles': aie_tiles,
         'memtile_buffers': len(plan.get('buffers', [])),

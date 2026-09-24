@@ -52,6 +52,19 @@ class IOPortLayout:
         return [int(x) for x in self.staging['offset']]
 
     @property
+    def transfer_bytes(self) -> int:
+        """Bytes one inference moves through this port: its tile, or more when the port frames the
+        tile in whole transfer units. The padding follows the tile and is not part of the tensor."""
+        element = int(self.dtype.width) // 8
+        tile = int(np.prod(self.numpy_tile_shape)) * element
+        framed = int(self.staging.get('transfer_bytes', tile))
+        if framed < tile or framed % element:
+            raise ValueError(
+                f'{self.tensor}: a {framed}-byte transfer cannot carry a {tile}-byte tile of {element}-byte elements.'
+            )
+        return framed
+
+    @property
     def logical_origin(self) -> List[int]:
         # Where this port's window starts in the tensor, signed: negative means it opens on
         # padding, before the data (a conv frame's zero border).
@@ -186,10 +199,10 @@ def write_input_files(output_dir: Path, layout: IOLayout, prepared_inputs: Dict[
         data = prepared_inputs[tensor]
         for p in ports:
             vals_per_line = max(1, int(plio_width_bits) // int(p.dtype.width))
-            tile = _extract_port_tile(data, p)
+            values = _framed(_extract_port_tile(data, p), p)
             file_path = data_dir / f'ifm_c{p.port}.txt'
             with open(file_path, 'w') as handle:
-                _write_values(handle, tile.flatten(order='C'), vals_per_line)
+                _write_values(handle, values, vals_per_line)
 
 
 def _write_values(stream, values, vals_per_line):
@@ -249,6 +262,17 @@ def _quantize_to_int(data: np.ndarray, dtype: AIEDataType) -> np.ndarray:
     integers = rounded.astype(np.int64, copy=False)
     clipped = handle_overflow(integers, int(dtype.width), bool(dtype.signed), dtype.saturation)
     return clipped.astype(dtype_for_precision(dtype.width, dtype.signed), copy=False)
+
+
+def _framed(tiles: np.ndarray, port: IOPortLayout) -> np.ndarray:
+    """The values a port moves, one transfer per iteration: each iteration's tile, then the zeros
+    that fill it to the port's transfer size. `tiles` carries a leading iteration axis."""
+    per_iteration = tiles.reshape(tiles.shape[0], -1)
+    padding = port.transfer_bytes // (int(port.dtype.width) // 8) - per_iteration.shape[1]
+    if padding == 0:
+        return per_iteration.reshape(-1)
+    zeros = np.zeros((per_iteration.shape[0], padding), dtype=per_iteration.dtype)
+    return np.concatenate([per_iteration, zeros], axis=1).reshape(-1)
 
 
 def _extract_port_tile(data: np.ndarray, port: IOPortLayout) -> np.ndarray:

@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tupl
 from ..ir import get_backend_context
 from ..op_impls.base import BufferLocation
 from .base import AIEPass
+from .shared_buffer import location_problem, static_problem
 
 log = logging.getLogger(__name__)
 
@@ -54,13 +55,18 @@ class Rect:
     input_face: PortFace
     output_face: PortFace
 
-    keepout_left: int = 0
-    keepout_right: int = 0
-    keepout_top: int = 0
-    keepout_bottom: int = 0
-
     extras: Dict[str, Any] = field(default_factory=dict)
     buffer_locations: Optional[Callable[[int], Tuple[BufferLocation, ...]]] = None
+    _locations: Dict[int, Tuple[BufferLocation, ...]] = field(default_factory=dict, repr=False, compare=False)
+
+    def locations_at(self, anchor_row: int) -> Tuple[BufferLocation, ...]:
+        """The op's buffer locations on anchor row `anchor_row`: they depend on the row alone, and the
+        search asks for them at every candidate position, so each row is asked of the op once."""
+        if self.buffer_locations is None:
+            return ()
+        if anchor_row not in self._locations:
+            self._locations[anchor_row] = tuple(self.buffer_locations(anchor_row))
+        return self._locations[anchor_row]
 
 
 @dataclass
@@ -88,6 +94,8 @@ class EdgeSpec:
     src_group: str = ''
     dst_group: str = ''
     port_pairs: Tuple[Tuple[int, int], ...] = ()
+    shared: bool = False  # both ports must pin the buffer to the same memory: one buffer, no DMA
+    shareable: bool = False  # the ports could hand over one buffer, placed right (`shared_buffer.static_problem`)
 
 
 @dataclass
@@ -105,8 +113,6 @@ class GraphSpec:
 class BranchBand:
     child: str
     names: Tuple[str, ...]
-    top_pad: int
-    bottom_pad: int
     inner_height: int
 
 
@@ -190,7 +196,6 @@ def _coerce_rect(footprint: Any) -> Rect:
       output_face: {"side": ..., "start": ..., "end": ...}
       input_side:  "left" | "right" | "top" | "bottom"
       output_side: "left" | "right" | "top" | "bottom"
-      keepout_left / keepout_right / keepout_top / keepout_bottom
       row_parity: 0 for even starting rows or 1 for odd starting rows
     """
     w = int(getattr(footprint, 'width'))
@@ -220,10 +225,6 @@ def _coerce_rect(footprint: Any) -> Rect:
         h=h,
         input_face=input_face,
         output_face=output_face,
-        keepout_left=int(extras.get('keepout_left', 0)),
-        keepout_right=int(extras.get('keepout_right', 0)),
-        keepout_top=int(extras.get('keepout_top', 0)),
-        keepout_bottom=int(extras.get('keepout_bottom', 0)),
         extras=extras,
     )
 
@@ -294,6 +295,23 @@ def _face_cost(
     return dx + lam * dy
 
 
+_UNSHARED_BUFFER_COST = 16.0
+"""What a shareable direct edge costs on top of its distance when its two advertised buffer locations do not
+coincide: its buffer is then copied by a DMA rather than shared, which is worth a long detour to avoid."""
+
+
+def _edge_cost(edge: EdgeSpec, src: Placed, dst: Placed, lam: float) -> float:
+    cost = _edge_cost_between_placements(src, dst, lam)
+    if not edge.shareable:
+        return cost
+    for src_port, dst_port in edge.port_pairs:
+        written = _absolute_bank_locations(src, group=edge.src_group, port=src_port)
+        read = _absolute_bank_locations(dst, group=edge.dst_group, port=dst_port)
+        if written and read and written != read:
+            cost += _UNSHARED_BUFFER_COST
+    return cost
+
+
 def _edge_cost_between_placements(src: Placed, dst: Placed, lam: float) -> float:
     return _face_cost(
         _face_abs_box(src, src.rect.output_face),
@@ -302,40 +320,17 @@ def _edge_cost_between_placements(src: Placed, dst: Placed, lam: float) -> float
     )
 
 
-def _expanded_box(placed: Placed) -> Tuple[int, int, int, int]:
-    """
-    Occupancy plus keepout margins.
-
-    Low-side keepouts are clipped at zero so placement at col/row 0 remains legal.
-    """
-    r = placed.rect
-    return (
-        max(0, placed.x - r.keepout_left),
-        placed.x + r.w - 1 + r.keepout_right,
-        max(0, placed.y - r.keepout_top),
-        placed.y + r.h - 1 + r.keepout_bottom,
-    )
+def _occupied_tiles(placed: Placed) -> set[Tuple[int, int]]:
+    return {
+        (col, row)
+        for col in range(placed.x, placed.x + placed.rect.w)
+        for row in range(placed.y, placed.y + placed.rect.h)
+    }
 
 
-def _rects_conflict(a: Placed, b: Placed) -> bool:
-    ax0, ax1, ay0, ay1 = _expanded_box(a)
-    bx0, bx1, by0, by1 = _expanded_box(b)
-    return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
-
-
-def _occupancy_box(placed: Placed) -> Tuple[int, int, int, int]:
-    return (
-        placed.x,
-        placed.x + placed.rect.w - 1,
-        placed.y,
-        placed.y + placed.rect.h - 1,
-    )
-
-
-def _boxes_conflict(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
-    ax0, ax1, ay0, ay1 = a
-    bx0, bx1, by0, by1 = b
-    return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
+def _memory_tiles(placed: Placed) -> set[Tuple[int, int]]:
+    """The tiles whose memory the op's transport-visible buffers use, as it declares them."""
+    return {(placed.x + loc.rel_col, placed.y + loc.rel_row) for loc in placed.rect.locations_at(placed.y)}
 
 
 def _absolute_bank_locations(
@@ -344,69 +339,68 @@ def _absolute_bank_locations(
     group: str,
     port: int,
 ) -> set[Tuple[int, int, Tuple[int, ...]]]:
-    if placed.rect.buffer_locations is None:
-        return set()
     return {
         (placed.x + location.rel_col, placed.y + location.rel_row, tuple(location.banks))
-        for location in placed.rect.buffer_locations(placed.y)
+        for location in placed.rect.locations_at(placed.y)
         if location.port_group == group and location.port == int(port)
     }
 
 
-def _direct_buffer_aliases(producer: Placed, consumer: Placed, graph: GraphSpec) -> bool:
-    """Whether a direct edge aliases the same physical banks at every paired port."""
-    edges = [
-        edge
-        for edge in graph.edges
-        if edge.direct
-        and edge.producer_exclusive
-        and edge.src == producer.name
-        and edge.dst == consumer.name
-        and edge.port_pairs
-    ]
-    if not edges:
-        return False
-
-    alias_tiles = set()
-    for edge in edges:
+def _aliased_tiles(producer: Placed, consumer: Placed, graph: GraphSpec) -> set[Tuple[int, int]]:
+    """The tiles where a direct edge from `producer` to `consumer` puts one buffer both ports name."""
+    tiles = set()
+    for edge in graph.edges:
+        if not (edge.direct and edge.producer_exclusive and edge.src == producer.name and edge.dst == consumer.name):
+            continue
         for src_port, dst_port in edge.port_pairs:
             source = _absolute_bank_locations(producer, group=edge.src_group, port=src_port)
-            target = _absolute_bank_locations(consumer, group=edge.dst_group, port=dst_port)
-            if not source or source != target:
-                return False
-            alias_tiles.update((col, row) for col, row, _ in source)
+            if source and source == _absolute_bank_locations(consumer, group=edge.dst_group, port=dst_port):
+                tiles.update((col, row) for col, row, _ in source)
+    return tiles
 
-    ax0, ax1, ay0, ay1 = _expanded_box(producer)
-    bx0, bx1, by0, by1 = _expanded_box(consumer)
-    overlap = {
-        (col, row) for col in range(max(ax0, bx0), min(ax1, bx1) + 1) for row in range(max(ay0, by0), min(ay1, by1) + 1)
-    }
-    return bool(overlap) and overlap <= alias_tiles
+
+def _shared_edges_coincide(a: Placed, b: Placed, graph: GraphSpec) -> bool:
+    """Whether every edge between the two that must be shared pins both of its ports to the same
+    memory -- the same (column, row, banks) -- so the compiler has one buffer to place, and no DMA."""
+    for edge in graph.edges:
+        if not edge.shared or {edge.src, edge.dst} != {a.name, b.name}:
+            continue
+        src, dst = (a, b) if edge.src == a.name else (b, a)
+        for src_port, dst_port in edge.port_pairs:
+            written = _absolute_bank_locations(src, group=edge.src_group, port=src_port)
+            if location_problem(written, _absolute_bank_locations(dst, group=edge.dst_group, port=dst_port)):
+                return False
+    return True
 
 
 def _placements_conflict(a: Placed, b: Placed, graph: GraphSpec) -> bool:
-    if not _rects_conflict(a, b):
-        return False
-    if _boxes_conflict(_occupancy_box(a), _occupancy_box(b)):
+    """Two ops conflict when they share a tile, or when one keeps buffers in a tile's memory that the
+    other occupies or also keeps buffers in -- unless it is the one buffer a direct edge between them
+    shares there."""
+    occupied_a, occupied_b = _occupied_tiles(a), _occupied_tiles(b)
+    if occupied_a & occupied_b:
         return True
-    if _direct_buffer_aliases(a, b, graph) or _direct_buffer_aliases(b, a, graph):
-        return False
-    return True
+    memory_a, memory_b = _memory_tiles(a), _memory_tiles(b)
+    clash = (memory_a & memory_b) | ((memory_a - occupied_a) & occupied_b) | ((memory_b - occupied_b) & occupied_a)
+    return bool(clash - _aliased_tiles(a, b, graph) - _aliased_tiles(b, a, graph))
 
 
 def _in_bounds(p: Placed, W: int, H: int) -> bool:
     return (
         p.x >= 0
         and p.y >= 0
-        and p.x + p.rect.w + p.rect.keepout_right <= W
-        and p.y + p.rect.h + p.rect.keepout_bottom <= H
+        and p.x + p.rect.w <= W
+        and p.y + p.rect.h <= H
+        # A buffer may sit west of or below the placement region -- the device starts before it -- but
+        # never past its far edges, where the device ends.
+        and all(col < W and row < H for col, row in _memory_tiles(p))
     )
 
 
 def _feasible(p: Placed, placed: Dict[str, Placed], graph: GraphSpec, W: int, H: int) -> bool:
     if not _in_bounds(p, W, H):
         return False
-    return all(not _placements_conflict(p, q, graph) for q in placed.values())
+    return all(not _placements_conflict(p, q, graph) and _shared_edges_coincide(p, q, graph) for q in placed.values())
 
 
 def _possible_face_domain(
@@ -427,8 +421,8 @@ def _possible_face_domain(
         ax, ay = spec.anchor
         return _face_abs_box(Placed(spec.name, ax, ay, rect), face)
 
-    max_x = W - rect.w - rect.keepout_right
-    max_y = H - rect.h - rect.keepout_bottom
+    max_x = W - rect.w
+    max_y = H - rect.h
     if max_x < 0 or max_y < 0:
         raise RuntimeError(f'Node {spec.name} footprint ({rect.w}x{rect.h}) does not fit device ({W}x{H}).')
 
@@ -513,6 +507,38 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                 continue
             entry_consumer_ports = consumer_ports(entry, consumer)
             direct = entry.decision is not None and entry.decision.realization == 'direct'
+            shared = ctx.ir.execution.get(consumer.node.name).input(consumer.tensor).shared_memory
+            if shared and not direct:
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: the edge into {consumer.node.name} must be shared memory, but '
+                    'transport did not classify it direct.'
+                )
+            # Why these ports could never hand over one buffer, wherever they are placed.
+            problems = []
+            if direct:
+                producer_inst, consumer_inst = ctx.ir.execution.get(src.name), ctx.ir.execution.get(consumer.node.name)
+                problems = [
+                    problem
+                    for p_port, c_port in zip(entry_producer_ports, entry_consumer_ports)
+                    for problem in (
+                        static_problem(
+                            ctx,
+                            entry.producer.tensor,
+                            producer_inst,
+                            entry.producer.group,
+                            p_port,
+                            consumer_inst,
+                            consumer.group,
+                            c_port,
+                        ),
+                    )
+                    if problem
+                ]
+            if shared and problems:
+                raise PlacementInfeasibleError(
+                    f'{entry.logical_tensor}: must pass into {consumer.node.name} through shared memory, but '
+                    f'{problems[0]}.'
+                )
             if direct and len(entry_producer_ports) != len(entry_consumer_ports):
                 raise RuntimeError(
                     f'{entry.logical_tensor}: direct placement requires equal producer and consumer port counts.'
@@ -537,6 +563,8 @@ def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
                     src_group=entry.producer.group,
                     dst_group=consumer.group,
                     port_pairs=tuple(zip(entry_producer_ports, entry_consumer_ports)) if direct else (),
+                    shared=shared,
+                    shareable=direct and not problems,
                 )
             )
     return edges
@@ -579,11 +607,8 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
     specs: Dict[str, NodeSpec] = {}
     stable_index: Dict[str, int] = {}
 
-    for idx, node in enumerate(ctx.ir.logical):
-        inst = ctx.ir.execution.get(node.name)
-        if inst is None:
-            continue
-
+    for idx, inst in enumerate(ctx.ir.execution):
+        node = inst.node
         footprint = inst.variant.footprint(node, inst.config)
         if footprint is None:
             raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
@@ -657,7 +682,7 @@ def _edge_lower_bound(
     dst_p = placed.get(edge.dst)
 
     if src_p is not None and dst_p is not None:
-        return _edge_cost_between_placements(src_p, dst_p, lam)
+        return _edge_cost(edge, src_p, dst_p, lam)
 
     if src_p is not None:
         dst_spec = graph.specs[edge.dst]
@@ -697,7 +722,7 @@ def _full_cost(
     lam: float,
     mu: float,
 ) -> float:
-    edge_cost = sum(_edge_cost_between_placements(placed[e.src], placed[e.dst], lam) for e in graph.edges)
+    edge_cost = sum(_edge_cost(e, placed[e.src], placed[e.dst], lam) for e in graph.edges)
     row_bias = sum(mu * p.y for p in placed.values())
     return edge_cost + row_bias
 
@@ -814,9 +839,9 @@ def _enumerate_candidate_positions(
         return
 
     min_x = 0 if spec.x_range is None else spec.x_range[0]
-    max_x = (W - spec.rect.w - spec.rect.keepout_right) if spec.x_range is None else spec.x_range[1]
+    max_x = (W - spec.rect.w) if spec.x_range is None else spec.x_range[1]
     min_y = 0 if spec.y_range is None else spec.y_range[0]
-    max_y = (H - spec.rect.h - spec.rect.keepout_bottom) if spec.y_range is None else spec.y_range[1]
+    max_y = (H - spec.rect.h) if spec.y_range is None else spec.y_range[1]
     if max_x < 0 or max_y < 0:
         return
     if max_x < min_x or max_y < min_y:
@@ -970,8 +995,6 @@ def _branch_band(graph: GraphSpec, names: Sequence[str], child: str) -> BranchBa
     return BranchBand(
         child=child,
         names=tuple(names),
-        top_pad=max(rect.keepout_top for rect in rects),
-        bottom_pad=max(rect.keepout_bottom for rect in rects),
         inner_height=max(rect.h for rect in rects),
     )
 
@@ -990,7 +1013,7 @@ def _assign_branch_bands(
     spare vertical room that would encourage unnecessary vertical chains.
     """
     bands = {child: _branch_band(graph, names, child) for child, names in branches.items()}
-    base_heights = {child: band.top_pad + band.inner_height + band.bottom_pad for child, band in bands.items()}
+    base_heights = {child: band.inner_height for child, band in bands.items()}
     required = sum(base_heights.values())
     if start_row + required > H:
         return None
@@ -1001,7 +1024,7 @@ def _assign_branch_bands(
         band = bands[child]
         band_height = base_heights[child]
         band_top = current_top
-        inner_top = band_top + band.top_pad
+        inner_top = band_top
         inner_height = band.inner_height
         band_rows[child] = (inner_top, inner_height, band_top)
         current_top = band_top + band_height
@@ -1163,7 +1186,7 @@ def _place_disjoint_fanout(
         max_states,
     )
     root_pos = root_placed[root]
-    start_row = _expanded_box(root_pos)[3] + 1
+    start_row = root_pos.y + root_pos.rect.h
     if start_row >= H:
         log.debug(
             """AIE placement: disjoint-fanout fast path skipped for root %s
@@ -1354,6 +1377,8 @@ class PlaceKernels(AIEPass):
             placement = {
                 'col': int(p.x + col_offset),
                 'row': int(p.y + row_offset),
+                'width': int(p.rect.w),  # the tiles reserved, not only the anchor
+                'height': int(p.rect.h),
             }
             prev = ctx.ir.physical.placements.get(name)
             if prev != placement:

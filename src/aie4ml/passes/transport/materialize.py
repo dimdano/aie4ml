@@ -7,10 +7,11 @@ from math import prod
 from typing import Any, Dict, List
 
 from ...aie_types import AIEDataType
-from ...ir import get_backend_context, input_role
+from ...ir import get_backend_context
 from ...op_impls.common_types import PORT_KIND_STREAM
 from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
 from ..base import AIEPass
+from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, location_problem, pinned_locations, static_problem
 from ..utils import sanitize_identifier
 from .boundary import (
     graph_input_port_descriptor,
@@ -35,7 +36,7 @@ class BuildMemoryPlan(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        ctx.ir.physical.plan = _MemoryPlanMaterializer(ctx).build(list(ctx.ir.logical))
+        ctx.ir.physical.plan = _MemoryPlanMaterializer(ctx).build()
         return True
 
 
@@ -45,7 +46,8 @@ class CollectMemoryEntries(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        state = _MemoryPlanMaterializer(ctx).collect(list(ctx.ir.logical))
+        ctx.ir.execution.verify()
+        state = _MemoryPlanMaterializer(ctx).collect()
         ctx.ir.physical.plan = {'_memory_plan_state': state}
         return True
 
@@ -77,20 +79,15 @@ class _MemoryPlanMaterializer:
         self._max_graph_input_port = -1
         self._buffer_seq: Dict[str, int] = {}
 
-    def build(self, nodes):
-        state = self.collect(nodes)
+    def build(self):
+        state = self.collect()
         return self.materialize(_legalize_collected_entries(self.ctx, state))
 
-    def collect(self, nodes):
-        idx = 0
-        for n in nodes:
-            if self._kernel_inst(n):
-                idx += 1
-                self.layer_indices[n.name] = idx
-
+    def collect(self):
+        self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
         return {
             'layer_indices': dict(self.layer_indices),
-            'entries': TransportCollector(self.ctx).collect(nodes),
+            'entries': TransportCollector(self.ctx).collect(),
         }
 
     def materialize(self, state):
@@ -170,15 +167,33 @@ class _MemoryPlanMaterializer:
     def _emit_direct_internal(self, entry, p_ports, c_ports):
         p = entry.producer
         c = entry.single_consumer()
+        producer, consumer = self._kernel_inst(p.node), self._kernel_inst(c.node)
+        stream = producer.ports.outputs[p.tensor].kind == PORT_KIND_STREAM
 
         for p_port, c_port in zip(p_ports, c_ports):
-            self.direct_edges.append(
-                {
-                    'source': f'{sanitize_identifier(p.node.name)}.{p.group}[{int(p_port)}]',
-                    'target': f'{sanitize_identifier(c.node.name)}.{c.group}[{int(c_port)}]',
-                    'tensor': entry.logical_tensor,
-                }
-            )
+            edge = {
+                'source': f'{sanitize_identifier(p.node.name)}.{p.group}[{int(p_port)}]',
+                'target': f'{sanitize_identifier(c.node.name)}.{c.group}[{int(c_port)}]',
+                'tensor': entry.logical_tensor,
+            }
+            if stream:
+                edge['realization'] = STREAM
+            else:
+                # Both ops' graphs pin their buffer ports where they list them. One buffer is shared where
+                # the two locations coincide and nothing else reads it (`shared_buffer`); counted as a DMA
+                # copy anywhere else, which is what it is wherever the locations differ.
+                written = pinned_locations(producer, p.group, p_port, *self._placed_at(producer))
+                read = pinned_locations(consumer, c.group, c_port, *self._placed_at(consumer))
+                if not written or not read:
+                    raise RuntimeError(
+                        f'{edge["source"]} -> {edge["target"]}: a buffer port without a buffer location; every '
+                        'buffer-port op lists where its graph pins them.'
+                    )
+                shared = not location_problem(written, read) and not static_problem(
+                    self.ctx, p.tensor, producer, p.group, p_port, consumer, c.group, c_port
+                )
+                edge['realization'] = SHARED_MEMORY if shared else DMA
+            self.direct_edges.append(edge)
 
     def _emit_direct_graph_input(self, entry, graph_ports, consumer_ports):
         consumer = entry.single_consumer()
@@ -498,6 +513,10 @@ class _MemoryPlanMaterializer:
     def _kernel_inst(self, node):
         return self.ctx.ir.execution.get(node.name) if node else None
 
+    def _placed_at(self, inst):
+        placement = self.ctx.ir.physical.placements[inst.name]
+        return int(placement['col']), int(placement['row'])
+
     @staticmethod
     def _producer_endpoint(node, group, port):
         return f'ifm[{port}]' if node is None else f'{sanitize_identifier(node.name)}.{group}[{port}]'
@@ -515,7 +534,7 @@ class _MemoryPlanMaterializer:
 
     def _graph_input_role(self, entry: EdgeEntry) -> str:
         consumer = entry.single_consumer()
-        role = input_role(consumer.node, consumer.tensor)
+        role = self._kernel_inst(consumer.node).input(consumer.tensor).role
         if not role:
             raise RuntimeError(
                 f'{entry.logical_tensor}: no role assigned on consumer {consumer.node.name!r}; '

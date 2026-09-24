@@ -1,0 +1,34 @@
+{% from 'variants/placement.jinja' import buffer_locations %}
+{% set P = L.op_impl.parameters %}
+// A retiler: its source -- the tensor as the boundary carries it, or the frame a producer wrote -- and
+// the column-grouped frame it builds for the strided conv that reads it. One kernel per band builds its
+// band's frame, configured by a struct of its own that completes these fields with the rows that band
+// reads; `band<b>::type` names it for the graph. (A kernel's configuration must be a plain struct: the
+// AIE compiler cannot wrap a kernel templated on a member template.)
+struct {{L.struct_name}} {
+  using data_t = {{P.precision.c_type}};
+  static constexpr int CAS_NUM = 1, CAS_LENGTH = 1;
+  static constexpr int BANDS = {{P.windows | length}};
+  static constexpr int SRC_W = {{P.src_w}}, SRC_C = {{P.src_c}};
+  static constexpr int SRC_BASE = {{P.src_base}}, SRC_PIXEL = {{P.src_pixel}};
+  static constexpr int SRC_ROW = {{P.src_row}}, SRC_BLOCK = {{P.src_block}};
+  static constexpr int ROWS = {{P.rows}}, COLS = {{P.cols}}, CB = {{P.blocks}};
+  static constexpr int STRIDE = {{P.stride}};
+  static constexpr int ORIGIN_C = {{P.origin_c}};
+  static constexpr int FRAME_BYTES = {{P.frame_bytes}};
+  static constexpr int col_placement = {{L.placement.col}};
+  static constexpr int row_placement = {{L.placement.row}};
+  // The Dense bank contract: input and frame copies in banks 0 and 3, the stack in bank 1.
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
+  template<int BAND> struct band;
+};
+{% for window in P.windows %}
+// Band {{loop.index0}}: source rows {{window.first_row}}..{{window.first_row + window.rows - 1}}, from frame row {{window.origin_row}}.
+struct {{L.struct_name}}_band{{loop.index0}} : {{L.struct_name}} {
+  static constexpr int SRC_H = {{window.rows}};
+  static constexpr int SRC_BYTES = {{window.transfer_bytes}};  // one inference in the source buffer
+  static constexpr int ORIGIN_R = {{window.origin_row}};
+};
+template<> struct {{L.struct_name}}::band<{{loop.index0}}> { using type = {{L.struct_name}}_band{{loop.index0}}; };
+{% endfor %}

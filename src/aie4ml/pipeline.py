@@ -11,11 +11,13 @@ from .passes import (
     ForceFloatMode,
     FuseActivationCasts,
     LegalizeFanoutEntries,
+    LegalizeLayouts,
     LegalizeMemtilePortLimits,
     MaterializeMemoryPlan,
     PackKernelArtifacts,
     PlaceKernels,
     Resolve,
+    VerifyPhysicalPlan,
 )
 
 HLS4ML_FLOW_SPEC = (
@@ -26,6 +28,7 @@ HLS4ML_FLOW_SPEC = (
     ('fuse', FuseActivationCasts),
     ('fold_views', FoldViewOps),
     ('resolve', Resolve),
+    ('legalize_layouts', LegalizeLayouts),
     ('pack', PackKernelArtifacts),
     ('memory_collect', CollectMemoryEntries),
     ('fanout_legalize', LegalizeFanoutEntries),
@@ -34,6 +37,7 @@ HLS4ML_FLOW_SPEC = (
     ('memtile_legalize', LegalizeMemtilePortLimits),
     ('memory_plan', MaterializeMemoryPlan),
     ('compact_batch', CompactBufferRank),
+    ('verify_physical', VerifyPhysicalPlan),
 )
 
 DEFAULT_PIPELINE = tuple(pass_cls for _, pass_cls in HLS4ML_FLOW_SPEC)

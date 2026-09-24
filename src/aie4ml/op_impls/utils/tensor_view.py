@@ -271,6 +271,14 @@ def validate_staging_descriptor(desc: Mapping[str, Any]) -> None:
     for key in ('slice_dimension', 'inner_dimension', 'outer_dimension'):
         if key in desc and not 0 <= int(desc[key]) < rank:
             raise ValueError(f'staging descriptor {key}={desc[key]} is not an axis of rank {rank}.')
+    # A column-phased frame groups its columns by residue: a fact of the inner-blocked layout, part of
+    # what two descriptors must agree on to hand a buffer over directly.
+    if 'column_phases' in desc:
+        phases = desc['column_phases']
+        if not isinstance(phases, int) or phases < 2:
+            raise ValueError(f'staging descriptor column_phases={phases!r} must be an integer of at least 2.')
+        if desc['storage_layout'] != STORAGE_LAYOUT_INNER_BLOCKED:
+            raise ValueError('staging descriptor column_phases applies only to an inner-blocked layout.')
     # The BD walk: each axis is traversed at most once, and the window it sweeps stays inside the
     # buffer. An axis with no traversal entry transfers its chunk once, at its offset.
     walked = set()

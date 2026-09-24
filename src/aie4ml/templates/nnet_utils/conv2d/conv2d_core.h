@@ -12,6 +12,12 @@
 
 using namespace adf;
 
+// A channel block is eight bytes, which the frame stores as int8 and both wrappers move as two
+// 32-bit words. Naming the word type `may_alias` is what makes that access defined: the frame
+// really is addressed as both, and copying through `__builtin_memcpy` instead measured 17% slower
+// once a pixel spans more than one block.
+using conv2d_word_t __attribute__((may_alias)) = int32;
+
 template<typename ConfigT>
 inline void conv2d_check_contract() {
   static_assert(ConfigT::K == 8 && ConfigT::N == 8, "conv2d taps are 8-channel blocks");
@@ -27,14 +33,22 @@ inline void conv2d_check_contract() {
   static_assert(ConfigT::IN_ORIGIN_C % ConfigT::M == 0 && ConfigT::OUT_ORIGIN_C % ConfigT::M == 0,
                 "origins keep tile stores aligned");
   static_assert(ConfigT::IN_ORIGIN_C + ConfigT::IN_W <= ConfigT::IN_COLS, "the image fits the frame columns");
-  // A frame either holds the whole image or one band of it; either way it holds every row the
-  // output rows of one core call read, which the next assert states.
-  static_assert(ConfigT::BANDS > 1 || ConfigT::IN_ORIGIN_R + ConfigT::IN_H <= ConfigT::IN_ROWS,
+  // A frame holds the whole image, one band of it, or -- under a vertical stride -- only the rows
+  // its outputs actually read, which can stop short of the last image row. Either way it holds
+  // every row the output rows of one core call read, which the next assert states.
+  static_assert(ConfigT::BANDS > 1 || ConfigT::STRIDE_H > 1 ||
+                    ConfigT::IN_ORIGIN_R + ConfigT::IN_H <= ConfigT::IN_ROWS,
                 "the image fits the frame rows");
-  static_assert(ConfigT::OUT_H + ConfigT::KH - 1 <= ConfigT::IN_ROWS, "input frame covers every output row");
+  static_assert((ConfigT::OUT_H - 1) * ConfigT::STRIDE_H + ConfigT::KH <= ConfigT::IN_ROWS,
+                "input frame covers every output row");
   static_assert(ConfigT::OUT_W_COMPUTED % (ConfigT::MB * ConfigT::M) == 0, "computed width is whole register tiles");
-  static_assert(ConfigT::IN_ORIGIN_C - ConfigT::PAD_L + ConfigT::OUT_W_COMPUTED + ConfigT::KW - 1 <= ConfigT::IN_COLS,
+  static_assert(ConfigT::IN_COLS % ConfigT::STRIDE_W == 0, "frame columns divide into polyphase classes");
+  static_assert(ConfigT::OUT_W_COMPUTED + (ConfigT::KW - 1 + ConfigT::IN_ORIGIN_C - ConfigT::PAD_L) /
+                        ConfigT::STRIDE_W <= ConfigT::IN_COLS / ConfigT::STRIDE_W,
                 "input frame covers every column the computed tiles read");
+  static_assert(ConfigT::STRIDE_W == 1 || !ConfigT::FILLS_BORDER,
+                "a strided frame is delivered with its border, because a kernel store writes whole "
+                "register tiles and those land in different polyphase classes");
   static_assert(ConfigT::FLATTEN || ConfigT::OUT_ORIGIN_C + ConfigT::OUT_W_COMPUTED <= ConfigT::OUT_COLS,
                 "output frame holds every column the computed tiles write");
 }
@@ -45,12 +59,22 @@ struct conv2d_geometry {
   static constexpr int RB = ConfigT::IN_COLS * 8;   // input row bytes
   static constexpr int CHB = ConfigT::IN_ROWS * RB;  // input channel-block bytes
   static constexpr int T = ConfigT::KH * ConfigT::KW * ConfigT::CB;
+  // Columns of one polyphase class. A frame row holds STRIDE_W classes of PW columns, so it is
+  // still IN_COLS columns long and RB is unchanged.
+  static constexpr int PW = ConfigT::IN_COLS / ConfigT::STRIDE_W;
 
   // Byte offset of tap t = (ky, kx, cb) from the window of output pixel (oy, 0); the taps are
   // packed in the same order.
+  //
+  // Output pixel x reads input column x * STRIDE_W + kx + c0, whose polyphase class is
+  // (kx + c0) % STRIDE_W -- the same for every x -- at index x + (kx + c0) / STRIDE_W within that
+  // class. So one tap is a fixed offset and consecutive output pixels stay 8 bytes apart, which is
+  // what lets the register tile load them together at any stride. At STRIDE_W == 1 this is
+  // (kx + c0) * 8, the offset it has always been.
   static constexpr int off(int t) {
     const int cb = t % ConfigT::CB, k = t / ConfigT::CB, kx = k % ConfigT::KW, ky = k / ConfigT::KW;
-    return cb * CHB + ky * RB + (kx + ConfigT::IN_ORIGIN_C - ConfigT::PAD_L) * 8;
+    const int col = kx + ConfigT::IN_ORIGIN_C - ConfigT::PAD_L;
+    return cb * CHB + ky * RB + (col % ConfigT::STRIDE_W) * PW * 8 + (col / ConfigT::STRIDE_W) * 8;
   }
   struct table { int off[T]; };
   static constexpr table build() {
@@ -81,7 +105,7 @@ static inline void conv2d_zero_border(typename ConfigT::data_t* frame) {
       }
       for (int c = 0; c < C0; c += 2) aie::store_v(row + c * 8, z16);
       if constexpr (C1 % 2) {  // one block: eight bytes is not a vector, so it goes as two words
-        int32* const odd = reinterpret_cast<int32*>(row + C1 * 8);
+        conv2d_word_t* const odd = reinterpret_cast<conv2d_word_t*>(row + C1 * 8);
         odd[0] = 0;
         odd[1] = 0;
       }
@@ -115,7 +139,7 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
 
   for (int oy = 0; oy < ConfigT::OUT_H; ++oy) {
     for (int z = 0; z < ConfigT::OUT_W_COMPUTED; z += MB * M) {
-      const data_t* pA = frame + oy * G::RB + z * 8;
+      const data_t* pA = frame + oy * ConfigT::STRIDE_H * G::RB + z * 8;
       for (int j = 0; j < NB; j += 2) {
         // The tile that stores the result owns the bias: it starts from it when it is also the
         // start of the chain, and adds it to the incoming partial sums otherwise.

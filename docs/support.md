@@ -10,7 +10,7 @@
 | Elementwise Add | Generation-dependent integer and float formats | Exact-shape inputs for residual and elementwise connections; broadcasting is not supported. BF16 is supported on AIE-ML and FP8 on AIE-MLv2. |
 | LayerNorm | Signed int8 | Last-axis normalization using integer mean/variance and reciprocal-square-root approximation. Input and output storage are currently signed int8 and require supported static quantization. |
 | Softmax | Int8 to uint8/int16 | Accurate integer exponential or an opt-in surrogate (needs explicit parameters + QAT). Linear or microtile layout; the exp variant is not yet perf-optimized. |
-| Conv2D | Signed int8, stride 1 | NHWC frames; any kernel that fits tile memory (validated to 7x7), asymmetric zero padding, `groups` (including depthwise), optional bias and fused ReLU. A layer spans several tiles through the Dense parallelism directive on the channel-block axis: `cas_length` splits the reduction along a cascade chain, `cas_num` splits the output channels ('inner') or the output rows ('outer') across chains. Row bands overlap by the window span, so a banded input comes from the graph boundary (the host delivers each band's window); a halo-free consumer such as a 1x1 conv inherits the bands, and nothing gathers them back, so a banded chain ends at the boundary. Batch > 1, stride, dilation and float are rejected explicitly. A flattened conv output feeds Dense directly (one chain only). A conv frame crossing the graph boundary must fit one 8-channel block per port. |
+| Conv2D | Signed int8 | NHWC frames on the Dense bank contract -- each tile's input frame, output frame and weights fit one memory bank, or the layer is split; any kernel shape (validated to 7x7), asymmetric zero padding, `groups` (including depthwise), optional bias and fused ReLU. A layer spans several tiles through the Dense parallelism directive on the channel-block axis: `cas_length` splits the reduction along a cascade chain, `cas_num` splits the output channels ('inner') or the output rows ('outer') across chains. Row bands overlap by the window span, so a banded input comes from the graph boundary (the host delivers each band's window); a halo-free consumer such as a 1x1 conv inherits the bands, and nothing gathers them back, so a banded chain ends at the boundary. A column stride greater than 1 is supported for a buffer-port conv on one tile -- reading the graph boundary or another kernel's frame -- or split into row bands (contract 'outer', `cas_length` 1) reading the graph boundary. A strided window reads its columns grouped by their residue modulo the stride, which neither source provides, so a layout legalization pass inserts a retiler: a kernel of its own in the execution IR (not in the model) that builds that frame -- border included -- so the compute core reads a strided window exactly as it reads a dense one. The boundary carries the rows the conv reads in plain order -- all of them for one tile, each band's window for row bands, clipped to the tensor, with the retiler building the padding -- each inference framed to whole 16-byte units by trailing zeros; a producing kernel hands over its frame as written. Row bands get one retiler kernel each, beside the band's conv tile. The frame's hand-over to the conv must be one buffer in shared memory -- a performance constraint, since that is what the measured latency and interval include (a DMA copy of the frame would be exact, but is unmeasured) -- so placement accepts only positions where the retiler's output and the conv's input locations coincide, and the physical plan is verified against the same rule before any code is generated (see Transport). The producer -> retiler edge is an ordinary direct edge, shared wherever placement can make its locations coincide. The retiler prepares the next inference while the conv computes the current one, so the output interval stays the conv's as long as the retiler is the faster of the two (the case in every measured shape); first-output latency rises by one stage and the layer occupies one extra tile. A row-only stride needs no retiler and reads the boundary as an unstrided conv does. Rejected: a strided conv split over channels (`cas_length` > 1 or inner `cas_num`), a strided conv in row bands fed by another kernel, a strided conv reading a folded slice or concat view, and stride on stream ports. On a hardware system the data mover moves whole 64-byte words, so a framed transfer that is not one -- 306 bytes of rows framed to 320, say -- is refused there; AIE compilation and aiesim support it. Batch > 1, dilation and float are rejected explicitly. A flattened conv output feeds Dense directly (one chain only). A conv frame crossing the graph boundary must fit one 8-channel block per port. |
 | Flatten / Reshape | Folded into the producing op | One sample to `[1, K]`, written directly by a producer that lists `flatten_2d` among its output views (today Conv2D), so no kernel or copy is instantiated. A view that ravels the axes in a different order hands that row order to the consuming family, which folds it into its constants. |
 | Transpose / Permute | Folded view with memtile fallback | Permutation of the final two axes only. AIE1 rejects permutations that require relayout because it has no memory-tile fallback. |
 | Split / Slice | Direct or per-slice memtile | No Split/Slice kernel. A slice must be an exact union of complete producer-port regions. Cross-port slices require an unimplemented relay/repacking path and are rejected on every generation. Graph-boundary slices and chained views are not supported. |
@@ -66,8 +66,22 @@
 
 - Internal transport is realized as either a direct AIE connection or, on devices that provide memory tiles, one
   memory-tile stage. AIE1 fails explicitly when an incompatible layout requires relay, gather, or relayout.
-- Direct transport means the endpoint staging descriptors are compatible. Physical shared-buffer aliasing is a
-  separate placement optimization; direct transport may instead use tile DMA between distinct buffers.
+- Direct transport means the endpoint staging descriptors are compatible; it is decided before placement. A direct
+  stream edge moves data on core streams and has no buffer. A direct buffer edge joins two buffer ports, and every op
+  with buffer ports lists their locations and pins them there in its own graph, one ping or pong copy per bank (banks 0
+  and 3) -- the Dense bank contract, which Dense, MatMul, Add, LayerNorm, Softmax, Conv2D and the strided-conv retiler
+  follow, each copy fitting one bank. Each hand-over buffer lives in the neighbouring tile both kernels reach: data flows left to right on every
+  row, and on AIE, where odd-row cores reach east rather than west, an odd row keeps a kernel's input in its own tile
+  and its output in the east neighbour's; only a cascade on an odd AIE row runs right to left, as the hardware
+  requires. Placement strongly prefers positions where a direct buffer edge's two locations coincide, and the physical
+  plan records how each direct edge is realised: `shared_memory` (one buffer both kernels reach, which the compiler
+  places or refuses, recorded only where the two locations coincide and nothing else reads the buffer), `dma`
+  (otherwise: a tile DMA may copy it) or `stream`.
+- An execution edge may require the `shared_memory` realisation. That requirement is one rule wherever it matters --
+  placement searches under it and the physical verifier re-derives it before code generation: both ports are buffer
+  ports each bound to one kernel, the value has no other reader, the two pinned locations coincide, and neither port
+  carries a DMA access pattern. A strided conv's retiler is an execution-IR kernel of its own, and its hand-over to the
+  conv is such an edge.
 - Fanout creates independently planned transport legs for each consumer. Reusing the same producer port disables
   exclusive shared-buffer aliasing but remains eligible for ADF buffer multicast.
 - Split/Slice and Concat may use direct connections when producer and consumer port regions align exactly. An aligned
@@ -86,13 +100,36 @@
   kernel builds everything its compute core needs around that data, keeping one band of the image (its output rows plus
   the window span) rather than the whole of it. So a stream carries a wire order, while `inner_blocked` describes buffer
   memory. It is also the only way more than one channel block crosses the graph boundary in one port. Partitioning a
-  streamed Conv2D across tiles is not implemented. It buys legality, not speed: see the measured
-  comparison below. What a stream port carries depends on the op -- a Dense port carries its padded per-port tile in
+  streamed Conv2D across tiles is not implemented. A streamed tensor must be a whole number of 16-byte beats, which
+  is checked and refused rather than padded: a band may end part-way through a beat and the kernel carries the
+  remainder to the next band, but a final partial beat would need transport support that is deliberately left out of
+  scope. A channel count that does not fill an 8-channel block reads the band into a staging buffer and places its
+  bytes afterwards -- counted in the tile-memory check -- because a stream read inside the placement loop stops that
+  loop pipelining, which costs tens of cycles a byte instead of about one. It buys legality, not speed. Measured on
+  aiesim over six iterations, bit-exact against onnxruntime, one tile, 3x3 same-padded, int8 (kernel cycles per
+  inference, buffer versus stream):
+
+  | image | Cin -> Cout | wire | AIE1 buffer | AIE1 stream | AIE-ML buffer | AIE-ML stream | AIE-MLv2 buffer | AIE-MLv2 stream |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | 8x8 | 8 -> 8 | blocked | 1,279 | 2,471 | 761 | 2,014 | 870 | 2,168 |
+  | 16x16 | 8 -> 8 | blocked | 4,906 | 9,308 | 1,505 | 5,609 | 1,718 | 5,956 |
+  | 8x8 | 3 -> 8 | tail in | 1,279 | 5,567 | 761 | 3,838 | 870 | 4,011 |
+  | 8x8 | 11 -> 8 | tail in | -- | 14,396 | -- | 8,969 | -- | 9,426 |
+  | 8x8 | 8 -> 11 | tail out | -- | 7,814 | -- | 7,736 | -- | -- |
+  | 8x8 | 24 -> 24 | blocked | -- | 19,864 | -- | 17,234 | -- | 13,133 |
+
+  A blocked wire costs roughly two to four times the buffer path; a channel count that does not fill a block costs
+  more again, because its bytes are placed one at a time. The buffer entries stop at `Cout=8` because a boundary
+  port carries one channel block, and a conv whose output blocks are not padded to an even count does better: an
+  internal `8 -> 16` conv over 16x16 measured 1,725 cycles, 171 MAC/cycle, 67% of the AIE-ML peak, against 38% for
+  the same kernel at `Cout=8`, where the schedule issues a second, padded output block. What a stream port carries depends on the op -- a Dense port carries its padded per-port tile in
   linear row order and the kernel re-tiles it in registers, while a Conv2D port carries the logical tensor described
   above and the kernel builds the padded frame itself. Either way there is no buffer to place, no bank contract, no DMA
   descriptor and no microtile on the wire. Stream legs
-  are always direct: stream-to-stream requires identical staging descriptors, a PLIO feeds the padded tile (the host
-  pads and trims), and a stream-to-buffer leg, a memory-tile route or a transposed view is rejected explicitly. The
+  are always direct: stream-to-stream requires identical staging descriptors, and a stream-to-buffer leg, a memory-tile
+  route or a transposed view is rejected explicitly. What a PLIO feeds is whatever that port's staging descriptor
+  publishes -- a Dense port's padded tile, which the host pads and trims, or a Conv2D port's logical tensor, which it
+  does not. The
   stream groups of one kernel must fit the core's stream ports (two in/out on AIE, one on AIE-ML). A microtile row
   must be a multiple of 16 bytes, or 8 bytes with an even M.
 - Multi-stage relay transport is not implemented. Topologies requiring an additional relay stage fail explicitly.

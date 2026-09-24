@@ -55,7 +55,8 @@ def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, of
     A DMA-fed buffer receives only the logical elements (`io_tiling_dimension`) and the DMA
     scatters them; a stream port receives the whole padded port tile, so its transfer shape
     is the staging `tiling_dimension`. `logical_origin` says where that window starts in the
-    tensor, and travels unchanged: transport never recomputes where a port's data lives.
+    tensor, and travels unchanged: transport never recomputes where a port's data lives. A port
+    that frames each inference in whole transfer units declares `transfer_bytes`, which travels too.
     """
     io_tile = list(base['io_tiling_dimension'])
     desc = {
@@ -71,6 +72,8 @@ def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, of
         'inner_dimension': int(base['inner_dimension']),
         'outer_dimension': int(base['outer_dimension']),
     }
+    if 'transfer_bytes' in base:
+        desc['transfer_bytes'] = int(base['transfer_bytes'])
     return desc
 
 

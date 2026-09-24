@@ -9,7 +9,7 @@ import numpy as np
 from ....aie_types import FloatIntent
 from ....ir.graph import STAGING_CONTRACTS, VIEW_FLATTEN_2D, OpImplInstance, OpNode, input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives, requested_port_kind
@@ -34,11 +34,12 @@ from ..matmul.config import MatmulMicrotileConfig
 from .common import (
     CHANNEL_BLOCK,
     describe_frame_staging,
-    describe_stream_frame_staging,
+    describe_logical_staging,
     frame_view,
     spatial_access_of,
 )
-from .config import Conv2dConfig, Conv2dFlags
+from .config import Conv2dConfig, Conv2dFlags, FrameRetileConfig
+from .frame_retile import FrameRetileOpImplVariant
 
 STREAM_BAND_ROWS = 4
 """Output rows a streamed kernel computes per core call: the band it keeps in local memory.
@@ -71,7 +72,11 @@ class Conv2dOpImplVariant(OpImplVariant):
     param_template = 'conv2d'
     plevel = 10
     port_kind: ClassVar[str] = PORT_KIND_BUFFER
-    supported_directives: ClassVar[frozenset] = frozenset({'ports', 'io_route', 'input_contracts', 'parallelism'})
+    # `placement` is the placement pass's, which serves every op; the rest the variant reads itself.
+    # Anything else -- microtiling, layout -- is refused rather than ignored.
+    supported_directives: ClassVar[frozenset] = frozenset(
+        {'ports', 'io_route', 'input_contracts', 'parallelism', 'placement'}
+    )
 
     def matches(self, node: OpNode, device) -> bool:
         lhs = input_tensor_for_role(node, 'lhs')
@@ -101,8 +106,6 @@ class Conv2dOpImplVariant(OpImplVariant):
         # Kernel limits, as opposed to what the operation means (which the family verified).
         if int(lhs.shape[0]) != 1:
             raise NotImplementedError(f'{node.name}: {self.variant_id} runs one sample per call, got N={lhs.shape[0]}.')
-        if access.strides != (1, 1):
-            raise NotImplementedError(f'{node.name}: {self.variant_id} does not implement strides {access.strides}.')
         if access.dilations != (1, 1):
             raise NotImplementedError(
                 f'{node.name}: {self.variant_id} does not implement dilations {access.dilations}.'
@@ -169,6 +172,17 @@ class Conv2dOpImplVariant(OpImplVariant):
         fused_act = node.traits.get('fused_activation')
         use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
 
+        if self.port_kind == PORT_KIND_BUFFER and int(access.strides[1]) > 1:
+            # A retiler kernel per row band feeds a strided conv; splitting its channels would need one
+            # per channel slice (cas_length) or one frame for several chains (inner cas_num).
+            banded = parallelism.contract == 'outer' and int(parallelism.cas_length) == 1
+            if int(parallelism.cas_num) * int(parallelism.cas_length) > 1 and not banded:
+                raise NotImplementedError(
+                    f'{node.name}: {self.variant_id} splits a strided conv only into row bands '
+                    f"(contract 'outer', cas_length 1); cas_num={parallelism.cas_num}, "
+                    f'cas_length={parallelism.cas_length} with contract {parallelism.contract!r} is not implemented.'
+                )
+
         return Conv2dConfig(
             precision=precision,
             parallelism=parallelism,
@@ -185,6 +199,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             pads=access.pads,
             groups=int(node.metadata['groups']),
             alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
+            bank_mem_bytes=int(device.bank_mem_bytes),
             flags=Conv2dFlags(use_relu=use_relu, emit_flattened=bool(view)),
         )
 
@@ -266,17 +281,46 @@ class Conv2dOpImplVariant(OpImplVariant):
         if config.shift < 0:
             raise ValueError(f'{node.name}: conv2d accumulator output shift must be non-negative, got {config.shift}.')
         params = self.build_template_params(node, config, {'row': 0, 'col': 0})
-        # The kernel computes whole register tiles, so it reads past the last output pixel.
-        read_span = params['in_origin_c'] - config.pads[1] + params['out_w_computed'] + config.kernel_shape[1] - 1
-        if read_span > params['in_cols']:
+        # The kernel computes whole register tiles, so it reads past the last output pixel. A strided
+        # frame holds its columns in `stride_w` polyphase classes and every class must reach that
+        # far; at stride 1 there is one class, the whole row. Mirrors the kernel's static_assert.
+        stride_w = int(config.strides[1])
+        phase_cols = int(params['in_cols']) // stride_w
+        read_span = (
+            params['out_w_computed'] + (config.kernel_shape[1] - 1 + params['in_origin_c'] - config.pads[1]) // stride_w
+        )
+        if int(params['in_cols']) % stride_w or read_span > phase_cols:
             raise RuntimeError(
-                f'{node.name}: the kernel reads {read_span} frame columns but the padded frame has '
-                f'{params["in_cols"]}.'
+                f'{node.name}: the kernel reads {read_span} columns of each of {stride_w} column '
+                f'class(es) but the padded frame holds {params["in_cols"]} columns.'
             )
-        # A buffer port ping-pongs; the stream wrapper owns one frame each way.
-        copies = 2 if self.port_kind == PORT_KIND_BUFFER else 1
+        if self.port_kind == PORT_KIND_BUFFER:
+            # Dense's bank schedule: one frame copy per bank (0 and 3) wherever the op contract puts it,
+            # the weights in bank 2 of the kernel's tile, stack and bias in bank 1.
+            bank = int(config.bank_mem_bytes)
+            for what, size, splits in (
+                ('input frame', params['in_bytes'], "row bands (contract 'outer') or `cas_length` over input channels"),
+                ('output frame', params['out_bytes'], "row bands (contract 'outer') or `cas_num` over output channels"),
+                (
+                    'weights',
+                    params['weight_count'],
+                    '`cas_length` over input channels or `cas_num` over output '
+                    'channels; row bands copy the weights to every tile',
+                ),
+            ):
+                if int(size) > bank:
+                    raise ValueError(
+                        f"{node.name}: each tile's {what} is {size} B but one {device.platform} memory bank holds "
+                        f'{bank} B. What shrinks it, where the shape splits evenly: {splits}.'
+                    )
+            return
+        # The stream wrapper owns one frame each way, and its staging, in its own tile.
         tile_bytes = (
-            copies * (params['in_bytes'] + params['out_bytes']) + params['weight_count'] + 4 * params['bias_count']
+            params['in_bytes']
+            + params['out_bytes']
+            + params['weight_count']
+            + 4 * params['bias_count']
+            + self.staging_bytes(params)
         )
         if tile_bytes > int(device.tile_mem_bytes):
             raise ValueError(
@@ -284,6 +328,86 @@ class Conv2dOpImplVariant(OpImplVariant):
                 f'{device.platform} tile has {device.tile_mem_bytes} B; split the layer with '
                 '`parallelism: {cas_num: .., cas_length: ..}`.'
             )
+
+    def staging_bytes(self, _params) -> int:
+        """Tile memory the kernel holds beyond its frames. A buffer kernel holds none."""
+        return 0
+
+    def retiles_input(self, config: Conv2dConfig) -> bool:
+        """Whether this conv reads a frame a retiler built.
+
+        A strided window reads its columns grouped by residue, which neither source provides: the
+        boundary carries the tensor in plain order, and a producing kernel writes whole register
+        tiles, which span several groups. The stream variant refuses stride altogether.
+        """
+        return self.port_kind == PORT_KIND_BUFFER and int(config.strides[1]) > 1
+
+    @staticmethod
+    def retiled_frame(node) -> str:
+        """The execution-only tensor a retiler writes and this conv reads in place of its input."""
+        return f'{input_tensor_for_role(node, "lhs").name}__{node.name}_frame'
+
+    def input_conversions(self, node, config: Conv2dConfig, sources):
+        if not self.retiles_input(config):
+            return ()
+        lhs = input_tensor_for_role(node, 'lhs')
+        source = sources[lhs.name]
+        if source.view is not None:
+            raise NotImplementedError(
+                f'{node.name}: its strided input is the {source.view.kind} view {source.view.node!r}; a '
+                'retiler reads only the boundary tensor or a whole frame a kernel wrote.'
+            )
+        view = config.io_views[lhs.name]
+        from_boundary = source.producer is None
+        bands = int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else 1
+        if bands > 1 and not from_boundary:
+            raise NotImplementedError(
+                f'{node.name}: its strided input arrives from {source.producer} in row bands; a retiler reads a '
+                "producer's frame whole."
+            )
+        frame = self.retiled_frame(node)
+        retile = FrameRetileConfig.for_frame(
+            config.precision['lhs'],
+            view,
+            int(config.strides[1]),
+            source=lhs.name,
+            target=frame,
+            from_boundary=from_boundary,
+            bands=bands,
+            band_rows=self._band_input_rows(node, config),
+            alternating_horizontal=config.alternating_horizontal,
+            bank_mem_bytes=config.bank_mem_bytes,
+        )
+        # A performance constraint, not a functional one: a DMA copy of the finished frame would be
+        # exact, but its latency, interval and descriptor limits are unmeasured, while the shared hand-
+        # over is what every retiler figure was measured with. Until the copy is, the edge requires it.
+        return (
+            LayoutConversion(
+                name=f'{node.name}_retile',
+                source=lhs.name,
+                target=frame,
+                variant=FrameRetileOpImplVariant(),
+                config=retile,
+                shared_memory=True,
+            ),
+        )
+
+    def buffer_locations(self, _node, config: Conv2dConfig, anchor_row):
+        """The op contract Dense follows (`row_flow`), mirroring `place_graph`: chain `c` on row `c`, each
+        kernel's input and each chain's output in banks 0 and 3 of the neighbouring tile both kernels of
+        the hand-over reach."""
+        cas_num, cas_length = int(config.parallelism.cas_num), int(config.parallelism.cas_length)
+        outer = config.parallelism.contract == 'outer'
+        locations = []
+        for chain in range(cas_num):
+            flow = row_flow(config.alternating_horizontal, int(anchor_row) + chain, cas_length)
+            for pos in range(cas_length):
+                col = cas_length - 1 - pos if flow.reversed else pos
+                port = chain * cas_length + pos if outer else pos
+                locations.append(BufferLocation('in1', port, col + flow.input_col, chain, (0, 3)))
+            last = 0 if flow.reversed else cas_length - 1
+            locations.append(BufferLocation('out1', chain, last + flow.output_col, chain, (0, 3)))
+        return tuple(locations)
 
     def band_rows(self, node, config: Conv2dConfig) -> int:
         """Output rows one core call covers. A buffer kernel does the whole tile in one call; a
@@ -297,7 +421,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             band -= 1
         return band
 
-    def build_template_params(self, node, config: Conv2dConfig, _placement):
+    def build_template_params(self, node, config: Conv2dConfig, placement):
         lhs = input_tensor_for_role(node, 'lhs')
         out = node.outputs[0]
         in_view, out_view = config.io_views[lhs.name], config.io_views[out.name]
@@ -318,9 +442,10 @@ class Conv2dOpImplVariant(OpImplVariant):
         if outer:
             out_h //= int(config.parallelism.cas_num)
         # Who puts the zeros around the image: the kernel re-fills the border of a buffer another
-        # kernel wrote, the host delivers it with the padded window at the boundary, and the stream
-        # wrapper keeps it in a frame it owns.
-        fills_border = lhs.producer is not None and self.port_kind == PORT_KIND_BUFFER
+        # kernel wrote, the host delivers it with the padded window at the boundary, the stream
+        # wrapper keeps it in a frame it owns, and a retiler builds the whole frame.
+        retile = self.retiles_input(config)
+        fills_border = lhs.producer is not None and self.port_kind == PORT_KIND_BUFFER and not retile
         # A band's window starts mid-image, so the image no longer sits at the frame's origin.
         whole_image = not outer
         params = {field: getattr(config, field) for field in config.__dataclass_fields__}
@@ -346,7 +471,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             out_bytes=int(np.prod(out_view.tile)),
             weight_count=kh * kw * (in_channels // CHANNEL_BLOCK) * out_blocks_padded * CHANNEL_BLOCK**2,
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
-            buffer_locations=(),
+            buffer_locations=self.buffer_locations(node, config, int(placement['row'])),
             stream_io=self.port_kind == PORT_KIND_STREAM,
         )
         if streamed:
@@ -394,26 +519,32 @@ class Conv2dOpImplVariant(OpImplVariant):
         out_rows = spatial_access_of(node).output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
         return out_rows // int(config.parallelism.cas_num)
 
+    def _band_input_rows(self, node, config) -> int:
+        """Frame rows between the windows of neighbouring bands: each band's output rows, strided."""
+        return self._band_rows(node, config) * int(config.strides[0])
+
     def describe_input_staging(self, node, config, tensor_name, port, _buf_dims=None, _producer=None):
         if self.port_kind == PORT_KIND_STREAM:
-            return describe_stream_frame_staging(config.io_views[tensor_name], 'read')
+            return describe_logical_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one
-        # (band, channel slice) tile, so it selects both.
+        # (band, channel slice) tile, so it selects both. A retiled frame is the same frame, its
+        # columns grouped by residue, and the port reads it from the retiler.
         cas_length = int(config.parallelism.cas_length)
         outer = config.parallelism.contract == 'outer'
         band, channel_port = (int(port) // cas_length, int(port) % cas_length) if outer else (0, int(port))
         return describe_frame_staging(
-            config.io_views[tensor_name],
+            config.io_views[input_tensor_for_role(node, 'lhs').name],
             'read',
             channel_port,
             band=band,
-            band_rows=self._band_rows(node, config),
+            band_rows=self._band_input_rows(node, config),
+            column_phases=int(config.strides[1]) if self.retiles_input(config) else 1,
         )
 
     def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
         view = config.io_views[tensor_name]
         if self.port_kind == PORT_KIND_STREAM:
-            return describe_stream_frame_staging(view, 'write')
+            return describe_logical_staging(view, 'write')
         if config.flags.emit_flattened:
             return describe_inner_output_staging(view, port, buf_dims)
         outer = config.parallelism.contract == 'outer'
@@ -428,6 +559,9 @@ class Conv2dOpImplVariant(OpImplVariant):
     def build_ports(self, node: OpNode, config: Conv2dConfig):
         cas_length = int(config.parallelism.cas_length)
         cas_num = int(config.parallelism.cas_num)
+        lhs = input_tensor_for_role(node, 'lhs')
+        # A retiled conv reads the frame its retiler writes, not the tensor itself.
+        in_tensor = self.retiled_frame(node) if self.retiles_input(config) else lhs.name
         if config.parallelism.contract == 'outer':
             # Every tile reads its own band, so no port is shared.
             lhs_endpoints = tuple((f'kk[{tile}].in[0]',) for tile in range(cas_num * cas_length))
@@ -438,9 +572,8 @@ class Conv2dOpImplVariant(OpImplVariant):
                 for port in range(cas_length)
             )
         out_endpoints = tuple((f'kk[{chain * cas_length + cas_length - 1}].out[0]',) for chain in range(cas_num))
-        lhs = input_tensor_for_role(node, 'lhs')
         return PortMap(
-            inputs={lhs.name: PortBinding('in1', len(lhs_endpoints), self.port_kind, lhs_endpoints)},
+            inputs={in_tensor: PortBinding('in1', len(lhs_endpoints), self.port_kind, lhs_endpoints)},
             outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.port_kind, out_endpoints)},
         )
 
@@ -570,6 +703,11 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
         config = super().resolve(node, device, directives)
+        if config.strides != (1, 1):
+            raise NotImplementedError(
+                f'{node.name}: {self.variant_id} does not implement strides {config.strides}; the '
+                'band it keeps and the columns it places are both written for a dense window.'
+            )
         if config.parallelism.cas_num != 1 or config.parallelism.cas_length != 1:
             raise NotImplementedError(f'{node.name}: {self.variant_id} does not implement partitioning yet.')
         if config.flags.emit_flattened:
@@ -595,6 +733,20 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
                     f'{node.name}: its {name} is {elements} bytes, which is not a whole number of '
                     f'{beat}-byte stream beats.'
                 )
+
+    def buffer_locations(self, _node, _config, _anchor_row):
+        return ()  # core streams: no buffer to place
+
+    def staging_bytes(self, params) -> int:
+        """A channel count that does not fill a block stages the band's bytes in a buffer: the
+        wire reads into one before placing, and gathers into one before writing, because a stream
+        access inside either loop stops it pipelining."""
+        total = 0
+        if int(params['cin']) % CHANNEL_BLOCK:
+            total += int(params['in_rows']) * int(params['in_w']) * int(params['cin']) + 16
+        if int(params['cout']) % CHANNEL_BLOCK:
+            total += int(params['band_rows']) * int(params['out_w']) * int(params['cout']) + 16
+        return total
 
     def footprint(self, _node, _config) -> OpImplFootprint:
         return OpImplFootprint(width=1, height=1)

@@ -4,6 +4,7 @@ declares the same contract and reuses the frame builder unchanged."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional, Sequence, Tuple
 
@@ -101,10 +102,17 @@ def build_padded_spatial_view(
     stride_w = int(access.strides[1]) if access else 1
     out_width = access.output_extent(height, width)[1] if access else width
     origin_col = align_up(left, int(column_align))
+    computed_w = align_up(out_width, int(column_block))
     columns = max(
         origin_col + align_up(width, int(column_block)),
-        origin_col - left + (align_up(out_width, int(column_block)) - 1) * stride_w + span_w,
+        origin_col - left + (computed_w - 1) * stride_w + span_w,
     )
+    if stride_w > 1:
+        # A strided frame holds its columns in `stride_w` polyphase classes, so every class must be
+        # long enough for the computed width plus the taps that reach past it, and the row must
+        # hold whole classes.
+        phase_cols = computed_w + (span_w - 1 + origin_col - left) // stride_w
+        columns = max(columns, stride_w * phase_cols)
     padded_channels = align_up(channels, int(inner_block))
     if padded_channels % (int(inner_block) * int(inner_slices)):
         raise ValueError(
@@ -115,7 +123,8 @@ def build_padded_spatial_view(
     out_height = access.output_extent(height, width)[0] if access else height
     if out_height % int(row_slices):
         raise ValueError(f'{out_height} output rows do not split into {row_slices} equal bands.')
-    full = (batch, top + height + bottom, align_up(columns, max(1, int(row_bytes_align))), padded_channels)
+    column_align_bytes = int(row_bytes_align) * stride_w // math.gcd(int(row_bytes_align) or 1, stride_w)
+    full = (batch, top + height + bottom, align_up(columns, max(1, column_align_bytes)), padded_channels)
     tile = (
         batch,
         (out_height // int(row_slices) - 1) * stride_h + span_h,
