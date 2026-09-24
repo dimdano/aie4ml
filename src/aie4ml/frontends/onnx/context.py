@@ -123,6 +123,20 @@ class OnnxImportContext:
         else:
             self.value_orders[name] = order
 
+    def canonical_axis(self, name: str, onnx_axis: int) -> int:
+        """The canonical axis that ONNX value `name` calls `onnx_axis`: an axis a view op records."""
+        order = self.value_orders.get(name)
+        return int(order[onnx_axis]) if order is not None else int(onnx_axis)
+
+    def canonical_shape(self, name: str, node_name: str) -> Tuple[int, ...]:
+        """The canonical shape behind ONNX value `name`, whose shape is seen through its view."""
+        view_shape = self.output_shape(name, node_name)
+        order = self.value_orders.get(name) or tuple(range(len(view_shape)))
+        shape = [0] * len(view_shape)
+        for view_axis, canonical_axis in enumerate(order):
+            shape[int(canonical_axis)] = int(view_shape[view_axis])
+        return tuple(shape)
+
     def propagate_order(self, src: str, dst: str) -> None:
         """Carry a value's view across an op that changes neither shape nor axis order."""
         order = self.value_orders.get(src)

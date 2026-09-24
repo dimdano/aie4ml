@@ -20,6 +20,9 @@ def _row_permutation(shape, axis_order):
     return rows.transpose(canonical_axes).reshape(-1)
 
 
+_VIEW_OPS = ('concat', 'slice', 'split')
+
+
 class FoldViewOps(AIEPass):
     """Lower semantic view ops into explicit tensor view traits."""
 
@@ -75,6 +78,13 @@ class FoldViewOps(AIEPass):
             raise ValueError(f'{node.name}: invalid permutation {perm} for rank {rank}.')
         if (node.metadata.get('data_format', 'channels_last') or '').lower() != 'channels_last':
             raise ValueError(f'{node.name}: only channels_last transpose is supported.')
+
+        views = [c.name for c in out_tv.consumers if c.op_type in _VIEW_OPS]
+        if views:
+            raise NotImplementedError(
+                f'{node.name}: transpose feeds the view op(s) {views}, whose axes would then name the untransposed '
+                'tensor; a view op must be recorded on the canonical tensor.'
+            )
 
         # buffer_order is derived (the fixed axis reversal); only perm is view data.
         in_view = {

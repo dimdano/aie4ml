@@ -130,8 +130,10 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
             ranges.append((offset, size))
             offset += size
 
-    source = ctx.canonical_source(src_name, node_name)
-    outputs = [(out_name, ctx.output_shape(out_name, node_name), source.precision) for out_name in node.output]
+    source = ctx.source_for(src_name, node_name)
+    for out_name in node.output:
+        ctx.propagate_order(src_name, out_name)
+    outputs = [(out_name, ctx.canonical_shape(out_name, node_name), source.precision) for out_name in node.output]
     ctx.emit(
         op_type.lower(),
         node_name,
@@ -139,7 +141,7 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
         outputs=outputs,
         roles=['lhs'],
         metadata={
-            'axis': axis,
+            'axis': ctx.canonical_axis(src_name, axis),
             'slices': [{'start': start, 'extent': extent} for start, extent in ranges],
             'layer_class': op_type,
             'source_class': op_type,
@@ -153,7 +155,7 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
 def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
     if len(node.input) < 1:
         raise ValueError(f'{node_name}: Concat must have at least one input.')
-    sources = [ctx.canonical_source(name, node_name) for name in node.input]
+    sources = [ctx.source_for(name, node_name) for name in node.input]
     if any(src.is_parameter for src in sources):
         raise ValueError(f'{node_name}: Concat currently supports activation tensors only.')
 
@@ -164,6 +166,13 @@ def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> N
     if any(len(shape) != rank for shape in shapes):
         raise ValueError(f'{node_name}: Concat inputs must have the same rank.')
     axis = normalize_axis(int(attr(node, 'axis', -1)), rank, node_name, 'Concat')
+    orders = {ctx.order_of(name) or tuple(range(rank)) for name in node.input}
+    if len(orders) != 1:
+        raise ValueError(
+            f'{node_name}: Concat inputs view their tensors in different axis orders {sorted(orders)}, so axis '
+            f'{axis} is canonical axis {sorted({ctx.canonical_axis(name, axis) for name in node.input})} of them; '
+            'concatenating them is not one concat of canonical tensors.'
+        )
 
     prefix, suffix = tuple(shapes[0][:axis]), tuple(shapes[0][axis + 1 :])
     for shape in shapes[1:]:
@@ -175,13 +184,14 @@ def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> N
         if src.precision != precision:
             raise ValueError(f'{node_name}: Concat inputs must use identical precision contracts.')
 
+    ctx.propagate_order(node.input[0], node.output[0])
     ctx.emit(
         'concat',
         node_name,
         inputs=sources,
-        outputs=[(node.output[0], ctx.output_shape(node.output[0], node_name), precision)],
+        outputs=[(node.output[0], ctx.canonical_shape(node.output[0], node_name), precision)],
         metadata={
-            'axis': axis,
+            'axis': ctx.canonical_axis(node.input[0], axis),
             'layer_class': 'Concat',
             'source_class': 'Concat',
             'source_layer': node_name,
