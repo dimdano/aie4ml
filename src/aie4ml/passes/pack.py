@@ -25,9 +25,6 @@ class PackKernelArtifacts(AIEPass):
             if type(inst.variant).pack is OpImplVariant.pack:
                 continue
 
-            if 'packed_weights' in inst.artifacts:
-                continue
-
             packed = inst.variant.pack(inst)
 
             if packed:

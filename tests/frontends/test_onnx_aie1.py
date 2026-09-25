@@ -14,7 +14,7 @@ from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
 from aie4ml.op_impls.families.matmul.common import select_generation_key
 from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
 from aie4ml.op_impls.utils.precision import infer_accumulator_tag
-from aie4ml.passes import Resolve
+from aie4ml.passes import PackKernelArtifacts, Resolve
 from aie4ml.writer import AIEProjectEmitter
 from helpers import TensorProto, helper, make_model, numpy_helper
 from jinja2 import Environment, FileSystemLoader
@@ -394,6 +394,16 @@ def test_an_output_view_the_family_cannot_write_is_refused(tmp_path, view, match
     next(node for node in ctx.ir.logical if node.name == 'dense_aie').add_trait(TraitInstance('output_view', view))
     with pytest.raises(ValueError, match=match):
         Resolve().transform(ctx)
+
+
+def test_resolving_again_repacks_the_current_weights(tmp_path):
+    ctx = _run_pipeline(_dense_model(), tmp_path).context
+    first = ctx.ir.execution.get('dense_aie').artifacts['packed_weights'].copy()
+    weights = next(t for t in ctx.ir.execution.get('dense_aie').node.inputs if t.is_parameter)
+    weights.data = -weights.data
+    Resolve().transform(ctx)
+    PackKernelArtifacts().transform(ctx)
+    assert np.array_equal(ctx.ir.execution.get('dense_aie').artifacts['packed_weights'], -first)
 
 
 def test_a_tensor_read_as_two_operands_is_refused(tmp_path):

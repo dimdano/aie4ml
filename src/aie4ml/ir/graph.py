@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -500,15 +500,6 @@ class ExecutionIR:
         self.values.clear()
         self.graph_inputs = ()
         self.graph_outputs = ()
-
-    def prune(self, active_names: Iterable[str]) -> bool:
-        keep = set(active_names)
-        removed = False
-        for name in list(self.instances.keys()):
-            if name not in keep:
-                del self.instances[name]
-                removed = True
-        return removed
 
     def verify(self) -> None:
         visited = set()

@@ -34,10 +34,6 @@ def _resolved_input_contracts(ctx, node) -> dict[str, TensorContract]:
     }
 
 
-def _same_execution_entry(inst, variant, ports, config) -> bool:
-    return inst.variant is variant and inst.ports == ports and inst.config == config
-
-
 def _check_transposed_views(node, config, variant) -> None:
     """A folded transpose needs both halves: the DMA walks the microtile grid in view order and
     the kernel transposes each block on load. Refuse rather than feed a kernel permuted data.
@@ -111,10 +107,7 @@ class Resolve(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         ctx.ir.logical.verify()
-        changed = False
-        visited = set()
-
-        ctx.ir.execution.tensor_contracts.clear()
+        ctx.ir.execution.clear()
 
         for node in ctx.ir.logical:
             if node.is_placeholder:
@@ -133,10 +126,6 @@ class Resolve(AIEPass):
             ports = variant.build_ports(node, config)
             variant.validate_ports(node, ports, ctx.device)
 
-            # Registered afresh even when unchanged: a later lowering pass may have rewired the old
-            # entry (a layout conversion in front of it), and it rewires the new one again.
-            previous = ctx.ir.execution.get(node.name)
-            same = previous is not None and _same_execution_entry(previous, variant, ports, config)
             inputs = tuple(ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter)
             outputs = tuple(t.name for t in node.outputs)
             inst = ctx.ir.execution.register(
@@ -152,14 +141,7 @@ class Resolve(AIEPass):
                 inputs=inputs,
                 outputs=outputs,
             )
-            if same:
-                inst.artifacts = previous.artifacts
             _propagate_contracts(ctx, node, inst, config)
-            visited.add(node.name)
-            changed = changed or not same
 
-        if ctx.ir.execution.prune(visited):
-            changed = True
         _build_execution_values(ctx)
-
-        return changed
+        return True
