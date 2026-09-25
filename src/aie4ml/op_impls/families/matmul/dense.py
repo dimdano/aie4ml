@@ -137,7 +137,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         shift += resolve_output_scale_shift(node, is_float=is_float)
 
         fused_act = node.traits.get('fused_activation')
-        use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
+        use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
 
         return DenseConfig(
             precision=precision,

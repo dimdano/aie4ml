@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Tuple
 
-from ...ir import OpNode
+from ...ir import ExecutionView, OpNode
 from ...op_impls.utils.tensor_view import map_view_axis
 from .model import Connection, EdgeEntry, Endpoint
 
@@ -39,18 +39,14 @@ class TransportCollector:
             for item in inst.inputs:
                 tname = item.tensor
                 cg = inst.ports.inputs[tname].group
-                concat_view = self._concat_view_for_tensor(tname)
-                if concat_view is not None:
-                    connections.extend(self._concat_connections(n, tname, cg, concat_view, producers))
+                view = self.execution.values[tname].view
+                if view is not None:
+                    if view.kind == 'concat':
+                        connections.extend(self._concat_connections(n, tname, cg, view, producers))
+                    else:
+                        connections.append(self._slice_connection(n, tname, cg, view, producers))
                     seen_outputs.add(tname)
-                    for view_item in concat_view.get('slices', []):
-                        seen_outputs.add(str(view_item['input']))
-                    continue
-                slice_view = self._slice_view_for_tensor(tname)
-                if slice_view is not None:
-                    connections.append(self._slice_connection(n, tname, cg, slice_view, producers))
-                    seen_outputs.add(tname)
-                    seen_outputs.add(str(slice_view['source']))
+                    seen_outputs.update(view.sources)
                     continue
                 if tname in producers:
                     p, pg = producers[tname]
@@ -69,39 +65,16 @@ class TransportCollector:
 
         return connections
 
-    def _concat_view_for_tensor(self, tensor: str) -> Optional[Dict[str, Any]]:
-        view = self.execution.values[tensor].view
-        if view is None or view.kind != 'concat':
-            return None
-        data = dict(view.data)
-        if data.get('output') != tensor:
-            raise ValueError(f'{view.node}: concat_view output does not match tensor {tensor!r}.')
-        return data
-
-    def _slice_view_for_tensor(self, tensor: str) -> Optional[Dict[str, Any]]:
-        view = self.execution.values[tensor].view
-        if view is None or view.kind not in ('slice', 'split'):
-            return None
-        data = dict(view.data)
-        matches = [item for item in data.get('slices', []) if item.get('output') == tensor]
-        if len(matches) != 1:
-            raise ValueError(f'{view.node}: slice_view does not define output tensor {tensor!r} exactly once.')
-        return {
-            'source': str(data['source']),
-            'axis': int(data['axis']),
-            'start': int(matches[0]['start']),
-            'extent': int(matches[0]['extent']),
-        }
-
     def _slice_connection(
         self,
         consumer: OpNode,
         slice_tensor: str,
         consumer_group: str,
-        slice_view: Dict[str, Any],
+        view: ExecutionView,
         producers: Dict[str, Tuple[OpNode, str]],
     ) -> Connection:
-        source_name = str(slice_view['source'])
+        part = view.parts[0]
+        source_name = part.source
         producer, producer_group = self._kernel_source(
             slice_tensor,
             source_name,
@@ -111,9 +84,9 @@ class TransportCollector:
         ports, offset_base, buffer_dimension = self._slice_producer_ports(
             producer,
             source_name,
-            int(slice_view['axis']),
-            int(slice_view['start']),
-            int(slice_view['extent']),
+            view.axis,
+            part.start,
+            part.extent,
         )
         return Connection(
             slice_tensor,
@@ -132,7 +105,7 @@ class TransportCollector:
         self, producer: OpNode, source_tensor: str, axis: int, start: int, extent: int
     ) -> Tuple[Tuple[int, ...], Tuple[int, ...], Tuple[int, ...]]:
         inst = self._kernel_inst(producer)
-        view = inst.config.io_views[source_tensor]
+        view = inst.port_views[source_tensor]
         axis_dim = self._view_axis_to_buffer_dim(view, axis)
         total_ports = int(inst.ports.outputs[source_tensor].count)
         end = int(start) + int(extent)
@@ -169,17 +142,17 @@ class TransportCollector:
         consumer: OpNode,
         concat_tensor: str,
         consumer_group: str,
-        concat_view: Dict[str, Any],
+        concat_view: ExecutionView,
         producers: Dict[str, Tuple[OpNode, str]],
     ) -> List[Connection]:
         ports_by_source = self._concat_consumer_ports(consumer, concat_tensor, concat_view)
         conns: List[Connection] = []
-        for item in concat_view.get('slices', []):
-            source_name = str(item['input'])
-            ports = tuple(ports_by_source.get(source_name, ()))
+        for part in concat_view.parts:
+            source_name = part.source
+            ports = tuple(ports_by_source[source_name])
             if not ports:
                 continue
-            offset_base = self._concat_consumer_offset_base(consumer, concat_tensor, concat_view, int(item['start']))
+            offset_base = self._concat_consumer_offset_base(consumer, concat_tensor, concat_view, part.start)
             producer, producer_group = self._kernel_source(
                 concat_tensor,
                 source_name,
@@ -202,30 +175,24 @@ class TransportCollector:
         return conns
 
     def _concat_consumer_offset_base(
-        self, consumer: OpNode, concat_tensor: str, concat_view: Dict[str, Any], start: int
+        self, consumer: OpNode, concat_tensor: str, concat_view: ExecutionView, start: int
     ) -> Tuple[int, ...]:
         inst = self._kernel_inst(consumer)
-        view = inst.config.io_views[concat_tensor]
-        axis_dim = self._view_axis_to_buffer_dim(view, int(concat_view['axis']))
+        view = inst.port_views[concat_tensor]
+        axis_dim = self._view_axis_to_buffer_dim(view, concat_view.axis)
         return tuple(int(start) if dim == axis_dim else 0 for dim in range(view.rank))
 
     def _concat_consumer_ports(
-        self, consumer: OpNode, concat_tensor: str, concat_view: Dict[str, Any]
+        self, consumer: OpNode, concat_tensor: str, concat_view: ExecutionView
     ) -> Dict[str, List[int]]:
         inst = self._kernel_inst(consumer)
         if inst is None:
             raise RuntimeError(f'{concat_tensor}: concat consumer {consumer.name!r} is not resolved.')
         total_ports = int(inst.ports.inputs[concat_tensor].count)
-        slices = [
-            (str(item['input']), int(item['start']), int(item['start']) + int(item['extent']))
-            for item in concat_view.get('slices', [])
-        ]
-        if not slices:
-            raise ValueError(f'{concat_tensor}: concat_view has no input slices.')
-
+        slices = [(part.source, part.start, part.start + part.extent) for part in concat_view.parts]
         out: Dict[str, List[int]] = {name: [] for name, _, _ in slices}
-        axis = int(concat_view['axis'])
-        view = inst.config.io_views[concat_tensor]
+        axis = concat_view.axis
+        view = inst.port_views[concat_tensor]
         axis_dim = self._view_axis_to_buffer_dim(view, axis)
         for port in range(total_ports):
             desc = inst.variant.describe_input_staging(consumer, inst.config, concat_tensor, port, None, None)

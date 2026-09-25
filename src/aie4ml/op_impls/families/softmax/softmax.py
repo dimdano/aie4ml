@@ -31,6 +31,12 @@ EXP_ZF = 8
 EXP_KQ_MAX = 32767 // 255
 
 
+def _input_scale(node: OpNode) -> float:
+    """The runtime scale folded into this Softmax (`fold_scale`); 1.0 when none was."""
+    trait = node.traits.get('input_scale')
+    return 1.0 if trait is None else float(trait.data['scale'])
+
+
 def _requested_approximation(node: OpNode) -> str:
     """The approximation this node asks for. Default 'exp': a plain ONNX Softmax with no directive
     lowers to the accurate integer exp, which needs no calibration."""
@@ -291,7 +297,7 @@ class _SoftmaxHccsBase(_SoftmaxVariantBase):
 
     def _resolve_params(self, node: OpNode, directives, full_inner: int, cas_num: int) -> Dict[str, Any]:
         hccs = _parse_hccs_directives(node.name, directives)
-        input_scale = float(node.trait_data('input_scale').get('scale', 1.0))
+        input_scale = _input_scale(node)
         if abs(input_scale - 1.0) > 1e-9:
             raise ValueError(
                 f'{node.name}: {self.variant_id} cannot apply a runtime input_scale={input_scale}; bake the '
@@ -362,7 +368,7 @@ class _SoftmaxExpBase(_SoftmaxVariantBase):
         in_prec = resolve_exact_storage_dtype(
             input_tensor_for_role(node, 'lhs').precision, namespace='lhs', layer_name=node.name
         )
-        temperature = float(node.trait_data('input_scale').get('scale', 1.0))
+        temperature = _input_scale(node)
         input_scale = (2.0 ** -int(in_prec.frac)) * temperature
         return {
             'param_sets': 1,
@@ -376,7 +382,7 @@ class _SoftmaxExpBase(_SoftmaxVariantBase):
         super().validate_config(node, config, device)
         kq = int(config.exp_kq)
         if not (1 <= kq <= EXP_KQ_MAX):
-            input_scale = float(node.trait_data('input_scale').get('scale', 1.0))
+            input_scale = _input_scale(node)
             raise ValueError(
                 f'{node.name}: exp Softmax needs 1 <= EXP_KQ <= {EXP_KQ_MAX}, got {kq} for input_scale='
                 f'{input_scale}. The input fixed-point scale is out of range (roughly frac in [2, 9]): too '

@@ -73,7 +73,7 @@ def serialize_op_impl_instance(inst: ExecutionEntry) -> Dict[str, Any]:
         'outputs': list(inst.outputs),
         'ports': to_plain(inst.ports),
         'io_route': to_plain(inst.io_route),
-        'io_views': to_plain(inst.io_views),
+        'port_views': to_plain(inst.port_views),
         'graph_header': inst.graph_header,
         'graph_name': inst.graph_name,
         'param_template': inst.param_template,

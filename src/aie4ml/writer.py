@@ -82,7 +82,7 @@ class AIEProjectEmitter:
                     'param_template': inst.param_template,
                     'parameters': variant.build_template_params(node, inst.config, placement),
                 },
-                'io_views': inst.io_views,
+                'port_views': inst.port_views,
                 'placement': placement,
                 'artifacts': artifacts,
             }

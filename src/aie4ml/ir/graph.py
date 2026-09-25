@@ -72,9 +72,6 @@ class OpNode:
     def add_trait(self, trait: TraitInstance) -> None:
         self.traits[trait.name] = trait
 
-    def trait_data(self, name: str) -> Dict[str, Any]:
-        return self.traits.get(name, TraitInstance(name)).data
-
 
 def set_input_roles(node: OpNode, tensors: Sequence[TensorVar], role_names: Sequence[str]) -> None:
     if len(tensors) != len(role_names):
@@ -319,9 +316,6 @@ ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'auto'})
 VIEW_FLATTEN_2D = 'flatten_2d'
 """Output view: the producer writes its result as one `[1, K]` row instead of its natural shape."""
 
-OUTPUT_VIEWS: frozenset = frozenset({VIEW_FLATTEN_2D})
-"""Compiler-wide vocabulary of output views a producing family may be asked to emit."""
-
 TENSOR_LAYOUTS: frozenset = frozenset({'linear', 'tiled'})
 """Valid `layout:` directive names. Only a variant selector -- the layout itself is the
 staging descriptor, not a name."""
@@ -354,21 +348,40 @@ class ExecutionInput:
 
 
 @dataclass(frozen=True)
+class ViewPart:
+    """`extent` elements along the view's axis of `source`, starting at `start`."""
+
+    source: str
+    start: int
+    extent: int
+
+
+@dataclass(frozen=True)
 class ExecutionView:
-    """A folded view (slice, split, concat): no kernel; transport maps its readers onto its sources."""
+    """A value no kernel writes, folded from a slice, split or concat (`kind`, the op `node`); transport maps
+    its readers onto its sources. A slice or split output is one part, a window of its source starting at
+    `start`; a concat places each whole source at its `start` in the value, in order along `axis`."""
 
     kind: str
     node: str
-    data: Tuple[Tuple[str, Any], ...]
+    axis: int
+    parts: Tuple[ViewPart, ...]
 
-    def get(self, key: str, default: Any = None) -> Any:
-        return dict(self.data).get(key, default)
+    def __post_init__(self) -> None:
+        if self.kind not in ('slice', 'split', 'concat') or not self.parts:
+            raise ValueError(f'{self.node}: a {self.kind!r} view with parts {self.parts}.')
+        if self.kind != 'concat' and len(self.parts) != 1:
+            raise ValueError(f'{self.node}: a {self.kind} output is one window of its source, not {self.parts}.')
+        if self.axis < 0 or any(part.start < 0 or part.extent <= 0 for part in self.parts):
+            raise ValueError(f'{self.node}: view axis {self.axis} or parts {self.parts} out of range.')
+        if self.kind == 'concat':
+            ends = [0] + [part.start + part.extent for part in self.parts]
+            if any(part.start != end for part, end in zip(self.parts, ends)):
+                raise ValueError(f'{self.node}: concat parts {self.parts} do not tile the value in order.')
 
     @property
     def sources(self) -> Tuple[str, ...]:
-        if self.kind == 'concat':
-            return tuple(str(item['input']) for item in self.get('slices', ()))
-        return (str(self.get('source')),)
+        return tuple(part.source for part in self.parts)
 
 
 @dataclass(frozen=True)
@@ -393,7 +406,7 @@ class ExecutionEntry:
     variant: 'OpImplVariant'
     ports: Any
     io_route: Dict[str, Any]
-    io_views: Dict[str, Any]
+    port_views: Dict[str, Any]  # the view of each value it reads or writes; config.io_views is the kernel's own
     config: Any
     graph_header: str
     graph_name: str
@@ -437,7 +450,7 @@ class ExecutionIR:
         variant: 'OpImplVariant',
         ports: Any,
         io_route: Dict[str, Any],
-        io_views: Dict[str, Any],
+        port_views: Dict[str, Any],
         config: Any,
         graph_header: str,
         graph_name: str,
@@ -450,7 +463,7 @@ class ExecutionIR:
             variant=variant,
             ports=ports,
             io_route=io_route,
-            io_views=io_views,
+            port_views=port_views,
             config=config,
             graph_header=graph_header,
             graph_name=graph_name,
@@ -527,6 +540,9 @@ class ExecutionIR:
                     raise RuntimeError(
                         f'{inst.name}: requires {item.tensor!r} through shared memory, but no kernel writes it.'
                     )
+            bound = {item.tensor for item in inst.inputs} | set(inst.outputs)
+            if set(inst.port_views) != bound:
+                raise RuntimeError(f'{inst.name}: has views for {sorted(inst.port_views)}, but binds {sorted(bound)}.')
             for name in inst.outputs:
                 value = self.values.get(name)
                 if value is None or value.producer != inst.name:

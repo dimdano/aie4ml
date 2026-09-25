@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from ..ir import get_backend_context
-from ..ir.graph import ExecutionInput, ExecutionValue, ExecutionView, TensorContract, input_role
+from ..ir.graph import ExecutionInput, ExecutionValue, ExecutionView, TensorContract, ViewPart, input_role
 from ..op_impls import get_family_resolver_registry
-from ..op_impls.utils.io import ensure_io_view, normalized_staging, resolve_io_route
+from ..op_impls.utils.io import check_io_view, normalized_staging, resolve_io_route
 from .base import AIEPass
 
 
@@ -58,7 +58,28 @@ def _check_transposed_views(node, config, variant) -> None:
             )
 
 
-_VIEW_TRAITS = ('slice_view', 'concat_view')
+def _folded_views(node):
+    """(value, view) for each output of a folded slice, split or concat, checked against the trait's schema."""
+
+    def trait(name, keys, part_keys):
+        data = node.traits[name].data
+        if set(data) != keys or any(set(item) != part_keys for item in data['slices']):
+            raise ValueError(f'{node.name}: malformed {name} {data}.')
+        return data
+
+    if 'concat_view' in node.traits:
+        data = trait('concat_view', {'kind', 'axis', 'output', 'slices'}, {'input', 'start', 'extent'})
+        parts = tuple(ViewPart(str(s['input']), int(s['start']), int(s['extent'])) for s in data['slices'])
+        views = [(str(data['output']), ExecutionView('concat', node.name, int(data['axis']), parts))]
+    else:
+        data = trait('slice_view', {'kind', 'axis', 'source', 'slices'}, {'output', 'start', 'extent'})
+        views = []
+        for s in data['slices']:
+            part = ViewPart(str(data['source']), int(s['start']), int(s['extent']))
+            views.append((str(s['output']), ExecutionView(node.op_type, node.name, int(data['axis']), (part,))))
+    if sorted(name for name, _ in views) != sorted(tensor.name for tensor in node.outputs):
+        raise ValueError(f'{node.name}: its view names {sorted(name for name, _ in views)}, not its outputs.')
+    return views
 
 
 def _build_execution_values(ctx) -> None:
@@ -72,12 +93,9 @@ def _build_execution_values(ctx) -> None:
     for name in execution.graph_inputs:
         execution.add_value(ExecutionValue(name))
     for node in ctx.ir.logical:
-        trait = next((node.traits[t] for t in _VIEW_TRAITS if node.is_placeholder and t in node.traits), None)
-        if trait is None:
-            continue
-        view = ExecutionView(kind=node.op_type, node=node.name, data=tuple(trait.data.items()))
-        for tensor in node.outputs:
-            execution.add_value(ExecutionValue(tensor.name, view=view))
+        if node.is_placeholder and ('slice_view' in node.traits or 'concat_view' in node.traits):
+            for name, view in _folded_views(node):
+                execution.add_value(ExecutionValue(name, view=view))
     for inst in execution:
         for name in inst.outputs:
             execution.add_value(ExecutionValue(name, producer=inst.name))
@@ -103,7 +121,7 @@ class Resolve(AIEPass):
                 continue
 
             resolver = self._registry.get(node.op_type)
-            ensure_io_view(node, ctx.device.generation)
+            check_io_view(node, ctx.device.generation)
 
             resolved_directives = dict(node.directives or {})
             resolved_directives['io_route'] = resolve_io_route(node)  # user intents
@@ -119,20 +137,20 @@ class Resolve(AIEPass):
             # entry (a layout conversion in front of it), and it rewires the new one again.
             previous = ctx.ir.execution.get(node.name)
             same = previous is not None and _same_execution_entry(previous, variant, ports, config)
+            inputs = tuple(ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter)
+            outputs = tuple(t.name for t in node.outputs)
             inst = ctx.ir.execution.register(
                 node=node,
                 variant=variant,
                 ports=ports,
                 io_route=dict(config.io_route),
-                io_views=config.io_views,
+                port_views={name: config.io_views[name] for name in (*(item.tensor for item in inputs), *outputs)},
                 config=config,
                 graph_header=variant.graph_header,
                 graph_name=variant.graph_name,
                 param_template=variant.param_template,
-                inputs=tuple(
-                    ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter
-                ),
-                outputs=tuple(t.name for t in node.outputs),
+                inputs=inputs,
+                outputs=outputs,
             )
             if same:
                 inst.artifacts = previous.artifacts

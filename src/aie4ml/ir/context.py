@@ -7,43 +7,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 from .graph import AIEPipelineIR
 
 CONTEXT_ATTR = '_aie_backend_context'
-
-
-@dataclass
-class TraitDefinition:
-    """Describes an optional capability attached to IR nodes."""
-
-    name: str
-    dialects: Tuple[str, ...]
-    fields: Tuple[str, ...] = ()
-    description: str = ''
-
-    def supports(self, dialect: str) -> bool:
-        return not self.dialects or dialect in self.dialects
-
-
-@dataclass
-class TraitRegistry:
-    """Central registry of trait definitions."""
-
-    _traits: Dict[str, TraitDefinition] = field(default_factory=dict)
-
-    def register(self, trait: TraitDefinition) -> None:
-        self._traits[trait.name] = trait
-
-    def get(self, name: str) -> TraitDefinition:
-        try:
-            return self._traits[name]
-        except KeyError as exc:
-            raise KeyError(f'Unknown trait "{name}".') from exc
-
-    def supported_for(self, dialect: str) -> List[TraitDefinition]:
-        return [trait for trait in self._traits.values() if trait.supports(dialect)]
 
 
 @dataclass
@@ -174,13 +142,12 @@ def detect_dialect(generation: str) -> str:
 
 @dataclass
 class AIEBackendContext:
-    """Container carrying IR graph, device spec, traits and policies."""
+    """Container carrying IR graph, device spec and policies."""
 
     device: DeviceSpec
     policies: BackendPolicies
     project_config: ProjectConfig
     aie_config: Dict[str, Any] = field(default_factory=dict)
-    traits: TraitRegistry = field(default_factory=TraitRegistry)
     ir: AIEPipelineIR = field(default_factory=AIEPipelineIR)
 
     def reset_ir(self) -> None:

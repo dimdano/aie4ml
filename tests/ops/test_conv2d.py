@@ -233,7 +233,7 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
     assert {inst.variant.variant_id for inst in (c1, c2, c3)} == {'conv2d.b.r.v1'}
     assert fc.variant.variant_id == 'dense.b.r.v1'
     assert 'fused_activation' in c1.node.traits and 'bias' in c1.node.roles.values()
-    assert c3.node.trait_data('output_view')['kind'] == 'flatten_2d' and c3.config.flags.emit_flattened
+    assert c3.node.traits['output_view'].data == {'kind': 'flatten_2d'} and c3.config.flags.emit_flattened
     assert (c2.config.spatial.kernel, c2.config.spatial.pads, c2.config.groups) == ((3, 3), (1, 1, 1, 1), C2)
 
     # The graph input's frame: 3 channels padded to one 8-block, a 1-pixel zero border, and the

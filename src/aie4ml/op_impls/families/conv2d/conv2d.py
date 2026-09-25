@@ -7,7 +7,14 @@ from typing import Any, ClassVar, Dict
 import numpy as np
 
 from ....aie_types import FloatIntent
-from ....ir.graph import STAGING_CONTRACTS, OpImplInstance, OpNode, input_role, input_tensor_for_role
+from ....ir.graph import (
+    STAGING_CONTRACTS,
+    VIEW_FLATTEN_2D,
+    OpImplInstance,
+    OpNode,
+    input_role,
+    input_tensor_for_role,
+)
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
@@ -120,8 +127,9 @@ class Conv2dOpImplVariant(OpImplVariant):
         microtiling = MatmulMicrotileConfig(microtile_m=m, microtile_k=k, microtile_n=n)
         spatial_blocks = _SPATIAL_BLOCKS[generation]
 
-        view = node.trait_data('output_view')
-        parallelism = self._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=bool(view))
+        view = node.traits.get('output_view')
+        flatten = view is not None and view.data['kind'] == VIEW_FLATTEN_2D
+        parallelism = self._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=flatten)
         block = spatial_blocks * m
         outer = parallelism.contract == 'outer'
         row_slices = parallelism.cas_num if outer else 1
@@ -130,7 +138,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 lhs, column_block=block, column_align=m, channel_slices=parallelism.cas_length, row_slices=row_slices
             ),
         }
-        if view:
+        if flatten:
             if int(rhs.shape[-1]) % CHANNEL_BLOCK:
                 raise NotImplementedError(
                     f'{node.name}: a flattened conv needs output channels in whole {CHANNEL_BLOCK}-blocks, '
@@ -163,7 +171,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         shift = resolve_accumulator_output_shift(lhs.precision, out.precision, rhs.precision)
         shift += resolve_output_scale_shift(node, is_float=False)
         fused_act = node.traits.get('fused_activation')
-        use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
+        use_relu = fused_act is not None and fused_act.data['activation'] == 'relu'
 
         return Conv2dConfig(
             precision=precision,
@@ -179,7 +187,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             groups=int(node.metadata['groups']),
             alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             bank_mem_bytes=int(device.bank_mem_bytes),
-            flags=Conv2dFlags(use_relu=use_relu, emit_flattened=bool(view)),
+            flags=Conv2dFlags(use_relu=use_relu, emit_flattened=flatten),
         )
 
     def _resolve_parallelism(self, node, parallel_cfg, input_contracts, *, flatten: bool) -> ParallelismConfig:

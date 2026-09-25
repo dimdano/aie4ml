@@ -2,29 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from ..ir import TraitDefinition
 from ..ir.graph import ROUTE_MODES, STAGING_CONTRACTS, TENSOR_LAYOUTS
 from ..op_impls.common_types import PORT_KINDS
-
-
-def register_default_traits(ctx) -> None:
-    ctx.traits.register(
-        TraitDefinition(
-            name='fused_activation',
-            dialects=(ctx.device.dialect,),
-            fields=('activation',),
-            description='Indicates that an activation has been fused into the producer op.',
-        )
-    )
-    ctx.traits.register(
-        TraitDefinition(
-            name='io_view',
-            dialects=(ctx.device.dialect,),
-            fields=('inputs', 'outputs'),
-            description='Per-tensor logical-to-physical view mapping for IO/staging.',
-        )
-    )
-
 
 _DIRECTIVE_FIELDS = {
     'placement': ('col', 'row'),

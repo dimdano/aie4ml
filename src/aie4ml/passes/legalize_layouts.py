@@ -27,7 +27,7 @@ def _insert(ctx, inst: ExecutionEntry, conversion) -> None:
     node = OpNode(name=conversion.name, op_type=variant.op_type, dialect='aie')
     variant.validate_config(node, config, ctx.device)
     routes = inst.io_route.get('inputs', {})
-    view = inst.io_views[conversion.source]
+    view = inst.port_views[conversion.source]
     entry = ExecutionEntry(
         node=node,
         variant=variant,
@@ -36,7 +36,7 @@ def _insert(ctx, inst: ExecutionEntry, conversion) -> None:
             'inputs': {conversion.source: routes.get(conversion.source, 'auto')},
             'outputs': {conversion.target: 'direct'},
         },
-        io_views={conversion.source: view, conversion.target: view},
+        port_views={conversion.source: view, conversion.target: view},
         config=config,
         graph_header=variant.graph_header,
         graph_name=variant.graph_name,
@@ -65,7 +65,7 @@ def _insert(ctx, inst: ExecutionEntry, conversion) -> None:
         **inst.io_route,
         'inputs': {**{k: v for k, v in routes.items() if k != conversion.source}, conversion.target: 'direct'},
     }
-    inst.io_views = {**inst.io_views, conversion.target: view}
+    inst.port_views = {**{k: v for k, v in inst.port_views.items() if k != conversion.source}, conversion.target: view}
     log.info('%s: reads %s through %s, a kernel on a tile of its own', inst.name, conversion.source, entry.name)
 
 

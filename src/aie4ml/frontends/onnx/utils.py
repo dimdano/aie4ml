@@ -10,7 +10,6 @@ from ...device_catalog import resolve_device
 from ...ir import BackendPolicies
 from ...ir.context import AIEBackendContext, ProjectConfig
 from ...system_plan import normalize_pl_config
-from ..common import register_default_traits
 
 
 def require_onnx():
@@ -81,7 +80,6 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
         project_config=project_config,
         aie_config=resolved_aie_config,
     )
-    register_default_traits(ctx)
     return ctx
 
 

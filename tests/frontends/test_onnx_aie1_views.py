@@ -288,7 +288,7 @@ def _transposed_concat_model(*, second_transposed: bool = True):
 
 def _view(ctx, op_type):
     node = next(n for n in ctx.ir.logical if n.op_type == op_type)
-    return node.trait_data('concat_view' if op_type == 'concat' else 'slice_view')
+    return node.traits['concat_view' if op_type == 'concat' else 'slice_view'].data
 
 
 def test_slice_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):

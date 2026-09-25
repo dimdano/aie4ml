@@ -3,7 +3,6 @@ from __future__ import annotations
 import numpy as np
 
 from ..ir import TraitInstance, get_backend_context
-from ..ir.graph import OUTPUT_VIEWS
 from ..op_impls import get_family_resolver_registry
 from .base import AIEPass
 
@@ -111,8 +110,6 @@ class FoldViewOps(AIEPass):
         source, out_tv = node.inputs[0], node.outputs[0]
         producer = source.producer
         kind = node.metadata['view']
-        if kind not in OUTPUT_VIEWS:
-            raise ValueError(f'{node.name}: unknown output view {kind!r}; expected one of {sorted(OUTPUT_VIEWS)}.')
         registry = get_family_resolver_registry()
         resolver = registry.find(producer.op_type) if producer is not None else None
         if resolver is None or kind not in resolver.supported_output_views:
@@ -131,7 +128,7 @@ class FoldViewOps(AIEPass):
             for consumer in list(out_tv.consumers):
                 registry.get(consumer.op_type).reorder_reduction_rows(consumer, out_tv, order)
 
-        producer.add_trait(TraitInstance('output_view', {'kind': kind, 'shape': tuple(int(d) for d in out_tv.shape)}))
+        producer.add_trait(TraitInstance('output_view', {'kind': kind}))
         graph.remove_node(node, mode='contract')
         return True
 

@@ -23,7 +23,6 @@ from ...ir import (
 from ...ir.context import AIEBackendContext, ProjectConfig
 from ...ir.graph import VIEW_FLATTEN_2D
 from ...passes.utils import is_pointwise_dense
-from ..common import register_default_traits
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
 
@@ -256,9 +255,7 @@ class LowerToAieIr(ModelOptimizerPass):
             stamp=config.get_config_value('Stamp'),
             custom_sources=dict(config.backend.get_custom_source()),
         )
-        ctx = AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
-        register_default_traits(ctx)
-        return ctx
+        return AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
 
     def _map_op_type(self, layer) -> str:
         if layer.class_name in ('Dense',) or is_pointwise_dense(layer):

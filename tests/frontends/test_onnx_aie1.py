@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 from aie4ml.device_catalog import resolve_device
 from aie4ml.frontends.onnx import from_onnx, lower_onnx_model
+from aie4ml.ir import TraitInstance
 from aie4ml.op_impls.common_types import PortBinding, kernel_endpoints, to_plain
 from aie4ml.op_impls.families.matmul.common import select_generation_key
 from aie4ml.op_impls.families.matmul.matmul import MatmulOpImplVariant, MatmulRowWiseOpImplVariant
@@ -377,6 +378,22 @@ def test_a_misspelled_directive_is_refused(tmp_path):
 def test_a_directive_the_variant_does_not_read_is_refused(tmp_path):
     with pytest.raises(NotImplementedError, match=r"does not implement the directive\(s\) \['layout'\]"):
         _resolve_dense(_dense_model(), tmp_path, directives={'layout': 'tiled'})
+
+
+@pytest.mark.parametrize(
+    ('view', 'match'),
+    [({'kind': 'flatten_2d'}, 'does not write the output view'), ({'kind': 'flatten_2d', 'shape': (8, 8)}, 'exactly')],
+)
+def test_an_output_view_the_family_cannot_write_is_refused(tmp_path, view, match):
+    ctx = lower_onnx_model(
+        _dense_model(),
+        {'Part': AIE1_PART, 'AIEConfig': {'BatchSize': 8, 'Iterations': 1}},
+        output_dir=tmp_path,
+        project_name='aie1_dense',
+    )
+    next(node for node in ctx.ir.logical if node.name == 'dense_aie').add_trait(TraitInstance('output_view', view))
+    with pytest.raises(ValueError, match=match):
+        Resolve().transform(ctx)
 
 
 def test_a_tensor_read_as_two_operands_is_refused(tmp_path):

@@ -16,7 +16,7 @@ class FamilyResolver:
 
     op_type: ClassVar[str] = ''
     supported_fusions: ClassVar[frozenset] = frozenset()  # epilogues folded into the kernel
-    supported_output_views: ClassVar[frozenset] = frozenset()  # OUTPUT_VIEWS written directly
+    supported_output_views: ClassVar[frozenset] = frozenset()  # output views it writes directly (VIEW_FLATTEN_2D)
 
     def spatial_access(self, _node: Any):
         """The 2-D window read around each output pixel (sizes its producer's frame), or None."""
@@ -32,9 +32,28 @@ class FamilyResolver:
     def validate_structure(self, _node: Any, _device: Any) -> None:
         raise NotImplementedError
 
+    def _check_output_view(self, node: Any) -> None:
+        """A folded output view must be one this family writes; its shape is the output tensor's."""
+        view = node.traits.get('output_view')
+        if view is None:
+            return
+        if set(view.data) != {'kind'}:
+            raise ValueError(f'{node.name}: an output_view holds exactly its kind, got {sorted(view.data)}.')
+        if view.data['kind'] not in self.supported_output_views:
+            raise ValueError(f"{node.name}: {self.op_type} does not write the output view {view.data['kind']!r}.")
+
+    def _check_fused_activation(self, node: Any) -> None:
+        fused = node.traits.get('fused_activation')
+        if fused is None:
+            return
+        if set(fused.data) != {'activation'} or fused.data['activation'] not in self.supported_fusions:
+            raise ValueError(f'{node.name}: {self.op_type} cannot fuse the activation {fused.data}.')
+
     def resolve(self, node: Any, device: Any, directives: Optional[Dict[str, Any]] = None) -> Tuple[Any, OpImplVariant]:
         from .registry import get_op_impl_registry
 
+        self._check_output_view(node)
+        self._check_fused_activation(node)
         self.validate_structure(node, device)
         ports = requested_port_kind(node)
         matching = [

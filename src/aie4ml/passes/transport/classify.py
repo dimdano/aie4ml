@@ -43,7 +43,7 @@ class ClassifyTransportEntries(AIEPass):
                 raise RuntimeError(f'{entry.logical_tensor}: io_route=memtile requested on a stream port.')
             if not is_boundary:
                 consumer = entry.single_consumer()
-                if self._has_consumer_perm(consumer):
+                if self._has_consumer_perm(ctx, consumer):
                     failure = f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
                 else:
                     failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
@@ -62,7 +62,7 @@ class ClassifyTransportEntries(AIEPass):
             return TransportDecision(realization, True if realization == 'direct' else None)
 
         consumer = entry.single_consumer()
-        if self._has_consumer_perm(consumer):
+        if self._has_consumer_perm(ctx, consumer):
             direct_failure = f'consumer {consumer.node.name}.{consumer.group} applies an input permutation'
         else:
             direct_failure = direct_transport_failure(ctx, entry.logical_tensor, entry.producer, consumer)
@@ -131,8 +131,5 @@ class ClassifyTransportEntries(AIEPass):
         return 'auto'
 
     @staticmethod
-    def _has_consumer_perm(consumer) -> bool:
-        trait = consumer.node.traits.get('io_view')
-        if trait is None:
-            return False
-        return trait.data.get('inputs', {}).get(consumer.tensor, {}).get('perm') is not None
+    def _has_consumer_perm(ctx, consumer) -> bool:
+        return ctx.ir.execution.get(consumer.node.name).port_views[consumer.tensor].perm is not None

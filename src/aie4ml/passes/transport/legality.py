@@ -84,10 +84,6 @@ def direct_transport_failure(
     if tc is not None:
         if any(int(port) < 0 or int(port) >= len(tc.port_staging) for port in producer_ports):
             return f'producer ports {producer_ports} exceed the published staging contract'
-        if producer_inst.io_views.get(producer.tensor) is None:
-            return f'producer tensor {producer.tensor!r} has no resolved I/O view'
-        if consumer_inst.io_views.get(consumer.tensor) is None:
-            return f'consumer tensor {consumer.tensor!r} has no resolved I/O view'
 
     for p_port, c_port in zip(producer_ports, consumer_ports):
         src_desc = producer_inst.variant.describe_output_staging(
