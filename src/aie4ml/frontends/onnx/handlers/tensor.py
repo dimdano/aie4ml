@@ -1,12 +1,13 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shape/view ops: Transpose, Slice, Split, Concat."""
+"""Shape/view ops: Transpose, Flatten/Reshape, Slice, Split, Concat."""
 
 from __future__ import annotations
 
 import numpy as np
 
+from ....ir.graph import VIEW_FLATTEN_2D
 from ..context import OnnxImportContext
 from ..registry import onnx_handler
 from ..shapes import normalize_axis
@@ -23,23 +24,43 @@ def _transpose(ctx: OnnxImportContext, node, node_name: str, directives: dict) -
     if sorted(perm) != list(range(len(in_shape))):
         raise ValueError(f'{node_name}: invalid permutation {perm} for rank {len(in_shape)}.')
     out_name = node.output[0]
-    out_shape = ctx.output_shape(out_name, node_name)
 
     if src.is_parameter:
         data = np.transpose(np.asarray(src.data, dtype=np.float64), axes=perm)
         ctx.bind(out_name, ctx.param_tensor(out_name, data, src.precision))
         return
 
+    view = ctx.order_of(node.input[0]) or tuple(range(len(in_shape)))
+    ctx.bind(out_name, src)
+    ctx.set_order(out_name, [view[axis] for axis in perm], node_name)
+
+
+@onnx_handler('Flatten', 'Reshape')
+def _flatten(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
+    """Flatten one sample to [1, K]. The canonical tensor is unchanged, so the op only records
+    which row order the ONNX value implies -- a consumer's weight rows follow that order.
+    """
+    src_name = node.input[0]
+    src = ctx.source_for(src_name, node_name)
+    out_name = node.output[0]
+    out_shape = tuple(int(d) for d in ctx.output_shape(out_name, node_name))
+    logical = tuple(int(d) for d in src.shape)
+    if len(out_shape) != 2 or int(out_shape[0]) != 1 or int(np.prod(logical[1:])) != int(out_shape[1]):
+        raise NotImplementedError(f'{node_name}: only a flatten of one sample to [1, K] is supported, got {out_shape}.')
+    # The flattened row is canonical; `source_order` records how the view ravelled the axes, so
+    # the fold can hand that order to whoever reduces over the row.
+    ctx.set_order(out_name, None, node_name)
+
     ctx.emit(
-        'transpose',
+        'reshape',
         node_name,
         inputs=[src],
         outputs=[(out_name, out_shape, src.precision)],
         roles=['lhs'],
         metadata={
-            'perm': perm,
-            'data_format': 'channels_last',
-            'layer_class': 'Transpose',
+            'view': VIEW_FLATTEN_2D,
+            'axis_order': ctx.order_of(src_name) or tuple(range(len(logical))),
+            'layer_class': node.op_type,
             'source_layer': node_name,
         },
         directives=directives,
@@ -104,7 +125,9 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
             offset += size
 
     source = ctx.source_for(src_name, node_name)
-    outputs = [(out_name, ctx.output_shape(out_name, node_name), source.precision) for out_name in node.output]
+    for out_name in node.output:
+        ctx.propagate_order(src_name, out_name)
+    outputs = [(out_name, ctx.canonical_shape(out_name, node_name), source.precision) for out_name in node.output]
     ctx.emit(
         op_type.lower(),
         node_name,
@@ -112,7 +135,7 @@ def _slice_split(ctx: OnnxImportContext, node, node_name: str, directives: dict)
         outputs=outputs,
         roles=['lhs'],
         metadata={
-            'axis': axis,
+            'axis': ctx.canonical_axis(src_name, axis),
             'slices': [{'start': start, 'extent': extent} for start, extent in ranges],
             'layer_class': op_type,
             'source_class': op_type,
@@ -137,6 +160,13 @@ def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> N
     if any(len(shape) != rank for shape in shapes):
         raise ValueError(f'{node_name}: Concat inputs must have the same rank.')
     axis = normalize_axis(int(attr(node, 'axis', -1)), rank, node_name, 'Concat')
+    orders = {ctx.order_of(name) or tuple(range(rank)) for name in node.input}
+    if len(orders) != 1:
+        raise ValueError(
+            f'{node_name}: Concat inputs view their tensors in different axis orders {sorted(orders)}, so axis '
+            f'{axis} is canonical axis {sorted({ctx.canonical_axis(name, axis) for name in node.input})} of them; '
+            'concatenating them is not one concat of canonical tensors.'
+        )
 
     prefix, suffix = tuple(shapes[0][:axis]), tuple(shapes[0][axis + 1 :])
     for shape in shapes[1:]:
@@ -148,13 +178,14 @@ def _concat(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> N
         if src.precision != precision:
             raise ValueError(f'{node_name}: Concat inputs must use identical precision contracts.')
 
+    ctx.propagate_order(node.input[0], node.output[0])
     ctx.emit(
         'concat',
         node_name,
         inputs=sources,
-        outputs=[(node.output[0], ctx.output_shape(node.output[0], node_name), precision)],
+        outputs=[(node.output[0], ctx.canonical_shape(node.output[0], node_name), precision)],
         metadata={
-            'axis': axis,
+            'axis': ctx.canonical_axis(node.input[0], axis),
             'layer_class': 'Concat',
             'source_class': 'Concat',
             'source_layer': node_name,

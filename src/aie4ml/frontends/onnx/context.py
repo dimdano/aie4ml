@@ -48,11 +48,10 @@ class OnnxImportContext:
         self.layer_directives = layer_directives
         self.used_directives: set[str] = set()
 
-        # ONNX value name -> lowered activation/parameter tensor.
         self.value_tensors: Dict[str, TensorVar] = {}
-        # QuantizeLinear output name -> (kind, ref, intent, shape) pending a DequantizeLinear.
         self.q_aliases: Dict[str, Tuple[str, Any, QuantIntent, Tuple[int, ...]]] = {}
         self.precision_mirrors: list[Tuple[str, str]] = []
+        self.value_orders: Dict[str, Tuple[int, ...]] = {}
 
     # -- directives ---------------------------------------------------------
 
@@ -101,8 +100,96 @@ class OnnxImportContext:
 
     # -- source lookup ------------------------------------------------------
 
+    # -- value order --------------------------------------------------------
+
+    def order_of(self, name: str) -> Optional[Tuple[int, ...]]:
+        """How ONNX value `name` views its canonical tensor, or None for the identity view."""
+        return self.value_orders.get(name)
+
+    def set_order(self, name: str, order: Optional[Sequence[int]], node_name: str) -> None:
+        if order is None:
+            self.value_orders.pop(name, None)
+            return
+        order = tuple(int(x) for x in order)
+        if sorted(order) != list(range(len(order))):
+            raise ValueError(f'{node_name}: {order} is not a permutation of rank {len(order)}.')
+        if list(order) == sorted(order):
+            self.value_orders.pop(name, None)
+        else:
+            self.value_orders[name] = order
+
+    def canonical_axis(self, name: str, onnx_axis: int) -> int:
+        """The canonical axis that ONNX value `name` calls `onnx_axis`: an axis a view op records."""
+        order = self.value_orders.get(name)
+        return int(order[onnx_axis]) if order is not None else int(onnx_axis)
+
+    def canonical_shape(self, name: str, node_name: str) -> Tuple[int, ...]:
+        """The canonical shape behind ONNX value `name`, whose shape is seen through its view."""
+        view_shape = self.output_shape(name, node_name)
+        order = self.value_orders.get(name) or tuple(range(len(view_shape)))
+        shape = [0] * len(view_shape)
+        for view_axis, canonical_axis in enumerate(order):
+            shape[int(canonical_axis)] = int(view_shape[view_axis])
+        return tuple(shape)
+
+    def propagate_order(self, src: str, dst: str) -> None:
+        """Carry a value's view across an op that changes neither shape nor axis order."""
+        order = self.value_orders.get(src)
+        if order is None:
+            self.value_orders.pop(dst, None)
+        else:
+            self.value_orders[dst] = order
+
+    def canonical_source(self, name: str, node_name: str) -> TensorVar:
+        """An activation in its own axis order, materializing a folded view if one is pending.
+
+        A handler that reads a tensor axis by axis calls this instead of `source_for`: a value
+        that still carries a view becomes a `transpose` op, which the view passes fold into the
+        consumer that can realize it -- and refuse on the consumer that cannot.
+        """
+        tensor = self.source_for(name, node_name)
+        order = self.value_orders.get(name)
+        if order is None:
+            return tensor
+        view_name = f'{name}_as_viewed'
+        self.emit(
+            'transpose',
+            view_name,
+            inputs=[tensor],
+            outputs=[(view_name, self.output_shape(name, node_name), tensor.precision)],
+            roles=['lhs'],
+            metadata={
+                'perm': [int(axis) for axis in order],
+                'data_format': 'channels_last',
+                'layer_class': 'Transpose',
+                'source_layer': node_name,
+            },
+            directives={},
+        )
+        materialized = self.value_tensors[view_name]
+        self.bind(name, materialized)  # the value is now in its own order for every later reader
+        self.set_order(name, None, node_name)
+        return materialized
+
+    def common_order(self, names: Sequence[str], node_name: str) -> Optional[Tuple[int, ...]]:
+        """The axis order shared by these values, for an op that reads them element for element."""
+        orders = {self.value_orders.get(name) for name in names}
+        if len(orders) > 1:
+            raise ValueError(f'{node_name}: its inputs view their tensors in different axis orders ({orders}).')
+        return next(iter(orders), None)
+
+    def require_order(self, name: str, expected: Sequence[int], node_name: str) -> None:
+        """Refuse a value that is not in the specific axis order this handler reads."""
+        order = self.value_orders.get(name) or tuple(range(len(expected)))
+        if tuple(order) != tuple(int(x) for x in expected):
+            raise ValueError(
+                f'{node_name}: input {name} views its tensor as {order}, but {node_name} reads '
+                f'{tuple(int(x) for x in expected)}.'
+            )
+
     def source_for(self, name: str, node_name: str) -> TensorVar:
-        """An activation tensor; never a constant."""
+        """An activation tensor; never a constant. Axis order is the handler's own contract: state
+        it with `require_identity_order`, `require_order` or `propagate_order`."""
         if name in self.value_tensors:
             return self.value_tensors[name]
         if name in self.input_shapes:

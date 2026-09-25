@@ -46,11 +46,10 @@ The architectural differences cannot be eliminated, but the generated schedule c
 potentially be improved by:
 
 1. Reducing simultaneously live accumulators, including trying less loop unrolling.
-2. Keeping values in `acc48` until the final shift, rounding, saturation, and `to_vector`.
-3. Processing fewer output vectors together when accumulator pressure causes spills.
-4. Restructuring loops to expose independent MACs alongside loads and conversions.
-5. Avoiding temporary vectors or local arrays that unnecessarily extend live ranges.
-6. Comparing equivalent `mac`, `mul`, and `mmul` formulations because they can produce
+2. Processing fewer output vectors together when accumulator pressure causes spills.
+3. Restructuring loops to expose independent MACs alongside loads and conversions.
+4. Avoiding temporary vectors or local arrays that unnecessarily extend live ranges.
+5. Comparing equivalent `mac`, `mul`, and `mmul` formulations because they can produce
    materially different AIE1 schedules.
 
 Treat an unexpectedly large stack requirement as a possible spill symptom before raising the
@@ -65,3 +64,14 @@ width must not be used to explain this gap: aie4ml selects a 128-bit PLIO for AI
 and AIE-MLv2.
 
 Using microtilings in dense/matmul other than the default ones often lowers performance. (for example AIE1 Dense default `2x8x8` is 3x faster than the `1x16x8` schedule)
+
+## Other general guidelines observations
+
+Prefer measured, generation-specific blocking over a single generic template: AIE1 favored 2×2 spatial/output-channel blocking, while AIE-ML favored 4×2 due to its larger register/compute resources in conv kernel.
+Register pressure is often a real limiter in AIE1. Aggressive unrolling or larger blocking can spill and destroy throughput even when it increases theoretical reuse.
+Keep reduction loops runtime-pipelined and structurally simple; short, predictable loops often outperform heavily unrolled versions.
+Treat alignment rules as guidance, not absolutes: unaligned vector loads may be effectively free in very specific schedules, so verify with aiesim rather than adding costly alignment copies by default.
+Push irregularity into DMA/layout transformation where possible (for example polyphase stride layouts) so the compute kernel sees regular contiguous tiles.
+Optimize for both steady-state throughput and small workloads: fixed per-block epilogue/setup costs can dominate small layers even when mmul utilization is high.
+When weights no longer fit locally, use cascade/reduction partitioning rather than complicating the single-tile kernel.
+Avoid putting a stream access inside a placement or gather loop, and never compute an address with a divide per byte

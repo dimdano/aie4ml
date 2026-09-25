@@ -1,5 +1,7 @@
 from .math import align_up, ceildiv, require_power_of_two
+from .spatial import SpatialAccess2D, build_padded_spatial_view, shared_consumer_spatial_access
 from .tensor_view import (
+    STORAGE_LAYOUT_INNER_BLOCKED,
     STORAGE_LAYOUT_LINEAR,
     STORAGE_LAYOUT_MICROTILED,
     STORAGE_LAYOUTS,
@@ -29,9 +31,13 @@ from .tiling import (
 )
 
 __all__ = [
+    'SpatialAccess2D',
+    'build_padded_spatial_view',
+    'shared_consumer_spatial_access',
     'AxisPlan',
     'MicrotileShape',
     'ParallelismConfig',
+    'STORAGE_LAYOUT_INNER_BLOCKED',
     'STORAGE_LAYOUT_LINEAR',
     'STORAGE_LAYOUT_MICROTILED',
     'STORAGE_LAYOUTS',

@@ -127,35 +127,131 @@ def microtiling(m: int, k: int, n: int) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+def assert_aie_matches_onnx(
+    model,
+    feeds,
+    directives,
+    tmp_path,
+    *,
+    project='proj',
+    batch,
+    frac=4,
+    max_code_diff=5,
+    part=PART,
+    iterations=2,
+    per_iteration=False,
+):
+    """The same check through aiesim rather than x86sim, for what x86 cannot see."""
+    return _assert_matches_onnx(
+        model,
+        feeds,
+        directives,
+        tmp_path,
+        project=project,
+        batch=batch,
+        frac=frac,
+        max_code_diff=max_code_diff,
+        part=part,
+        iterations=iterations,
+        simulator='aie',
+        per_iteration=per_iteration,
+    )
+
+
 def assert_x86_matches_onnx(
-    model, feeds, directives, tmp_path, *, project='proj', batch, frac=4, max_code_diff=5, part=PART
+    model,
+    feeds,
+    directives,
+    tmp_path,
+    *,
+    project='proj',
+    batch,
+    frac=4,
+    max_code_diff=5,
+    part=PART,
+    iterations=1,
+    per_iteration=False,
 ):
     """Compile a model for x86, simulate it, and check every output against onnxruntime.
 
     The reference runs the float ONNX graph; each AIE output is compared in the quantized int8
     code space, tolerating a small rounding difference. One compile+sim covers every output the
     model exposes, which is why an ops/ test packs several configurations into one graph.
+
+    Every iteration is fed the same input and checked against the same reference, so asking for
+    more than one catches a kernel that carries state from one inference into the next. With
+    `per_iteration`, each feed instead carries a leading axis of `iterations` distinct inputs, each
+    checked against its own reference -- which is what catches framing drifting across iterations,
+    since repeating one input hides it.
     """
+    return _assert_matches_onnx(
+        model,
+        feeds,
+        directives,
+        tmp_path,
+        project=project,
+        batch=batch,
+        frac=frac,
+        max_code_diff=max_code_diff,
+        part=part,
+        iterations=iterations,
+        simulator='x86',
+        per_iteration=per_iteration,
+    )
+
+
+def _assert_matches_onnx(
+    model,
+    feeds,
+    directives,
+    tmp_path,
+    *,
+    project,
+    batch,
+    frac,
+    max_code_diff,
+    part,
+    iterations,
+    simulator,
+    per_iteration,
+):
     import onnxruntime as ort
 
     aie_model = from_onnx(
         model,
-        {'Part': part, 'AIEConfig': {'BatchSize': batch, 'Iterations': 1}, 'LayerDirectives': dict(directives)},
+        {
+            'Part': part,
+            'AIEConfig': {'BatchSize': batch, 'Iterations': iterations},
+            'LayerDirectives': dict(directives),
+        },
         output_dir=Path(tmp_path) / project,
         project_name=project,
     )
-    aie_model.compile()
+    if simulator == 'aie':
+        aie_model.build('all')
+    else:
+        aie_model.compile()
 
     sess = ort.InferenceSession(model.SerializeToString(), providers=['CPUExecutionProvider'])
-    ref = {o.name: r for o, r in zip(sess.get_outputs(), sess.run(None, feeds))}
+    names = [o.name for o in sess.get_outputs()]
+    if per_iteration:
+        runs = [sess.run(None, {k: v[i] for k, v in feeds.items()}) for i in range(iterations)]
+    else:
+        runs = [sess.run(None, feeds)] * iterations
+    ref = {name: [run[j] for run in runs] for j, name in enumerate(names)}
 
-    got = aie_model.predict(feeds, simulator='x86', quantize_in=False, dequantize_out=False)
+    # Outputs only: per-kernel profiling slows aiesim by ~40% and no check reads it.
+    got = aie_model.predict(feeds, simulator=simulator, quantize_in=False, dequantize_out=False, aie_profile=False)
     if not isinstance(got, dict):
         got = {next(iter(ref)): got}
 
     scale = float(2.0**-frac)
-    for name, want_deq in ref.items():
-        want = np.clip(np.rint(np.asarray(want_deq, np.float32) / scale), -128, 127).astype(np.int8)
-        have = np.asarray(got[name])[:batch].astype(np.int8)
-        diff = np.abs(have.astype(np.int16) - want.astype(np.int16))
-        assert int(diff.max()) <= max_code_diff, f'{name}: max code diff {int(diff.max())} > {max_code_diff}'
+    for name, wants in ref.items():
+        produced = np.asarray(got[name]).astype(np.int8)
+        for iteration in range(iterations):
+            want = np.clip(np.rint(np.asarray(wants[iteration], np.float32) / scale), -128, 127).astype(np.int8)
+            have = produced[iteration * batch : (iteration + 1) * batch]
+            diff = np.abs(have.astype(np.int16) - want.astype(np.int16))
+            assert (
+                int(diff.max()) <= max_code_diff
+            ), f'{name}: iteration {iteration} max code diff {int(diff.max())} > {max_code_diff}'

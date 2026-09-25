@@ -1,0 +1,79 @@
+"""hls4ml/QKeras frontend: a QConv2D stack lowered to the canonical conv2d contract.
+
+The point of this test is the frontend boundary: hls4ml is channels-last, so it reaches the same
+IR as the ONNX path without any op_impls change -- only the attribute names and, for a depthwise
+layer, the weight arrangement differ.
+"""
+
+import numpy as np
+import pytest
+
+tf = pytest.importorskip('tensorflow')
+
+PART = 'xcvp2802-vsva5601-2MHP-e-S'
+H, W, CIN, COUT, CLASSES, BITS = 8, 8, 8, 8, 8, 8
+
+
+@pytest.fixture
+def lowered(tmp_path):
+    hls4ml = pytest.importorskip('hls4ml')
+    pytest.importorskip('qkeras')
+    from keras.models import Sequential
+    from qkeras import QActivation, QConv2D, QDense, QDepthwiseConv2D, quantized_bits, quantized_relu
+
+    tf.keras.utils.set_random_seed(7)
+    q_w = quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
+            QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, bias_quantizer=q_w, name='conv'),
+            QActivation(quantized_relu(BITS, 2), name='relu'),
+            QDepthwiseConv2D((3, 3), padding='same', depthwise_quantizer=q_w, bias_quantizer=q_w, name='dw'),
+            QActivation(quantized_relu(BITS, 2), name='dwrelu'),
+            tf.keras.layers.Flatten(name='flatten'),
+            QDense(CLASSES, kernel_quantizer=q_w, bias_quantizer=q_w, name='fc'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        model,
+        backend='AIE',
+        io_type='io_parallel',
+        output_dir=str(tmp_path / 'proj'),
+        part=PART,
+        hls_config=config,
+        project_name='proj',
+        batch_size=1,  # conv2d.b.r.v1 runs one sample per call
+    )
+    hls_model.compile()
+    from aie4ml.ir import get_backend_context
+
+    return get_backend_context(hls_model)
+
+
+def test_hls4ml_conv_reaches_the_canonical_contract(lowered):
+    conv = next(node for node in lowered.ir.logical if node.op_type == 'conv2d')
+    activation, weight = conv.inputs[0], conv.inputs[1]
+    assert len(activation.shape) == 4 and tuple(activation.shape)[1:] == (H, W, CIN)  # NHWC
+    assert tuple(weight.shape) == (3, 3, CIN, COUT)  # [kh, kw, Cin/groups, Cout]
+    assert conv.metadata['kernel_shape'] == (3, 3)
+    assert conv.metadata['strides'] == (1, 1) and conv.metadata['dilations'] == (1, 1)
+    assert conv.metadata['pads'] == (1, 1, 1, 1) and conv.metadata['groups'] == 1
+    assert conv.roles[weight.name] == 'rhs' and 'bias' in conv.roles.values()
+
+    inst = lowered.ir.execution.get(conv.name)
+    assert inst.variant.variant_id == 'conv2d.b.r.v1'
+    assert 'fused_activation' in conv.traits  # the QActivation folded in
+
+
+def test_hls4ml_depthwise_reaches_the_compact_group_contract(lowered):
+    """Keras keeps a filter per input channel; the canonical form is one group per channel."""
+    dw = next(node for node in lowered.ir.logical if node.metadata.get('groups', 1) > 1)
+    assert tuple(dw.inputs[1].shape) == (3, 3, 1, COUT)  # [kh, kw, Cin/groups, Cout]
+    assert dw.metadata['groups'] == COUT
+    tiles = lowered.ir.execution.get(dw.name).artifacts['packed_weights']
+    blocks = COUT // 8
+    padded = blocks if blocks == 1 else blocks + blocks % 2  # pairs, except a lone block
+    grid = tiles.reshape(9, blocks, padded, 8, 8)
+    assert np.count_nonzero(grid[0, 0, 0]) == np.count_nonzero(np.diag(grid[0, 0, 0]))

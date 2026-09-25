@@ -20,6 +20,10 @@ def dump_pipeline_ir(ctx, destination: Path) -> None:
     data = {
         'logical': [serialize_logical_node(node) for node in ctx.ir.logical],
         'execution': [serialize_op_impl_instance(inst) for inst in ctx.ir.execution],
+        'execution_values': [
+            {'name': v.name, 'producer': v.producer, 'view': v.view.node if v.view else None}
+            for v in ctx.ir.execution.values.values()
+        ],
         'physical': serialize_physical_ir(ctx.ir.physical),
     }
 
@@ -63,7 +67,10 @@ def _serialize_quant_metadata(quant_meta: Dict[str, Any]) -> Dict[str, Any]:
 def serialize_op_impl_instance(inst: ExecutionEntry) -> Dict[str, Any]:
     return {
         'node': inst.name,
+        'op_type': inst.op_type,
         'variant_id': inst.variant.variant_id,
+        'inputs': [to_plain(item) for item in inst.inputs],
+        'outputs': list(inst.outputs),
         'ports': to_plain(inst.ports),
         'io_route': to_plain(inst.io_route),
         'io_views': to_plain(inst.io_views),

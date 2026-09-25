@@ -4,17 +4,14 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ....aie_types import FLOAT_FORMATS, AIEDataType, FloatIntent, legality_format
+import numpy as np
+
+from ....aie_types import AIEDataType, legality_format
 from ....ir import input_role, input_tensor_for_role
 from ...family_registry import FamilyResolver, family_resolver
 from ...utils import MicrotileShape, TensorView, align_up, build_tensor_view, ceildiv
 from ...utils.io import view_shape
-from ...utils.precision import (
-    element_bytes,
-    infer_accumulator_tag,
-    resolve_exact_storage_dtype,
-    to_quant_intent,
-)
+from ...utils.precision import element_bytes
 from .common import MICROTILE_OPTIONS, select_generation_key
 from .config import MatmulMicrotileConfig
 
@@ -121,65 +118,6 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, required_lhs_microtile
 
     default_m, default_k, default_n = options[0]
     return MatmulMicrotileConfig(microtile_m=default_m, microtile_k=default_k, microtile_n=default_n)
-
-
-def _resolve_numeric(node, device) -> tuple[Dict[str, AIEDataType], str]:
-    lhs_tensor = input_tensor_for_role(node, 'lhs')
-    rhs_tensor = input_tensor_for_role(node, 'rhs')
-    out_tensor = node.outputs[0]
-    if any(t.precision is None for t in (lhs_tensor, rhs_tensor, out_tensor)):
-        raise ValueError(f'{node.name}: missing precision metadata for {node.op_type}.')
-
-    resolved = {
-        'lhs': resolve_exact_storage_dtype(lhs_tensor.precision, namespace='lhs', layer_name=node.name),
-        'rhs': resolve_exact_storage_dtype(rhs_tensor.precision, namespace='rhs', layer_name=node.name),
-        'output': resolve_exact_storage_dtype(out_tensor.precision, namespace='output', layer_name=node.name),
-    }
-
-    if isinstance(lhs_tensor.precision, FloatIntent):
-        if not all(isinstance(t.precision, FloatIntent) for t in (lhs_tensor, rhs_tensor, out_tensor)):
-            raise ValueError(f'{node.name}: float {node.op_type} requires lhs/rhs/output to share float precision.')
-        return resolved, 'accfloat'
-
-    if int(resolved['lhs'].width) <= 8 and int(resolved['rhs'].width) > 8:
-        raise RuntimeError(
-            f'{node.name}: unsupported int8 x int16 precision mix; its accumulator output shift '
-            'may be negative, which the current kernels do not support.'
-        )
-
-    acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'], None)
-    return resolved, acc_tag
-
-
-def _resolve_bias_dtype(node, precision: Dict[str, AIEDataType]) -> AIEDataType:
-    """Resolve the bias accumulator dtype for dense-family ops."""
-    is_float = precision['lhs'].format in FLOAT_FORMATS
-    if is_float:
-        return AIEDataType(format='float32', frac=0)
-    bias_tensor = next((t for t in node.inputs if t.is_parameter and input_role(node, t.name) == 'bias'), None)
-    frac = int(precision['lhs'].frac) + int(precision['rhs'].frac)
-    if bias_tensor is not None and bias_tensor.precision is not None:
-        bias_intent = to_quant_intent(bias_tensor.precision)
-        return AIEDataType(format='int32', frac=frac, rounding=bias_intent.rounding, saturation=bias_intent.saturation)
-    return AIEDataType(format='int32', frac=frac)
-
-
-def _resolve_output_scale_shift(node, *, is_float: bool) -> int:
-    trait = node.traits.get('output_scale')
-    if trait is None:
-        return 0
-    scale = float(trait.data['scale'])
-    if is_float:
-        raise NotImplementedError(f'{node.name}: fused output scaling is not implemented for float MatMul-family ops.')
-    if scale <= 0.0 or scale > 1.0:
-        raise ValueError(f'{node.name}: fused output scale must be in the range (0, 1], got {scale}.')
-    shift = int(round(-math.log2(scale)))
-    if not math.isclose(scale, math.ldexp(1.0, -shift), rel_tol=0.0, abs_tol=1e-12):
-        raise NotImplementedError(
-            f'{node.name}: fused output scale {scale} is not a power of two; '
-            'fixed-point multiplier scaling is not implemented.'
-        )
-    return shift
 
 
 def _parallelism_candidate(
@@ -475,8 +413,28 @@ def _validate_matmul_family_rank_contract(node) -> None:
         )
 
 
+class _MatmulFamilyBase(FamilyResolver):
+    """Shared capabilities of the GEMM families: both reduce over their LHS rows."""
+
+    supported_fusions = frozenset({'bias', 'relu'})
+
+    def reorder_reduction_rows(self, node, tensor, order) -> None:
+        rhs = input_tensor_for_role(node, 'rhs')
+        order = np.asarray(order)
+        if not rhs.is_parameter:
+            raise NotImplementedError(
+                f'{node.name}: {self.op_type} can only adopt a reordered {tensor.name!r} into a constant RHS.'
+            )
+        data = np.asarray(rhs.data)
+        if data.ndim != 2 or data.shape[0] != order.size:
+            raise ValueError(
+                f'{node.name}: RHS {data.shape} does not have one row per element of {tensor.name!r} ({order.size}).'
+            )
+        rhs.data = data[order]
+
+
 @family_resolver('dense')
-class DenseFamilyResolver(FamilyResolver):
+class DenseFamilyResolver(_MatmulFamilyBase):
     op_type = 'dense'
 
     def validate_structure(self, node, _device) -> None:
@@ -484,7 +442,7 @@ class DenseFamilyResolver(FamilyResolver):
 
 
 @family_resolver('matmul')
-class MatmulFamilyResolver(FamilyResolver):
+class MatmulFamilyResolver(_MatmulFamilyBase):
     op_type = 'matmul'
 
     def validate_structure(self, node, _device) -> None:

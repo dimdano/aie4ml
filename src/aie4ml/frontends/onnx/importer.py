@@ -85,6 +85,7 @@ def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
     for output in graph_proto.output:
         if output.name not in ctx.value_tensors:
             raise ValueError(f'Graph output {output.name}: expected a lowered semantic tensor.')
+        ctx.canonical_source(output.name, f'graph output {output.name}')
         tensor = ctx.value_tensors[output.name]
         if output.name not in graph.tensors:
             graph.tensors.pop(tensor.name, None)

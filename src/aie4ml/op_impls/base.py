@@ -3,13 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from ..ir.graph import OpImplInstance, OpNode
+from ..ir.graph import ExecutionValue, OpImplInstance, OpNode
 from .common_types import PORT_KIND_STREAM, PortMap
 
 
 @dataclass(frozen=True)
 class BufferLocation:
-    """One transport-visible buffer's footprint-relative location."""
+    """A port buffer's footprint-relative location; the op's graph pins it there, ping and pong one
+    per bank. Weights, stacks and cascade resources are not listed."""
 
     port_group: str
     port: int
@@ -27,6 +28,40 @@ class BufferLocation:
             or any(bank not in range(4) for bank in self.banks)
         ):
             raise ValueError(f'Invalid ADF bank set {self.banks}.')
+
+
+@dataclass(frozen=True)
+class RowFlow:
+    """Hand-over geometry of one row. `input_col`/`output_col` offset the tile holding a kernel's input
+    (a chain's output) from that kernel's (the chain's last kernel's) column; `reversed` marks a cascade
+    running right to left (odd rows on AIE)."""
+
+    reversed: bool
+    input_col: int
+    output_col: int
+
+
+def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow:
+    """On AIE odd-row cores reach their east neighbour's memory, even rows the west's; on AIE-ML all west."""
+    reaches_east = bool(alternating_horizontal and int(row) % 2)
+    if reaches_east and int(cas_length) > 1:
+        return RowFlow(reversed=True, input_col=1, output_col=0)
+    if reaches_east:
+        return RowFlow(reversed=False, input_col=0, output_col=1)
+    return RowFlow(reversed=False, input_col=-1, output_col=0)
+
+
+@dataclass(frozen=True)
+class LayoutConversion:
+    """A kernel graph re-laying `source` into `target`, an execution-only value the op reads instead.
+    `shared_memory` makes the hand-over to the op a hard no-DMA requirement."""
+
+    name: str
+    source: str
+    target: str
+    variant: 'OpImplVariant'
+    config: Any
+    shared_memory: bool
 
 
 @dataclass(frozen=True)
@@ -70,10 +105,17 @@ class OpImplVariant:
     def build_template_params(self, _node: OpNode, config: Any, _placement: Dict[str, int]) -> Dict[str, Any]:
         return config
 
+    def input_conversions(
+        self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
+    ) -> Tuple['LayoutConversion', ...]:
+        """Conversions for inputs whose `sources` (execution values) arrive in a layout the op cannot read."""
+        return ()
+
     def buffer_locations(self, _node: OpNode, _config: Any, _anchor_row: int) -> Tuple[BufferLocation, ...]:
         """Return transport-visible buffers relative to an op anchor.
 
-        Repeated group/port pairs describe multicast graph ports.
+        Repeated group/port pairs describe multicast graph ports. A shared-memory edge lists both of its
+        ports at the same place.
         """
         return ()
 

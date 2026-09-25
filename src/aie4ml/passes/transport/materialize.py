@@ -7,19 +7,26 @@ from math import prod
 from typing import Any, Dict, List
 
 from ...aie_types import AIEDataType
-from ...ir import get_backend_context, input_role
+from ...ir import get_backend_context
 from ...op_impls.common_types import PORT_KIND_STREAM
 from ...op_impls.utils import STORAGE_LAYOUT_LINEAR, staging_tile_shape
 from ..base import AIEPass
+from ..shared_buffer import DMA, SHARED_MEMORY, STREAM, location_problem, pinned_locations, static_problem
 from ..utils import sanitize_identifier
 from .boundary import (
     graph_input_port_descriptor,
     graph_input_writer_port_descriptor,
     host_offsets,
+    host_visible_input_staging,
     require_linear_stream_staging,
 )
 from .collect import TransportCollector
-from .descriptors import boundary_access_descriptor, localize_descriptor, localized_graph_io_descriptor
+from .descriptors import (
+    boundary_access_descriptor,
+    describes_natural_order,
+    localize_descriptor,
+    localized_graph_io_descriptor,
+)
 from .model import EdgeEntry
 
 
@@ -29,7 +36,7 @@ class BuildMemoryPlan(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        ctx.ir.physical.plan = _MemoryPlanMaterializer(ctx).build(list(ctx.ir.logical))
+        ctx.ir.physical.plan = _MemoryPlanMaterializer(ctx).build()
         return True
 
 
@@ -39,7 +46,8 @@ class CollectMemoryEntries(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
-        state = _MemoryPlanMaterializer(ctx).collect(list(ctx.ir.logical))
+        ctx.ir.execution.verify()
+        state = _MemoryPlanMaterializer(ctx).collect()
         ctx.ir.physical.plan = {'_memory_plan_state': state}
         return True
 
@@ -71,20 +79,15 @@ class _MemoryPlanMaterializer:
         self._max_graph_input_port = -1
         self._buffer_seq: Dict[str, int] = {}
 
-    def build(self, nodes):
-        state = self.collect(nodes)
+    def build(self):
+        state = self.collect()
         return self.materialize(_legalize_collected_entries(self.ctx, state))
 
-    def collect(self, nodes):
-        idx = 0
-        for n in nodes:
-            if self._kernel_inst(n):
-                idx += 1
-                self.layer_indices[n.name] = idx
-
+    def collect(self):
+        self.layer_indices = {inst.name: idx for idx, inst in enumerate(self.ctx.ir.execution, start=1)}
         return {
             'layer_indices': dict(self.layer_indices),
-            'entries': TransportCollector(self.ctx).collect(nodes),
+            'entries': TransportCollector(self.ctx).collect(),
         }
 
     def materialize(self, state):
@@ -164,21 +167,40 @@ class _MemoryPlanMaterializer:
     def _emit_direct_internal(self, entry, p_ports, c_ports):
         p = entry.producer
         c = entry.single_consumer()
+        producer, consumer = self._kernel_inst(p.node), self._kernel_inst(c.node)
+        stream = producer.ports.outputs[p.tensor].kind == PORT_KIND_STREAM
 
         for p_port, c_port in zip(p_ports, c_ports):
-            self.direct_edges.append(
-                {
-                    'source': f'{sanitize_identifier(p.node.name)}.{p.group}[{int(p_port)}]',
-                    'target': f'{sanitize_identifier(c.node.name)}.{c.group}[{int(c_port)}]',
-                    'tensor': entry.logical_tensor,
-                }
-            )
+            edge = {
+                'source': f'{sanitize_identifier(p.node.name)}.{p.group}[{int(p_port)}]',
+                'target': f'{sanitize_identifier(c.node.name)}.{c.group}[{int(c_port)}]',
+                'tensor': entry.logical_tensor,
+            }
+            if stream:
+                edge['realization'] = STREAM
+            else:
+                # Both ops' graphs pin their buffer ports where they list them. One buffer is shared where
+                # the two locations coincide and nothing else reads it (`shared_buffer`); counted as a DMA
+                # copy anywhere else, which is what it is wherever the locations differ.
+                written = pinned_locations(producer, p.group, p_port, *self._placed_at(producer))
+                read = pinned_locations(consumer, c.group, c_port, *self._placed_at(consumer))
+                if not written or not read:
+                    raise RuntimeError(
+                        f'{edge["source"]} -> {edge["target"]}: a buffer port without a buffer location; every '
+                        'buffer-port op lists where its graph pins them.'
+                    )
+                shared = not location_problem(written, read) and not static_problem(
+                    self.ctx, p.tensor, producer, p.group, p_port, consumer, c.group, c_port
+                )
+                edge['realization'] = SHARED_MEMORY if shared else DMA
+            self.direct_edges.append(edge)
 
     def _emit_direct_graph_input(self, entry, graph_ports, consumer_ports):
         consumer = entry.single_consumer()
         consumer_id = sanitize_identifier(consumer.node.name)
         inst = self._kernel_inst(consumer.node)
-        dtype = self._graph_input_dtype(entry).to_dict()
+        element = self._graph_input_dtype(entry)
+        dtype = element.to_dict()
 
         binding = inst.ports.inputs[consumer.tensor]
         stream = binding.kind == PORT_KIND_STREAM
@@ -198,12 +220,14 @@ class _MemoryPlanMaterializer:
             )
             if not stream:
                 # Vitis accepts access constraints on hierarchical ports but does not apply their buffer
-                # reorder; bind them to the kernel ports. A stream port has no DMA to constrain.
-                descriptor = boundary_access_descriptor(descriptor)
-                self.kernel_write_accesses.extend(
-                    {'endpoint': f'{consumer_id}.{endpoint}', 'descriptor': descriptor}
-                    for endpoint in binding.endpoints[int(consumer_port)]
-                )
+                # reorder; bind them to the kernel ports. A stream port has no DMA to constrain, and
+                # neither does a transfer that already moves the buffer in its own order.
+                descriptor = boundary_access_descriptor(descriptor, element_bits=int(element.width))
+                if not describes_natural_order(descriptor):
+                    self.kernel_write_accesses.extend(
+                        {'endpoint': f'{consumer_id}.{endpoint}', 'descriptor': descriptor}
+                        for endpoint in binding.endpoints[int(consumer_port)]
+                    )
             self.io_ports.append(
                 {
                     'direction': 'input',
@@ -221,7 +245,8 @@ class _MemoryPlanMaterializer:
         producer = entry.producer
         producer_id = sanitize_identifier(producer.node.name)
         inst = self._kernel_inst(producer.node)
-        dtype = self._graph_output_dtype(entry).to_dict()
+        element = self._graph_output_dtype(entry)
+        dtype = element.to_dict()
 
         binding = inst.ports.outputs[producer.tensor]
         stream = binding.kind == PORT_KIND_STREAM
@@ -249,21 +274,26 @@ class _MemoryPlanMaterializer:
             else:
                 elements = int(prod(staging_tile_shape(descriptor)))
                 logical_elements = int(prod(int(value) for value in staging['io_tiling_dimension']))
-                descriptor = boundary_access_descriptor(descriptor, project_to_io_boundary=logical_elements != elements)
-                transferred_elements = int(prod(staging_tile_shape(descriptor)))
-                if transferred_elements != logical_elements:
-                    raise NotImplementedError(
-                        f'{entry.logical_tensor}: direct graph output requires {elements} kernel-buffer elements '
-                        f'but exposes {logical_elements} logical elements; the boundary DMA cannot project this layout.'
-                    )
+                descriptor = boundary_access_descriptor(
+                    descriptor,
+                    element_bits=int(element.width),
+                    project_to_io_boundary=logical_elements != elements,
+                )
+                # What the PLIO carries per iteration: the projected transfer (logical rows, columns
+                # rounded up to the microtile) or the whole tile; the host trims to io_tiling.
+                transfer = descriptor.pop('transfer_shape', None) or list(staging['tiling_dimension'])
+                if int(prod(transfer)) != int(prod(staging_tile_shape(descriptor))):
+                    raise RuntimeError(f'{entry.logical_tensor}: boundary DMA transfer does not match its descriptor.')
+                staging['tiling_dimension'] = [int(value) for value in transfer]
                 endpoints = binding.endpoints[int(producer_port)]
                 if len(endpoints) != 1:
                     raise RuntimeError(
                         f'{entry.logical_tensor}: direct graph output requires one kernel endpoint, got {endpoints}.'
                     )
-                self.kernel_read_accesses.append(
-                    {'endpoint': f'{producer_id}.{endpoints[0]}', 'descriptor': descriptor}
-                )
+                if not describes_natural_order(descriptor):
+                    self.kernel_read_accesses.append(
+                        {'endpoint': f'{producer_id}.{endpoints[0]}', 'descriptor': descriptor}
+                    )
             self.io_ports.append(
                 {
                     'direction': 'output',
@@ -442,21 +472,7 @@ class _MemoryPlanMaterializer:
         inst = self._kernel_inst(consumer.node)
         port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
         base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None, None)
-
-        io_tile = list(base['io_tiling_dimension'])
-
-        return {
-            'access': 'write',
-            'storage_layout': STORAGE_LAYOUT_LINEAR,
-            'buffer_dimension': list(base['buffer_dimension']),
-            'tiling_dimension': io_tile,
-            'io_tiling_dimension': list(io_tile),
-            'io_boundary_dimension': list(base['io_boundary_dimension']),
-            'offset': [0 for _ in io_tile],
-            'slice_dimension': int(base['slice_dimension']),
-            'inner_dimension': int(base['inner_dimension']),
-            'outer_dimension': int(base['outer_dimension']),
-        }
+        return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
 
     def _graph_output_reader_descriptor(
         self,
@@ -497,6 +513,10 @@ class _MemoryPlanMaterializer:
     def _kernel_inst(self, node):
         return self.ctx.ir.execution.get(node.name) if node else None
 
+    def _placed_at(self, inst):
+        placement = self.ctx.ir.physical.placements[inst.name]
+        return int(placement['col']), int(placement['row'])
+
     @staticmethod
     def _producer_endpoint(node, group, port):
         return f'ifm[{port}]' if node is None else f'{sanitize_identifier(node.name)}.{group}[{port}]'
@@ -514,7 +534,7 @@ class _MemoryPlanMaterializer:
 
     def _graph_input_role(self, entry: EdgeEntry) -> str:
         consumer = entry.single_consumer()
-        role = input_role(consumer.node, consumer.tensor)
+        role = self._kernel_inst(consumer.node).input(consumer.tensor).role
         if not role:
             raise RuntimeError(
                 f'{entry.logical_tensor}: no role assigned on consumer {consumer.node.name!r}; '
@@ -605,6 +625,7 @@ def _host_visible_output_staging(base: Dict[str, Any], *, stream: bool = False) 
     desc = dict(base)
     desc['buffer_dimension'] = list(base['io_boundary_dimension'])
     desc['offset'] = host_offsets(base)
+    desc['logical_origin'] = list(base['logical_origin'])
     desc['tiling_dimension'] = list(base['tiling_dimension'] if stream else base['io_tiling_dimension'])
     desc['storage_layout'] = STORAGE_LAYOUT_LINEAR
     return desc

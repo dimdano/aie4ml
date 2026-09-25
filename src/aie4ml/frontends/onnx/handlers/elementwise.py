@@ -48,6 +48,7 @@ def _mul_div(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> 
         metadata={'scale': scale, 'layer_class': op_type, 'source_class': op_type, 'source_layer': node_name},
         directives=directives,
     )
+    ctx.propagate_order(source_name, out_name)  # a scalar scale is order-agnostic
 
 
 @onnx_handler('Add')
@@ -57,6 +58,7 @@ def _add(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None
     lhs_name, rhs_name = node.input
     lhs = ctx.any_source_for(lhs_name, node_name)
     rhs = ctx.any_source_for(rhs_name, node_name)
+    order = ctx.common_order([lhs_name, rhs_name], node_name)  # elementwise: any shared order
     out_name = node.output[0]
     out_precision = lhs.precision if isinstance(lhs.precision, FloatIntent) else None
 
@@ -79,3 +81,4 @@ def _add(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None
         metadata={'layer_class': 'Add', 'source_class': 'Add', 'source_layer': node_name},
         directives=directives,
     )
+    ctx.set_order(out_name, order, node_name)

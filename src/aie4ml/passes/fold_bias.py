@@ -6,15 +6,17 @@ from __future__ import annotations
 import numpy as np
 
 from ..ir import get_backend_context
+from ..ir.graph import has_input_role
+from ..op_impls import get_family_resolver_registry
 from .base import AIEPass
 
 
 class FoldBias(AIEPass):
-    """Fold a trailing `add(dense_output, const)` into the dense op's bias.
+    """Fold a trailing `add(output, const)` into the producing op's bias.
 
-    The ONNX frontend emits bias as a separate `add` (both for a standalone
-    MatMul+Add and for Gemm's C input); this pass is the single place that
-    fuses it, keeping the frontend free of fusion decisions.
+    The ONNX frontend emits bias as a separate `add` (a standalone MatMul+Add, Gemm's C input,
+    Conv's B input); this pass is the single place that fuses it, keeping the frontend free of
+    fusion decisions.
     """
 
     def __init__(self):
@@ -28,53 +30,58 @@ class FoldBias(AIEPass):
         for add in list(graph.nodes):
             if add.op_type != 'add' or len(add.inputs) != 2 or len(add.outputs) != 1:
                 continue
-            dense_out, bias = _match_dense_bias(add.inputs[0], add.inputs[1])
-            if dense_out is None:
+            producer_out, bias = _match_biasless_producer(add.inputs[0], add.inputs[1])
+            if producer_out is None:
                 continue
 
-            dense = dense_out.producer
-            n_out = int(dense.metadata['n_out'])
+            producer = producer_out.producer
+            n_out = int(producer_out.shape[-1])
             bias_size = int(np.asarray(bias.data).size)
             if bias_size != n_out:
-                raise ValueError(f'{add.name}: dense bias Add requires exactly {n_out} elements, got {bias_size}.')
-            if len(dense_out.consumers) != 1:
                 raise ValueError(
-                    f'{add.name}: cannot fold bias because dense output {dense_out.name!r} '
-                    f'has {len(dense_out.consumers)} consumers.'
+                    f'{add.name}: a fused bias needs exactly {n_out} elements, one per output channel, '
+                    f'got {bias_size}.'
+                )
+            if len(producer_out.consumers) != 1:
+                raise ValueError(
+                    f'{add.name}: cannot fold bias because {producer.op_type} output {producer_out.name!r} '
+                    f'has {len(producer_out.consumers)} consumers.'
                 )
 
-            _fold(graph, dense, dense_out, bias, add)
+            _fold(graph, producer, producer_out, bias, add)
             changed = True
 
         return changed
 
 
-def _match_dense_bias(lhs, rhs):
-    if _is_biasless_dense(lhs) and rhs.is_parameter:
+def _match_biasless_producer(lhs, rhs):
+    if _is_biasless_producer(lhs) and rhs.is_parameter:
         return lhs, rhs
-    if _is_biasless_dense(rhs) and lhs.is_parameter:
+    if _is_biasless_producer(rhs) and lhs.is_parameter:
         return rhs, lhs
     return None, None
 
 
-def _is_biasless_dense(tensor) -> bool:
+def _is_biasless_producer(tensor) -> bool:
     producer = tensor.producer
-    return producer is not None and producer.op_type == 'dense' and not producer.metadata.get('use_bias')
+    if producer is None or has_input_role(producer, 'bias'):
+        return False
+    resolver = get_family_resolver_registry().find(producer.op_type)
+    return resolver is not None and 'bias' in resolver.supported_fusions
 
 
-def _fold(graph, dense, dense_out, bias, add) -> None:
+def _fold(graph, producer, producer_out, bias, add) -> None:
     y = add.outputs[0]
 
-    dense.inputs.append(bias)
+    producer.inputs.append(bias)
     bias.consumers = [c for c in bias.consumers if c is not add]
-    bias.consumers.append(dense)
-    dense.metadata['use_bias'] = True
-    dense.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
-    dense.roles[bias.name] = 'bias'
+    bias.consumers.append(producer)
+    producer.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
+    producer.roles[bias.name] = 'bias'
 
-    dense.outputs = [y]
-    y.producer = dense
-    graph.tensors.pop(dense_out.name, None)
+    producer.outputs = [y]
+    y.producer = producer
+    graph.tensors.pop(producer_out.name, None)
 
     graph.nodes.remove(add)
     add.inputs.clear()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ..ir import get_backend_context
-from ..ir.graph import TensorContract
+from ..ir.graph import ExecutionInput, ExecutionValue, ExecutionView, TensorContract, input_role
 from ..op_impls import get_family_resolver_registry
 from ..op_impls.utils.io import ensure_io_view, normalized_staging, resolve_io_route
 from .base import AIEPass
@@ -58,6 +58,31 @@ def _check_transposed_views(node, config, variant) -> None:
             )
 
 
+_VIEW_TRAITS = ('slice_view', 'concat_view')
+
+
+def _build_execution_values(ctx) -> None:
+    """The values the execution graph moves, copied once from the logical graph: its boundary, the
+    views folding left without a kernel, and every entry's outputs. From here on transport reads
+    these, never the logical tensors."""
+    execution = ctx.ir.execution
+    execution.values = {}
+    execution.graph_inputs = tuple(ctx.ir.logical.input_tensor_names)
+    execution.graph_outputs = tuple(ctx.ir.logical.output_tensor_names)
+    for name in execution.graph_inputs:
+        execution.add_value(ExecutionValue(name))
+    for node in ctx.ir.logical:
+        trait = next((node.traits[t] for t in _VIEW_TRAITS if node.is_placeholder and t in node.traits), None)
+        if trait is None:
+            continue
+        view = ExecutionView(kind=node.op_type, node=node.name, data=tuple(trait.data.items()))
+        for tensor in node.outputs:
+            execution.add_value(ExecutionValue(tensor.name, view=view))
+    for inst in execution:
+        for name in inst.outputs:
+            execution.add_value(ExecutionValue(name, producer=inst.name))
+
+
 class Resolve(AIEPass):
     """Resolve logical nodes into family-owned execution entries."""
 
@@ -90,12 +115,10 @@ class Resolve(AIEPass):
             ports = variant.build_ports(node, config)
             variant.validate_ports(node, ports, ctx.device)
 
-            inst = ctx.ir.execution.get(node.name)
-            if inst is not None and _same_execution_entry(inst, variant, ports, config):
-                _propagate_contracts(ctx, node, inst, inst.config)
-                visited.add(node.name)
-                continue
-
+            # Registered afresh even when unchanged: a later lowering pass may have rewired the old
+            # entry (a layout conversion in front of it), and it rewires the new one again.
+            previous = ctx.ir.execution.get(node.name)
+            same = previous is not None and _same_execution_entry(previous, variant, ports, config)
             inst = ctx.ir.execution.register(
                 node=node,
                 variant=variant,
@@ -106,12 +129,19 @@ class Resolve(AIEPass):
                 graph_header=variant.graph_header,
                 graph_name=variant.graph_name,
                 param_template=variant.param_template,
+                inputs=tuple(
+                    ExecutionInput(t.name, input_role(node, t.name)) for t in node.inputs if not t.is_parameter
+                ),
+                outputs=tuple(t.name for t in node.outputs),
             )
+            if same:
+                inst.artifacts = previous.artifacts
             _propagate_contracts(ctx, node, inst, config)
             visited.add(node.name)
-            changed = True
+            changed = changed or not same
 
         if ctx.ir.execution.prune(visited):
             changed = True
+        _build_execution_values(ctx)
 
         return changed

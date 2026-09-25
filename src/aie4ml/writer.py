@@ -59,11 +59,8 @@ class AIEProjectEmitter:
         layer_index = 0
         placements = ctx.ir.physical.placements or {}
 
-        for node in ctx.ir.logical:
-            inst = ctx.ir.execution.get(node.name)
-            if inst is None:
-                continue
-
+        for inst in ctx.ir.execution:
+            node = inst.node
             variant = inst.variant
 
             if node.name not in placements:

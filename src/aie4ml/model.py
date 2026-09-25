@@ -79,14 +79,21 @@ class AIEModel:
         AIEProjectEmitter().emit(self.context)
         return self
 
-    def build(self, make_target: str = 'all', env=None, log_to_stdout: bool = True) -> int:
+    def build(self, make_target: str = 'all', env=None, log_to_stdout: bool = True, jobs: Optional[int] = None) -> int:
+        """Run a target of the generated Makefile, writing the project first if needed.
+
+        make_target: 'all' compiles for the hardware target; others as in the Makefile ('x86com', ...).
+        env: environment for make (default: this process's).
+        log_to_stdout: stream the tools' output; otherwise it is captured into the log.
+        jobs: kernels compiled in parallel (make -jN); default: the compiler's own.
+        """
         ctx = self.context
         output_dir = ctx.project_config.output_dir
         self._ensure_runtime_plan()
         if not output_dir.exists():
             self.write()
 
-        cmd = ['make', make_target]
+        cmd = ['make', make_target] + ([f'-j{int(jobs)}'] if jobs else [])  # -jN: kernels compiled at once
         log.debug('Running %s in %s', ' '.join(cmd), output_dir)
 
         stdout = None if log_to_stdout else subprocess.PIPE
@@ -108,7 +115,23 @@ class AIEModel:
         *,
         quantize_in: bool = True,
         dequantize_out: bool = True,
+        aie_profile: bool = True,
     ):
+        """Simulate the compiled project on `X` and return its outputs.
+
+        X: input samples, one array or a dict by input tensor; one sample or `Iterations` of them.
+        simulator: 'x86' (functional) or 'aie' (cycle-accurate aiesim).
+        quantize_in / dequantize_out: convert inputs to and outputs from the ports' fixed-point types.
+        aie_profile: aiesim with per-kernel profiling, for report(); slower.
+        """
+        sim_key = simulator.lower()
+        if sim_key == 'x86':
+            make_target = 'x86sim'
+        elif sim_key == 'aie':
+            make_target = 'profile' if aie_profile else 'aiesim'
+        else:
+            raise ValueError(f'Unknown simulator "{simulator}". Expected one of: x86, aie.')
+
         ctx = self.context
         output_dir = ctx.project_config.output_dir
         if not output_dir.exists():
@@ -123,17 +146,8 @@ class AIEModel:
         prepared_inputs = prepare_inputs(layout, X, iterations=iterations, quantize=quantize_in)
         write_input_files(output_dir, layout, prepared_inputs, plio_width_bits=plio_width)
 
-        sim_key = simulator.lower()
-        if sim_key == 'x86':
-            make_target = 'x86sim'
-        elif sim_key == 'aie':
-            make_target = 'profile'
-        else:
-            raise ValueError(f'Unknown simulator "{simulator}". Expected one of: x86, aie.')
-
         log.info('Running %s simulation using make %s', ctx.project_config.project_name, make_target)
         run_simulation_target(output_dir, make_target)
-
         sim_out = collect_outputs(output_dir, sim_key, layout)
         final_out = dequantize_outputs(layout, sim_out) if dequantize_out else sim_out
 

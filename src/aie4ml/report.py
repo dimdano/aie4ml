@@ -11,8 +11,8 @@ tiers -- the report gathers whatever is present and says what is missing:
     make profile    profile_funct_*.txt     per-kernel cycles
 
 `predict(simulator='aie')` runs `make profile`, so it covers all three tiers. Bare
-`make aiesim` does not profile -- that yields latency and throughput but no per-kernel
-breakdown, and needs `make profile` re-run for it.
+`make aiesim` (`predict(simulator='aie', aie_profile=False)`) does not profile -- that yields
+latency and throughput but no per-kernel breakdown, and needs `make profile` re-run for it.
 
     from aie4ml.report import report        # notebook: report(model) or report(project_dir)
     aie4ml-report path/to/project-folder    # terminal
@@ -32,8 +32,6 @@ from typing import Any, Dict, List, Optional
 _KERNEL_RE = re.compile(r'run _ZN(\d+)([A-Za-z_][A-Za-z0-9_]*)')
 _PLIO_RE = re.compile(r'\|\s*(?:plio)?\s*\|?\s*(PLIO_\w+)\s*\|\s*(IN|OUT)\s*\|\s*([\d.]+)')
 _CORE_RE = re.compile(r'^Core (\S+)', re.M)
-
-ASSUMED_AIE_CLOCK_GHZ = 1.25
 
 
 def _analyze_aie_out_interval(output_dir: Path, pipeline: Optional[Dict[str, Any]] = None) -> Dict:
@@ -63,20 +61,22 @@ def _analyze_aie_out_interval(output_dir: Path, pipeline: Optional[Dict[str, Any
             }
             all_lat.extend(lst)
 
-    if not all_lat:
+    if not first_complete:
         return {}
 
     return {
+        # One sample gives a latency but no interval.
         'global': {
             'min_ns': round(min(all_lat), 3),
             'max_ns': round(max(all_lat), 3),
             'avg_ns': round(sum(all_lat) / len(all_lat), 3),
             'samples': len(all_lat),
-        },
-        # When the first inference is complete on every output port (its last TLAST): one
-        # sample's whole trip, including the DMA and memtile hops that the per-kernel cycle
-        # counts do not see. Same definition as an HLS latency: start to last output.
-        'first_output_ns': round(max(first_complete), 3) if first_complete else None,
+        }
+        if all_lat
+        else {},
+        # When the first inference is complete on every output port, counted from simulation start:
+        # it includes the array configuration and weight loading, so it is not latency.
+        'first_output_from_sim_start_ns': round(max(first_complete), 3) if first_complete else None,
         'per_port': per_file,
     }
 
@@ -169,8 +169,9 @@ def _convert_to_ns(value: float, unit: str) -> float:
 def _plan_ops(doc: Dict[str, Any]) -> int:
     """MAC-equivalent ops per inference, from the plan rather than a live model.
 
-    Only dense/matmul contribute; each output element costs one multiply and one add over
-    the reduction, so 2 * n_in * n_out * (elements outside the feature axis).
+    Every multiplying op contributes: each output element costs one multiply and one add per
+    element of its reduction, which is the input features for a GEMM and `kh * kw * Cin / groups`
+    for a convolution.
     """
     shapes = {}
     for entry in doc.get('execution', []):
@@ -178,17 +179,32 @@ def _plan_ops(doc: Dict[str, Any]) -> int:
             shapes[name] = view.get('logical') or []
     ops = 0
     for node in doc.get('logical', []):
-        if node.get('op_type') not in ('dense', 'matmul'):
-            continue
         meta = node.get('metadata') or {}
         out = shapes.get((node.get('outputs') or [None])[0]) or []
-        if not out or 'n_in' not in meta:
+        inputs = [shapes.get(name) or [] for name in (node.get('inputs') or [])]
+        if not out:
             continue
-        independent = 1
-        for dim in out[:-1]:
-            independent *= int(dim)
-        ops += 2 * int(meta['n_in']) * int(meta['n_out']) * independent
+        if node.get('op_type') in ('dense', 'matmul') and 'n_in' in meta:
+            reduction, outputs = int(meta['n_in']), int(meta['n_out'])
+            independent = _prod(out[:-1])
+        elif node.get('op_type') == 'conv2d' and inputs and len(inputs[0]) == 4:
+            kh, kw = (int(k) for k in meta['kernel_shape'])
+            channels_in = int(inputs[0][-1]) // int(meta.get('groups', 1))
+            # A flattened output is one row of every output pixel and channel.
+            outputs = int(inputs[1][-1]) if len(inputs) > 1 and inputs[1] else int(out[-1])
+            reduction = kh * kw * channels_in
+            independent = _prod(out[1:]) // outputs if len(out) == 2 else _prod(out[1:-1])
+        else:
+            continue
+        ops += 2 * reduction * outputs * independent
     return ops
+
+
+def _prod(dims) -> int:
+    total = 1
+    for dim in dims:
+        total *= int(dim)
+    return total
 
 
 def _critical_path(edges: List[tuple], stage_cycles: Dict[str, int]) -> Dict[str, Any]:
@@ -225,6 +241,47 @@ def _critical_path(edges: List[tuple], stage_cycles: Dict[str, int]) -> Dict[str
         chain.append(node)
         node = came.get(node)
     return {'cycles': best[end], 'chain': list(reversed(chain))}
+
+
+def _aie_clock_ghz(project: Path) -> Optional[float]:
+    """The AIE clock the design was compiled for; boards run it at different rates."""
+    path = project / 'Work' / 'ps' / 'c_rts' / 'aie_control_config.json'
+    try:
+        return float(json.loads(path.read_text())['aie_metadata']['DeviceData']['AIEFrequency']) / 1000.0
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+_LATENCY_RE = re.compile(r'AIE4ML_LATENCY_START_CC\s+(\d+)')
+
+
+def measured_latency_cc(project: Path) -> Optional[int]:
+    """One sample's latency: first input beat to its output complete, in AIE cycles.
+
+    The aiesim host measures input start to output start with the event API, after configuration and
+    weight loading; the first sample's own output duration, from the output timestamps, completes it.
+    """
+    project = Path(project)
+    log = project / 'log'
+    clock = _aie_clock_ghz(project)
+    starts = _LATENCY_RE.findall(log.read_text(errors='replace')) if log.exists() else []
+    data_dir = project / 'aiesimulator_output' / 'data'
+    first_beat = _first_beat_ns(data_dir / 'y_p0.txt')
+    complete = (_analyze_aie_out_interval(project, _pipeline(project)) or {}).get('first_output_from_sim_start_ns')
+    if not (starts and clock and first_beat is not None and complete is not None):
+        return None
+    return int(starts[-1]) + round((complete - first_beat) * clock)
+
+
+def _first_beat_ns(path: Path) -> Optional[float]:
+    if not path.exists():
+        return None
+    with open(path) as handle:
+        for line in handle:
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == 'T':
+                return _convert_to_ns(float(parts[1]), parts[2].lower())
+    return None
 
 
 def _vitis(project: Path) -> Dict[str, Any]:
@@ -314,15 +371,16 @@ def _kernel_cycles(project: Path, vitis: Dict[str, Any]) -> List[Dict[str, Any]]
             continue
         fields = run.split()
         try:
-            calls, total = int(fields[0]), int(fields[1])
+            calls, total = int(fields[0]), int(fields[6])
         except (IndexError, ValueError):
             continue
         match = _KERNEL_RE.search(run)
         kernel = match.group(2)[: int(match.group(1))] if match else '?'
-        # Columns are: calls, cycles, %-of-report, min, avg, max. The kernel's own share of
-        # the simulated window is its utilisation; the rest is time in main, i.e. blocked on
-        # an input buffer. Both come from the same total, so only one is worth reporting.
-        busy = fields[2].rstrip('%') if len(fields) > 2 else ''
+        # Columns come in two groups of six: the function alone, then the function with its
+        # callees. A kernel that moves its data through helper functions does that work too, so
+        # the second group is the kernel's cost -- reading the first would charge its callees to
+        # nobody and leave the difference looking like time blocked on a port.
+        busy = fields[7].rstrip('%') if len(fields) > 7 else ''
         tile = path.stem.replace('profile_funct_', '')
         rows.append(
             {
@@ -498,11 +556,16 @@ def _design(project: Path, vitis: Dict[str, Any]) -> Dict[str, Any]:
         return None
 
     plan = find(doc, 'direct_edges') or {}
-    aie_tiles = sum(
-        int((e.get('config') or {}).get('parallelism', {}).get('cas_num', 1))
-        * int((e.get('config') or {}).get('parallelism', {}).get('cas_length', 1))
-        for e in doc.get('execution', [])
-    )
+    placements = (doc.get('physical') or {}).get('placements') or {}
+    if placements and all('width' in p for p in placements.values()):
+        # What placement reserved, which counts tiles an op adds beyond its compute tiles.
+        aie_tiles = sum(int(p['width']) * int(p['height']) for p in placements.values())
+    else:  # a plan written before placements recorded their size
+        aie_tiles = sum(
+            int((e.get('config') or {}).get('parallelism', {}).get('cas_num', 1))
+            * int((e.get('config') or {}).get('parallelism', {}).get('cas_length', 1))
+            for e in doc.get('execution', [])
+        )
     return {
         'aie_tiles': aie_tiles,
         'memtile_buffers': len(plan.get('buffers', [])),
@@ -544,8 +607,17 @@ def collect_report(model_or_path) -> 'Report':
     for k in kernels:
         k.update({f'{kind}_B': v for kind, v in per_core.get(k['tile'], {}).items()})
     latency = _analyze_aie_out_interval(project, doc)
+    clock = _aie_clock_ghz(project)
+    if latency:
+        latency['latency_cc'] = measured_latency_cc(project)
+    if clock and latency:
+        for stats in [latency.get('global') or {}, *(latency.get('per_port') or {}).values()]:
+            for key in ('min', 'max', 'avg'):
+                if f'{key}_ns' in stats:
+                    stats[f'{key}_cc'] = round(stats[f'{key}_ns'] * clock)
     report: Dict[str, Any] = {
         'project': str(project),
+        'aie_clock_GHz': clock,
         'design': _design(project, vitis),
         'latency': latency,
         'throughput_plio': _throughput(project),
@@ -574,16 +646,14 @@ def collect_report(model_or_path) -> 'Report':
         ]
         critical = _critical_path(edges, stage_cycles)
         report['critical_path'] = critical
-        first = (latency or {}).get('first_output_ns')
+        first = (latency or {}).get('latency_cc')
         if critical and first:
-            # This is a residual, not a measurement: end-to-end minus the kernel work on the critical path.
-            compute_ns = critical['cycles'] / ASSUMED_AIE_CLOCK_GHZ
+            # A residual, not a measurement: end-to-end minus the kernel work on the critical path.
             report['latency_split'] = {
-                'assumed_clock_GHz': ASSUMED_AIE_CLOCK_GHZ,
-                'total_ns': first,
-                'compute_ns': round(compute_ns, 1),
-                'data_movement_ns': round(first - compute_ns, 1),
-                'data_movement_pct': round(100.0 * (first - compute_ns) / first, 1),
+                'total_cc': first,
+                'compute_cc': critical['cycles'],
+                'data_movement_cc': first - critical['cycles'],
+                'data_movement_pct': round(100.0 * (first - critical['cycles']) / first, 1),
             }
 
     missing = []
@@ -593,6 +663,10 @@ def collect_report(model_or_path) -> 'Report':
         missing.append("PLIO throughput: run 'make aiesim' or 'make profile'")
     if not report['memory']:
         missing.append("memory: run 'make aiecom'")
+    if clock is None:
+        missing.append("AIE clock (cycles for latency and interval): compile the design ('make all')")
+    if latency and latency.get('latency_cc') is None:
+        missing.append('latency: re-run the aie simulation of a project generated with this aie4ml version')
     report['missing'] = missing
     return Report(report)
 
@@ -601,7 +675,8 @@ def format_report(report: Dict[str, Any]) -> str:
     """Render the report as plain text."""
     out: List[str] = []
     add = out.append
-    ns = lambda cycles: cycles / ASSUMED_AIE_CLOCK_GHZ  # noqa: E731 - local unit shorthand
+    clock = report.get('aie_clock_GHz')
+    ns = lambda cycles: cycles / clock if clock else float('nan')  # noqa: E731 - local unit shorthand
 
     add('=' * 78)
     add('  aie4ml  |  AIE project report')
@@ -616,32 +691,32 @@ def format_report(report: Dict[str, Any]) -> str:
         if design.get('memtile_bytes'):
             line += f' ({design["memtile_bytes"]:,} B)'
         add(line)
-    add(f'  Clock freq. (assumed): {ASSUMED_AIE_CLOCK_GHZ} GHz')
+    add(f'  AIE clock: {clock} GHz' if clock else '  AIE clock: unknown (cycles omitted)')
 
     latency = (report.get('latency') or {}).get('global') or {}
-    first = (report.get('latency') or {}).get('first_output_ns')
+    first_cc = (report.get('latency') or {}).get('latency_cc')
     critical = report.get('critical_path') or {}
     split = report.get('latency_split') or {}
-    if first or critical:
+    if first_cc is not None or critical:
         add('')
-        add('Latency  (one sample, input to output)')
-        if first:
+        add('Latency  (first input beat to output complete; excludes configuration and weight loading)')
+        if first_cc is not None:
             add(
-                f'    end to end     {first * ASSUMED_AIE_CLOCK_GHZ:12,.0f} cc  {first:12,.1f} ns   '
-                'measured, first inference complete'
+                f'    latency        {first_cc:12,d} cc  {ns(first_cc):12,.1f} ns   '
+                'per sample, with samples at least one output interval apart'
             )
         if critical:
             add(
                 f'      compute      {critical["cycles"]:12,d} cc  {ns(critical["cycles"]):12,.1f} ns   '
                 f'critical path, {len(critical["chain"])} stages'
             )
-        if split and split['data_movement_ns'] < 0:
+        if split and split['data_movement_cc'] < 0:
             # A stream kernel emits its first rows before it finishes, so the residual has no meaning.
             add('      data move             n/a   (output streams out before the kernel finishes)')
         elif split:
             add(
-                f'      data move    {split["data_movement_ns"] * ASSUMED_AIE_CLOCK_GHZ:12,.0f} cc  '
-                f'{split["data_movement_ns"]:12,.1f} ns   {split["data_movement_pct"]}% memtile/DMA/lock etc.'
+                f'      data move    {split["data_movement_cc"]:12,d} cc  '
+                f'{ns(split["data_movement_cc"]):12,.1f} ns   {split["data_movement_pct"]}% memtile/DMA/lock etc.'
             )
 
     compute = report.get('compute') or {}
@@ -649,10 +724,9 @@ def format_report(report: Dict[str, Any]) -> str:
         add('')
         add('Throughput  (steady state)')
         if latency:
-            add(
-                f'    output interval {latency["avg_ns"] * ASSUMED_AIE_CLOCK_GHZ:12,.0f} cc '
-                f'{latency["avg_ns"]:12,.1f} ns   avg ({latency["min_ns"]:,.1f} min)'
-            )
+            cc = f'{latency["avg_cc"]:12,d} cc' if 'avg_cc' in latency else f'{"-":>12s} cc'
+            add(f'    output interval {cc} {latency["avg_ns"]:12,.1f} ns   avg ({latency["min_ns"]:,.1f} min)')
+            add(f'    sample rate    {1000.0 / latency["avg_ns"]:12,.3f} MS/s   sustained, one sample per interval')
         if compute:
             add(
                 f'    compute rate   {compute["avg_GOPs"]:12,.2f} GOP/s  '

@@ -13,18 +13,19 @@ def _input(nodes, initializers, name: str, rows: int):
     return (f'{name}_q', TensorProto.INT8, [rows, 16])
 
 
-def _dense(nodes, initializers, source: str, name: str):
+def _dense(nodes, initializers, source: str, name: str, *, seed=None):
+    """16 -> 16 MatMul; all-ones weights unless a seed asks for distinct ones, which a numeric test
+    needs to tell rows and features apart."""
     weight_name = f'{name}_w'
     dq(nodes, f'{weight_name}_q', weight_name, weight_name)
     nodes.append(helper.make_node('MatMul', [source, weight_name], [f'{name}_mm'], name=name))
     qdq(nodes, f'{name}_mm', f'{name}_out', name)
-    initializers.extend(
-        [
-            *qparams(weight_name),
-            *qparams(name),
-            numpy_helper.from_array(np.ones((16, 16), dtype=np.int8), f'{weight_name}_q'),
-        ]
+    weights = (
+        np.ones((16, 16), dtype=np.int8)
+        if seed is None
+        else np.random.default_rng(seed).integers(-3, 4, size=(16, 16), dtype=np.int8)
     )
+    initializers.extend([*qparams(weight_name), *qparams(name), numpy_helper.from_array(weights, f'{weight_name}_q')])
     return f'{name}_out'
 
 
@@ -204,3 +205,181 @@ def test_chained_views_fail_explicitly(tmp_path):
             batch=8,
             directives={'root': _parallelism(2), 'tail': _parallelism(2)},
         )
+
+
+# --------------------------------------------------------------------------- #
+# a view op on a transposed value: its axis is the canonical tensor's
+# --------------------------------------------------------------------------- #
+
+
+def _transposed(nodes, source: str, name: str) -> str:
+    nodes.append(helper.make_node('Transpose', [source], [name], perm=[1, 0], name=name))
+    return name
+
+
+def _transposed_slice_model(*, seed=None):
+    """root [8, 16] viewed as [16, 8]; Slice(axis=1, 0:4) takes its first four ROWS, not features."""
+    nodes, initializers = [], []
+    graph_input = _input(nodes, initializers, 'x', 8)
+    root = _dense(nodes, initializers, 'x', 'root', seed=seed)
+    for name, value in (('starts', [0]), ('ends', [4]), ('axes', [1])):
+        initializers.append(numpy_helper.from_array(np.asarray(value, dtype=np.int64), name))
+    nodes.append(
+        helper.make_node('Slice', [_transposed(nodes, root, 'root_t'), 'starts', 'ends', 'axes'], ['cut'], name='slice')
+    )
+    output = _dense(
+        nodes, initializers, _transposed(nodes, 'cut', 'cut_t'), 'tail', seed=None if seed is None else seed + 1
+    )
+    return make_model(
+        'aie1_transposed_slice',
+        nodes=nodes,
+        inputs=[graph_input],
+        outputs=[(output, TensorProto.FLOAT, [4, 16])],
+        initializers=initializers,
+    )
+
+
+def _transposed_split_model(*, seed=None):
+    """root [8, 16] viewed as [16, 8]; Split(axis=1) halves its ROWS, each half feeding its own dense."""
+    nodes, initializers = [], []
+    graph_input = _input(nodes, initializers, 'x', 8)
+    root = _dense(nodes, initializers, 'x', 'root', seed=seed)
+    initializers.append(numpy_helper.from_array(np.asarray([4, 4], dtype=np.int64), 'split_sizes'))
+    nodes.append(
+        helper.make_node(
+            'Split', [_transposed(nodes, root, 'root_t'), 'split_sizes'], ['up', 'down'], name='split', axis=1
+        )
+    )
+    left = _dense(
+        nodes, initializers, _transposed(nodes, 'up', 'up_t'), 'left', seed=None if seed is None else seed + 1
+    )
+    right = _dense(
+        nodes, initializers, _transposed(nodes, 'down', 'down_t'), 'right', seed=None if seed is None else seed + 2
+    )
+    return make_model(
+        'aie1_transposed_split',
+        nodes=nodes,
+        inputs=[graph_input],
+        outputs=[(left, TensorProto.FLOAT, [4, 16]), (right, TensorProto.FLOAT, [4, 16])],
+        initializers=initializers,
+    )
+
+
+def _transposed_concat_model(*, second_transposed: bool = True):
+    """[4, 16] and [4, 16] viewed as [16, 4] each; Concat(axis=1) stacks their ROWS. With the second
+    input left untransposed ([16, 16]) the two views disagree on what axis 1 is."""
+    nodes, initializers = [], []
+    first_input = _input(nodes, initializers, 'a', 4)
+    second_input = _input(nodes, initializers, 'b', 4 if second_transposed else 16)
+    first = _transposed(nodes, _dense(nodes, initializers, 'a', 'first'), 'first_t')
+    second = _dense(nodes, initializers, 'b', 'second')
+    second = _transposed(nodes, second, 'second_t') if second_transposed else second
+    nodes.append(helper.make_node('Concat', [first, second], ['joined'], name='concat', axis=1))
+    output = _dense(nodes, initializers, _transposed(nodes, 'joined', 'joined_t'), 'tail')
+    rows = 8 if second_transposed else 20
+    return make_model(
+        'aie1_transposed_concat',
+        nodes=nodes,
+        inputs=[first_input, second_input],
+        outputs=[(output, TensorProto.FLOAT, [rows, 16])],
+        initializers=initializers,
+    )
+
+
+def _view(ctx, op_type):
+    node = next(n for n in ctx.ir.logical if n.op_type == op_type)
+    return node.trait_data('concat_view' if op_type == 'concat' else 'slice_view')
+
+
+def test_slice_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
+    """The ONNX axis names an axis of the transposed view; the slice is recorded on the canonical tensor,
+    so it cuts root's rows -- the first of its two row-band ports -- not its features."""
+    ctx = lower(
+        _transposed_slice_model(),
+        tmp_path,
+        part=AIE1_PART,
+        batch=8,
+        directives={'root': _parallelism(2), 'tail': _parallelism(1)},
+    )
+    assert _view(ctx, 'slice')['axis'] == 0
+    assert ('root_aie.out1[0]', 'tail_aie.in1[0]') in {
+        (e['source'], e['target']) for e in ctx.ir.physical.plan['direct_edges']
+    }
+
+
+def test_split_of_a_transposed_value_cuts_the_canonical_axis(tmp_path):
+    ctx = lower(
+        _transposed_split_model(),
+        tmp_path,
+        part=AIE1_PART,
+        batch=8,
+        directives={'root': _parallelism(2), 'left': _parallelism(1), 'right': _parallelism(1)},
+    )
+    assert _view(ctx, 'split')['axis'] == 0
+    edges = {(e['source'], e['target']) for e in ctx.ir.physical.plan['direct_edges']}
+    assert {('root_aie.out1[0]', 'left_aie.in1[0]'), ('root_aie.out1[1]', 'right_aie.in1[0]')} <= edges
+
+
+def test_concat_of_transposed_values_joins_the_canonical_axis(tmp_path):
+    ctx = lower(
+        _transposed_concat_model(),
+        tmp_path,
+        part=AIE1_PART,
+        batch=8,
+        directives={'first': _parallelism(1), 'second': _parallelism(1), 'tail': _parallelism(2)},
+    )
+    assert _view(ctx, 'concat')['axis'] == 0
+    edges = {(e['source'], e['target']) for e in ctx.ir.physical.plan['direct_edges']}
+    assert {('first_aie.out1[0]', 'tail_aie.in1[0]'), ('second_aie.out1[0]', 'tail_aie.in1[1]')} <= edges
+
+
+def test_concat_of_differently_viewed_values_is_refused(tmp_path):
+    with pytest.raises(ValueError, match=r'different axis orders .* canonical axis \[0, 1\]'):
+        lower(_transposed_concat_model(second_transposed=False), tmp_path, part=AIE1_PART, batch=8)
+
+
+def test_a_transpose_never_folds_under_a_view_op():
+    """Folding a transpose out from under a view op would leave its axis naming the other order: the pass
+    refuses rather than slice the wrong axis."""
+    from types import SimpleNamespace
+
+    from aie4ml.ir.context import CONTEXT_ATTR
+    from aie4ml.ir.graph import LogicalIR, OpNode, TensorVar
+    from aie4ml.passes.fold_views import FoldViewOps
+
+    graph = LogicalIR()
+    x, view, cut = (TensorVar(n, s) for n, s in (('x', (8, 16)), ('x_t', (16, 8)), ('cut', (16, 4))))
+    for tensor in (x, view, cut):
+        graph.add_tensor(tensor)
+    graph.mark_graph_input('x')
+    for name, op, inputs, outputs, meta in (
+        ('t', 'transpose', [x], [view], {'perm': [1, 0], 'data_format': 'channels_last'}),
+        ('slice', 'slice', [view], [cut], {'axis': 1, 'slices': [{'start': 0, 'extent': 4}]}),
+    ):
+        node = OpNode(name, op, 'aie', inputs=inputs, outputs=outputs, metadata=meta)
+        for tensor in inputs:
+            tensor.consumers.append(node)
+        for tensor in outputs:
+            tensor.producer = node
+        graph.add_node(node)
+    holder = SimpleNamespace()
+    setattr(holder, CONTEXT_ATTR, SimpleNamespace(ir=SimpleNamespace(logical=graph)))
+    with pytest.raises(NotImplementedError, match='view op'):
+        FoldViewOps().transform(holder)
+
+
+@pytest.mark.requires_vitis
+def test_split_of_a_transposed_value_matches_onnx(tmp_path):
+    """Distinct weights, so halving features instead of rows would change every number."""
+    from helpers import assert_x86_matches_onnx
+
+    feeds = {'x_q': np.random.default_rng(3).integers(-8, 8, size=(8, 16), dtype=np.int8)}
+    assert_x86_matches_onnx(
+        _transposed_split_model(seed=11),
+        feeds,
+        {'root': _parallelism(2), 'left': _parallelism(1), 'right': _parallelism(1)},
+        tmp_path,
+        batch=8,
+        max_code_diff=0,
+        part=AIE1_PART,
+    )

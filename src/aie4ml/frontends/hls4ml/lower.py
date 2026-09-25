@@ -21,6 +21,7 @@ from ...ir import (
     set_input_roles,
 )
 from ...ir.context import AIEBackendContext, ProjectConfig
+from ...ir.graph import VIEW_FLATTEN_2D
 from ...passes.utils import is_pointwise_dense
 from ..common import register_default_traits
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
@@ -50,7 +51,7 @@ class LowerToAieIr(ModelOptimizerPass):
             graph.add_tensor(
                 TensorVar(
                     name=input_var.name,
-                    shape=input_var.shape,
+                    shape=_canon(input_var.shape),  # the batch axis every other tensor carries
                     precision=_precision_of(input_var),
                 )
             )
@@ -90,8 +91,15 @@ class LowerToAieIr(ModelOptimizerPass):
             self._collect_metadata(layer, node)
             node.directives.update(extract_layer_directives(layer, model))
 
-            if node.op_type == 'dense':
+            if node.op_type in ('dense', 'conv2d'):
                 weight_tv, bias_tv = _create_weight_tensors(layer, graph)
+                if layer.class_name == 'DepthwiseConv2D':
+                    # Keras keeps a depthwise filter per input channel, [kh, kw, Cin, multiplier];
+                    # the canonical form is one group per channel, [kh, kw, Cin/groups, Cout].
+                    data = np.asarray(weight_tv.data)
+                    kh, kw, channels, multiplier = data.shape
+                    weight_tv.data = data.reshape(kh, kw, 1, channels * multiplier)
+                    weight_tv.shape = (kh, kw, 1, channels * multiplier)
                 param_tensors[layer.name] = (weight_tv, bias_tv)
 
             if node.op_type == 'layer_norm':
@@ -138,9 +146,10 @@ class LowerToAieIr(ModelOptimizerPass):
 
             if layer.name in param_tensors:
                 weight_tv, bias_tv = param_tensors[layer.name]
-                node.inputs.append(weight_tv)
-                if bias_tv is not None:
-                    node.inputs.append(bias_tv)
+                for param_tv in (weight_tv, bias_tv):
+                    if param_tv is not None:
+                        node.inputs.append(param_tv)
+                        param_tv.consumers.append(node)
 
             role_names = list(node.metadata.get('input_roles') or [])
             if role_names:
@@ -150,6 +159,11 @@ class LowerToAieIr(ModelOptimizerPass):
             graph.mark_graph_output(out_var.name)
 
         return True
+
+    @staticmethod
+    def _input_rank(layer) -> int:
+        """Rank of this layer's input tensor, batch axis included."""
+        return len(layer.get_input_variable().shape) + 1
 
     def _collect_metadata(self, layer, node) -> None:
         meta: Dict[str, Any] = {}
@@ -165,8 +179,27 @@ class LowerToAieIr(ModelOptimizerPass):
                 raise ValueError(f'{layer.name}: missing n_in/n_out for {layer.class_name}.')
             meta['n_in'] = int(n_in)
             meta['n_out'] = int(n_out)
-            meta['use_bias'] = layer.get_attr('bias_data') is not None
-            meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if meta['use_bias'] else [])
+            has_bias = layer.get_attr('bias_data') is not None
+            meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if has_bias else [])
+
+        if node.op_type == 'conv2d':
+            # hls4ml is channels-last and stores its weights as [kh, kw, Cin/groups, Cout], which
+            # is the canonical conv2d contract; only the attribute names differ.
+            meta.update(
+                kernel_shape=(int(layer.get_attr('filt_height')), int(layer.get_attr('filt_width'))),
+                strides=(int(layer.get_attr('stride_height', 1)), int(layer.get_attr('stride_width', 1))),
+                dilations=(int(layer.get_attr('dilation_height', 1)), int(layer.get_attr('dilation_width', 1))),
+                pads=tuple(int(layer.get_attr(f'pad_{side}', 0)) for side in ('top', 'left', 'bottom', 'right')),
+                groups=int(layer.get_attr('n_chan')) if layer.class_name == 'DepthwiseConv2D' else 1,
+            )
+            meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if layer.get_attr('bias_data') is not None else [])
+
+        if node.op_type == 'reshape':
+            # hls4ml tensors are already in canonical order, so the flattened row ravels the axes
+            # exactly as they are stored.
+            meta['input_roles'] = ['lhs']
+            meta['view'] = VIEW_FLATTEN_2D
+            meta['axis_order'] = tuple(range(self._input_rank(layer)))
 
         if layer.class_name == 'ApplyAlpha':
             scale = layer.get_attr('scale_data')
@@ -230,6 +263,15 @@ class LowerToAieIr(ModelOptimizerPass):
     def _map_op_type(self, layer) -> str:
         if layer.class_name in ('Dense',) or is_pointwise_dense(layer):
             return 'dense'
+        if layer.class_name == 'SeparableConv2D':
+            raise NotImplementedError(
+                f'{layer.name}: a separable convolution is a depthwise and a pointwise convolution; '
+                'split it in the model so each lowers to its own conv2d.'
+            )
+        if layer.class_name in ('Conv2D', 'DepthwiseConv2D'):
+            return 'conv2d'
+        if layer.class_name in ('Reshape', 'Flatten'):
+            return 'reshape'
         if layer.class_name == 'Transpose':
             return 'transpose'
         if layer.class_name == 'LayerNormalization':

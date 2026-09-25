@@ -46,26 +46,40 @@ def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
     port = int(consumer.selected_ports(inst.ports.inputs[consumer.tensor].count)[0])
     base = inst.variant.describe_input_staging(consumer.node, inst.config, consumer.tensor, port, None, None)
     rebase_descriptor_offset(base, consumer.offset_base)
+    return host_visible_input_staging(base, offset=[0 for _ in base['io_tiling_dimension']])
+
+
+def host_visible_input_staging(base: Dict[str, Any], *, stream: bool = False, offset=None) -> Dict[str, Any]:
+    """Host-visible descriptor of one graph-input port.
+
+    A DMA-fed buffer receives only the logical elements (`io_tiling_dimension`) and the DMA
+    scatters them; a stream port receives the whole padded port tile, so its transfer shape
+    is the staging `tiling_dimension`. `logical_origin` says where that window starts in the
+    tensor, and travels unchanged: transport never recomputes where a port's data lives. A port
+    that frames each inference in whole transfer units declares `transfer_bytes`, which travels too.
+    """
     io_tile = list(base['io_tiling_dimension'])
-    return {
+    desc = {
         'access': 'write',
         'storage_layout': STORAGE_LAYOUT_LINEAR,
         'buffer_dimension': list(base['buffer_dimension']),
-        'tiling_dimension': list(io_tile),
+        'tiling_dimension': list(base['tiling_dimension']) if stream else list(io_tile),
         'io_tiling_dimension': list(io_tile),
         'io_boundary_dimension': list(base['io_boundary_dimension']),
-        'offset': [0 for _ in io_tile],
+        'offset': host_offsets(base) if offset is None else list(offset),
+        'logical_origin': list(base['logical_origin']),
         'slice_dimension': int(base['slice_dimension']),
         'inner_dimension': int(base['inner_dimension']),
         'outer_dimension': int(base['outer_dimension']),
     }
+    if 'transfer_bytes' in base:
+        desc['transfer_bytes'] = int(base['transfer_bytes'])
+    return desc
 
 
 def host_offsets(desc: Dict[str, Any]) -> List[int]:
-    """Rebase a staging offset from padded kernel-buffer coordinates into logical tensor coordinates.
-
-    A port's offset is a whole number of padded slices along its partition axis; the host-visible
-    slice starts at the same number of logical (`io_tiling_dimension`) slices.
+    """Where a port sits among its peers, in logical units: the coordinate memtile sharding groups
+    ports by. Where its data lands in the tensor is `logical_origin`, which its op publishes.
     """
     offsets = [int(x) for x in desc['offset']]
     io_tile = [int(x) for x in desc['io_tiling_dimension']]
@@ -95,29 +109,7 @@ def host_offsets(desc: Dict[str, Any]) -> List[int]:
 def graph_input_writer_port_descs(
     read_descs: Dict[int, Dict[str, Any]], *, stream: bool = False
 ) -> Dict[int, Dict[str, Any]]:
-    """Host-visible descriptor per graph-input port.
-
-    A DMA-fed buffer receives only the logical elements (`io_tiling_dimension`) and the DMA
-    scatters them; a stream port receives the whole padded port tile, so its transfer shape
-    is the staging `tiling_dimension`. `io_tiling_dimension` names the logical slice either way.
-    """
-    out: Dict[int, Dict[str, Any]] = {}
-    for port, base in read_descs.items():
-        io_tile = list(base['io_tiling_dimension'])
-        transfer = list(base['tiling_dimension']) if stream else list(io_tile)
-        out[int(port)] = {
-            'access': 'write',
-            'storage_layout': STORAGE_LAYOUT_LINEAR,
-            'buffer_dimension': list(base['buffer_dimension']),
-            'tiling_dimension': transfer,
-            'io_tiling_dimension': list(io_tile),
-            'io_boundary_dimension': list(base['io_boundary_dimension']),
-            'offset': host_offsets(base),
-            'slice_dimension': int(base['slice_dimension']),
-            'inner_dimension': int(base['inner_dimension']),
-            'outer_dimension': int(base['outer_dimension']),
-        }
-    return out
+    return {int(port): host_visible_input_staging(base, stream=stream) for port, base in read_descs.items()}
 
 
 def graph_input_unit_box(descs: Dict[int, Dict[str, Any]], ports: List[int]):

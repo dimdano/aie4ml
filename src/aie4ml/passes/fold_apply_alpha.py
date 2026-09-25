@@ -7,6 +7,7 @@ import numpy as np
 
 from ..aie_types import FloatIntent, QuantIntent
 from ..ir import get_backend_context
+from ..ir.graph import has_input_role
 from .base import AIEPass
 
 
@@ -50,7 +51,7 @@ class FoldApplyAlpha(AIEPass):
                 saturation=old_w.saturation,
             )
 
-            if dense_node.metadata.get('use_bias') and len(dense_node.inputs) > 2:
+            if has_input_role(dense_node, 'bias') and len(dense_node.inputs) > 2:
                 bias_tv = dense_node.inputs[2]
                 bias_tv.data = np.asarray(bias_tv.data, dtype=np.float64) * scale
 

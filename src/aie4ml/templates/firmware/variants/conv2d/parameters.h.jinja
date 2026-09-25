@@ -1,0 +1,61 @@
+{% from 'variants/placement.jinja' import buffer_locations %}
+{% set P = L.op_impl.parameters %}
+struct {{L.struct_name}} {
+  using data_t = {{P.precision.lhs.c_type}};
+  using weight_t = {{P.precision.rhs.c_type}};
+  using result_t = {{P.precision.output.c_type}};
+  using bias_t = {{P.precision.bias.c_type}};
+  static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}}; static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
+  static constexpr bool ALTERNATING_HORIZONTAL = {{ 'true' if P.alternating_horizontal else 'false' }};
+  // 'inner' multicasts one channel slice per column to every chain; 'outer' gives each tile its
+  // own row band, so the port array is per tile.
+  static constexpr bool PARALLELISM_CONTRACT_OUTER = {{ 'true' if P.parallelism.contract == 'outer' else 'false' }};
+  static constexpr int M = {{P.microtiling.microtile_m}}, K = {{P.microtiling.microtile_k}}, N = {{P.microtiling.microtile_n}};
+  static constexpr int MB = {{P.spatial_blocks}};
+  // CB / NB are this tile's share of the layer's channel blocks (see CAS_LENGTH / CAS_NUM).
+  static constexpr int CIN = {{P.cin}}, CB = {{P.in_blocks}};
+  static constexpr int COUT = {{P.cout}}, NB = {{P.out_blocks}}, NBP = {{P.out_blocks_padded}};
+  static constexpr int KH = {{P.spatial.kernel[0]}}, KW = {{P.spatial.kernel[1]}};
+  static constexpr int PAD_T = {{P.spatial.pads[0]}}, PAD_L = {{P.spatial.pads[1]}};
+  // A strided conv keeps its frame columns in STRIDE_W polyphase classes, so that the taps of one
+  // output pixel stay contiguous and the compute core reads them exactly as it does at stride 1.
+  static constexpr int STRIDE_H = {{P.spatial.strides[0]}}, STRIDE_W = {{P.spatial.strides[1]}};
+  // Input frame [CB][IN_ROWS][IN_COLS][8]; the IN_H x IN_W image starts at (IN_ORIGIN_R, IN_ORIGIN_C).
+  // FILLS_BORDER: this kernel zeroes the frame's border, because the kernel upstream wrote only
+  // the image. At the graph boundary the host delivers the padded window instead, and a strided
+  // conv reads a frame its retiler built whole.
+  static constexpr bool FILLS_BORDER = {{ 'true' if P.fills_border else 'false' }};
+  // STREAM_IO: the frame arrives and leaves on core streams in linear row order, and the kernel
+  // lands it in the channel-blocked layout the compute core reads.
+  static constexpr bool STREAM_IO = {{ 'true' if P.stream_io else 'false' }};
+  static constexpr int IN_H = {{P.in_h}}, IN_W = {{P.in_w}};
+  static constexpr int IN_ROWS = {{P.in_rows}}, IN_COLS = {{P.in_cols}};
+  static constexpr int IN_ORIGIN_R = {{P.in_origin_r}}, IN_ORIGIN_C = {{P.in_origin_c}};
+  // Outputs are produced in whole register tiles, so OUT_W_COMPUTED >= OUT_W columns are written.
+  // OUT_H is what one call of the compute core covers: the whole tile for a buffer port, one band
+  // for a streamed one, which walks the image in BANDS of them.
+  static constexpr int OUT_H = {{P.out_h}}, OUT_W = {{P.out_w}}, OUT_W_COMPUTED = {{P.out_w_computed}};
+  static constexpr int BANDS = {{P.bands}};
+  static constexpr bool FLATTEN = {{ 'true' if P.flags.emit_flattened else 'false' }};
+  // Output: [NB][OUT_ROWS][OUT_COLS][8] frame, or one Dense LHS row of FLAT_K_PADDED elements.
+  static constexpr int OUT_ROWS = {{P.out_rows}}, OUT_COLS = {{P.out_cols}};
+  static constexpr int OUT_ORIGIN_R = {{P.out_origin_r}}, OUT_ORIGIN_C = {{P.out_origin_c}};
+  static constexpr int FLAT_K_PADDED = {{P.flat_k_padded}};
+  static constexpr int IN_BYTES = {{P.in_bytes}}, OUT_BYTES = {{P.out_bytes}};
+  static constexpr int WN = {{P.weight_count}}, BN = {{P.bias_count}};
+  static constexpr int SHIFT = {{P.shift}};
+  static constexpr bool USE_RELU = {{ 'true' if P.flags.use_relu else 'false' }};
+  static constexpr int col_placement = {{L.placement.col}};
+  static constexpr int row_placement = {{L.placement.row}};
+  // The Dense bank contract for a buffer port: activation copies in banks 0 and 3, stack and bias in
+  // bank 1, weights in bank 2.
+{{ buffer_locations('IN1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'in1') | list) }}
+{{ buffer_locations('OUT1_BUFFER_LOCATIONS', P.buffer_locations | selectattr('port_group', 'equalto', 'out1') | list) }}
+  using acc_scalar_t = {{ P.accumulator_tag }};
+  static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
+  static constexpr const char* SATURATION_TOKEN = "saturate";
+#if __cplusplus >= 202002L
+  static constexpr auto ROUNDING   = aie::rounding_mode::{{ P.rounding_mode }};
+  static constexpr auto SATURATION = aie::saturation_mode::saturate;
+#endif
+};

@@ -5,9 +5,9 @@ from typing import Any, ClassVar, Dict
 import numpy as np
 
 from ....aie_types import FloatIntent
-from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
+from ....ir.graph import OpImplInstance, OpNode, has_input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
-from ...base import BufferLocation, OpImplFootprint, OpImplVariant
+from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
 from ...utils import ParallelismConfig, inherited_microtile, parse_directives, requested_port_kind
@@ -15,6 +15,9 @@ from ...utils.precision import (
     aie_rounding_token,
     element_bytes,
     resolve_accumulator_output_shift,
+    resolve_bias_dtype,
+    resolve_operand_precision,
+    resolve_output_scale_shift,
 )
 from .common import (
     bitwidths_supported,
@@ -32,14 +35,7 @@ from .common import (
     requested_contract,
 )
 from .config import DenseConfig, DenseFlags
-from .resolver import (
-    _build_matmul_io_views,
-    _resolve_bias_dtype,
-    _resolve_numeric,
-    _resolve_output_scale_shift,
-    _resolve_parallelism,
-    _resolve_tile_cfg,
-)
+from .resolver import _build_matmul_io_views, _resolve_parallelism, _resolve_tile_cfg
 
 
 class _BaseDenseMatmulVariant(OpImplVariant):
@@ -93,8 +89,8 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
-        precision, accumulator_tag = _resolve_numeric(node, device)
-        precision['bias'] = _resolve_bias_dtype(node, precision)
+        precision, accumulator_tag = resolve_operand_precision(node, device)
+        precision['bias'] = resolve_bias_dtype(node, precision)
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         required_microtile = None
         producer_contract = input_contracts.get(lhs_tensor.name)
@@ -142,7 +138,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             if is_float
             else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
         )
-        shift += _resolve_output_scale_shift(node, is_float=is_float)
+        shift += resolve_output_scale_shift(node, is_float=is_float)
 
         fused_act = node.traits.get('fused_activation')
         use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
@@ -163,7 +159,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             flags=DenseFlags(
                 use_relu=use_relu,
                 transpose_lhs=io_views[lhs_tensor.name].is_transposed,
-                use_bias=bool(node.metadata.get('use_bias')),
+                use_bias=has_input_role(node, 'bias'),
             ),
         )
 
@@ -209,7 +205,6 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         return OpImplFootprint(
             width=int(config.parallelism.cas_length),
             height=int(config.parallelism.cas_num),
-            extras={'keepout_left': 1, 'keepout_right': int(config.alternating_horizontal)},
         )
 
     def buffer_locations(self, _node, config, anchor_row):
@@ -218,13 +213,14 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
         cas_length = int(config.parallelism.cas_length)
         outer = config.parallelism.contract == 'outer'
         for chain in range(cas_num):
-            reverse = bool(config.alternating_horizontal and (int(anchor_row) + chain) % 2)
+            flow = row_flow(config.alternating_horizontal, int(anchor_row) + chain, cas_length)
             for pos in range(cas_length):
                 idx = chain * cas_length + pos
-                tile_col = cas_length - 1 - pos if reverse else pos
+                tile_col = cas_length - 1 - pos if flow.reversed else pos
                 port = idx if outer else pos
-                locations.append(BufferLocation('in1', port, tile_col + 1 if reverse else tile_col - 1, chain, (0, 3)))
-            locations.append(BufferLocation('out1', chain, 0 if reverse else cas_length - 1, chain, (0, 3)))
+                locations.append(BufferLocation('in1', port, tile_col + flow.input_col, chain, (0, 3)))
+            last = 0 if flow.reversed else cas_length - 1
+            locations.append(BufferLocation('out1', chain, last + flow.output_col, chain, (0, 3)))
         return tuple(locations)
 
     def get_artifacts(self, inst: OpImplInstance):

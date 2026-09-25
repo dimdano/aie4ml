@@ -280,6 +280,7 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     )
     AIEProjectEmitter()._render_makefile(tmp_path, ctx, env, None)
     makefile = (tmp_path / 'Makefile').read_text()
+    assert '--target=hw $(AIE_FLAGS_HW) $(AIE_JOBS)' in makefile  # make -jN reaches the kernel compile
     assert f'AIE_PART      ?= {AIE1_PART}' in makefile
     assert 'AIE_TARGET    := --part=$(AIE_PART)' in makefile
     assert '--platform=$(PLATFORM) $(APP_NAME).cpp' not in makefile
@@ -462,11 +463,15 @@ def test_aie1_tiled_normalization_chain_uses_direct_acc48_kernels(tmp_path):
     execution = aie_model.context.ir.execution
     plan = aie_model.context.ir.physical.plan
 
+    # One-tile rows flow left to right on AIE too: on an odd row the core reaches east, so its input
+    # lives in its own tile and its output in the east neighbour's; on an even row, west and own.
     for name in ('add_aie', 'layernorm_aie', 'softmax_aie'):
         inst = execution.get(name)
-        locations = inst.variant.buffer_locations(inst.node, inst.config, anchor_row=1)
         assert inst.config.alternating_horizontal is True
-        assert any(location.rel_col == 1 for location in locations if location.port_group == 'in1')
+        for row, (input_col, output_col) in ((0, (-1, 0)), (1, (0, 1))):
+            locations = inst.variant.buffer_locations(inst.node, inst.config, anchor_row=row)
+            assert {loc.rel_col for loc in locations if loc.port_group == 'in1'} == {input_col}
+            assert {loc.rel_col for loc in locations if loc.port_group == 'out1'} == {output_col}
     assert execution.get('layernorm_aie').config.accumulator_tag == 'acc48'
     assert execution.get('softmax_aie').config.accumulator_tag == 'acc48'
     assert execution.get('layernorm_aie').variant.variant_id == 'layer_norm.i8.tiled.v1'

@@ -57,6 +57,9 @@ AIE_FLAGS_BASE := $(DSPLIB_OPTS) \
 AIE_FLAGS_HW   := $(AIE_FLAGS_BASE) \
   --aie.workdir=$(AIE_WORKDIR) --aie.output-archive=$(LIBADF)
 
+# `make -jN` also compiles N kernels at once; make shows -jN only inside recipes, so this expands there.
+AIE_JOBS = $(if $(filter -j%,$(MAKEFLAGS)),--aie.Xelfgen=$(filter -j%,$(MAKEFLAGS)))
+
 AIE_FLAGS_X86  := $(AIE_FLAGS_BASE) \
   --aie.workdir=$(X86_WORKDIR) --aie.output-archive=$(LIBADF_X86)
 
@@ -135,7 +138,7 @@ $(STAMP_MARKER):
 	@echo "{{ stamp | default('00000000') }}" > $@
 
 $(LIBADF): $(MY_SOURCES) aie.cfg $(STAMP_MARKER)
-	set -o pipefail; v++ --compile --config aie.cfg --mode aie --target=hw $(AIE_FLAGS_HW) |& tee log
+	set -o pipefail; v++ --compile --config aie.cfg --mode aie --target=hw $(AIE_FLAGS_HW) $(AIE_JOBS) |& tee log
 
 x86all: clean x86com x86sim
 

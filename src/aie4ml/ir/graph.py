@@ -90,6 +90,10 @@ def input_role(node: OpNode, tensor_name: str) -> Optional[str]:
     return node.roles.get(tensor_name)
 
 
+def has_input_role(node: OpNode, role: str) -> bool:
+    return role in node.roles.values()
+
+
 def input_tensor_for_role(node: OpNode, role: str) -> TensorVar:
     for tensor in node.inputs:
         if node.roles.get(tensor.name) == role:
@@ -173,6 +177,11 @@ class LogicalIR:
         out_tv.consumers.clear()
         self.tensors.pop(out_tv.name, None)
 
+    def _retarget_boundary(self, old: 'TensorVar', new: 'TensorVar') -> None:
+        for names in (self.input_tensor_names, self.output_tensor_names):
+            if old.name in names:
+                names[names.index(old.name)] = new.name
+
     def _contract_node(self, node: OpNode):
         in_tv, out_tv = node.inputs[0], node.outputs[0]
         producer = in_tv.producer
@@ -190,6 +199,7 @@ class LogicalIR:
 
         in_tv.producer = None
         if not in_tv.consumers:
+            self._retarget_boundary(in_tv, out_tv)
             self.tensors.pop(in_tv.name, None)
 
     def _detach_node(self, node: OpNode):
@@ -221,6 +231,8 @@ class LogicalIR:
         self._verify_unique_node_names()
         self._verify_topological_order()
         self._verify_tensor_producers()
+        self._verify_connectivity()
+        self._verify_graph_boundaries()
 
     def _verify_unique_node_names(self) -> None:
         seen: set = set()
@@ -252,6 +264,35 @@ class LogicalIR:
                         'and is not a declared graph input.'
                     )
 
+    def _verify_connectivity(self) -> None:
+        for node in self.nodes:
+            for tensor in node.inputs:
+                if node not in tensor.consumers:
+                    raise RuntimeError(f'{node.name}: reads {tensor.name!r}, which does not list it as a consumer.')
+            for tensor in node.outputs:
+                if tensor.producer is not node:
+                    raise RuntimeError(
+                        f'{node.name}: writes {tensor.name!r}, whose producer is '
+                        f'{tensor.producer.name if tensor.producer else None!r}.'
+                    )
+        for tensor in self.tensors.values():
+            for consumer in tensor.consumers:
+                if tensor not in consumer.inputs:
+                    raise RuntimeError(f'{tensor.name}: lists {consumer.name!r} as a consumer, which does not read it.')
+            if any(int(extent) <= 0 for extent in tensor.shape):
+                raise RuntimeError(f'{tensor.name}: has a non-positive extent in {tuple(tensor.shape)}.')
+
+    def _verify_graph_boundaries(self) -> None:
+        for name in self.input_tensor_names:
+            if name not in self.tensors:
+                raise RuntimeError(f'graph input {name!r} is not a tensor of this graph.')
+        for name in self.output_tensor_names:
+            tensor = self.tensors.get(name)
+            if tensor is None:
+                raise RuntimeError(f'graph output {name!r} is not a tensor of this graph.')
+            if tensor.producer is None and name not in self.input_tensor_names:
+                raise RuntimeError(f'graph output {name!r} has no producer and is not a graph input.')
+
     def __iter__(self):
         return iter(self.nodes)
 
@@ -265,6 +306,12 @@ STAGING_CONTRACTS: frozenset = frozenset({'outer', 'inner'})
 ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'plio', 'auto'})
 """Compiler-wide vocabulary of valid IO route modes."""
 
+
+VIEW_FLATTEN_2D = 'flatten_2d'
+"""Output view: the producer writes its result as one `[1, K]` row instead of its natural shape."""
+
+OUTPUT_VIEWS: frozenset = frozenset({VIEW_FLATTEN_2D})
+"""Compiler-wide vocabulary of output views a producing family may be asked to emit."""
 
 TENSOR_LAYOUTS: frozenset = frozenset({'linear', 'tiled'})
 """Valid `layout:` directive names. Only a variant selector -- the layout itself is the
@@ -287,9 +334,51 @@ class TensorContract:
     port_staging: Tuple[Dict[str, Any], ...] = ()
 
 
+@dataclass(frozen=True)
+class ExecutionInput:
+    """One activation an execution entry reads. `shared_memory` requires the edge's no-DMA
+    realisation; without it placement still draws the kernels together and the plan records its choice."""
+
+    tensor: str
+    role: Optional[str]
+    shared_memory: bool = False
+
+
+@dataclass(frozen=True)
+class ExecutionView:
+    """A folded view (slice, split, concat): no kernel; transport maps its readers onto its sources."""
+
+    kind: str
+    node: str
+    data: Tuple[Tuple[str, Any], ...]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return dict(self.data).get(key, default)
+
+    @property
+    def sources(self) -> Tuple[str, ...]:
+        if self.kind == 'concat':
+            return tuple(str(item['input']) for item in self.get('slices', ()))
+        return (str(self.get('source')),)
+
+
+@dataclass(frozen=True)
+class ExecutionValue:
+    """One activation: written by `producer`, or else a folded `view`, or else a graph input."""
+
+    name: str
+    producer: Optional[str] = None
+    view: Optional[ExecutionView] = None
+
+    def __post_init__(self) -> None:
+        if self.producer is not None and self.view is not None:
+            raise ValueError(f'{self.name}: a value is written by a kernel or is a view, not both.')
+
+
 @dataclass
 class ExecutionEntry:
-    """Materialized execution selection for a logical node."""
+    """One kernel graph to build. `node` is read only: the logical node it implements, or an
+    execution-only node for a kernel a lowering pass inserted. Connectivity is `inputs`/`outputs`."""
 
     node: OpNode
     variant: 'OpImplVariant'
@@ -300,6 +389,8 @@ class ExecutionEntry:
     graph_header: str
     graph_name: str
     param_template: str
+    inputs: Tuple[ExecutionInput, ...] = ()
+    outputs: Tuple[str, ...] = ()
     artifacts: Dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -310,16 +401,26 @@ class ExecutionEntry:
     def op_type(self) -> str:
         return self.node.op_type
 
+    def input(self, tensor: str) -> ExecutionInput:
+        for item in self.inputs:
+            if item.tensor == tensor:
+                return item
+        raise KeyError(f'{self.name}: reads no execution value {tensor!r}.')
+
 
 OpImplInstance = ExecutionEntry
 
 
 @dataclass
 class ExecutionIR:
-    """Container for selected implementation instances derived from logical nodes."""
+    """The kernel graphs to build, in producer-before-consumer order. After resolution it is the only
+    source of executable connectivity; the logical graph keeps the semantics."""
 
     instances: Dict[str, ExecutionEntry] = field(default_factory=dict)
     tensor_contracts: Dict[str, TensorContract] = field(default_factory=dict)
+    values: Dict[str, ExecutionValue] = field(default_factory=dict)
+    graph_inputs: Tuple[str, ...] = ()
+    graph_outputs: Tuple[str, ...] = ()
 
     def register(
         self,
@@ -332,6 +433,8 @@ class ExecutionIR:
         graph_header: str,
         graph_name: str,
         param_template: str,
+        inputs: Tuple[ExecutionInput, ...],
+        outputs: Tuple[str, ...],
     ) -> ExecutionEntry:
         inst = ExecutionEntry(
             node=node,
@@ -343,9 +446,28 @@ class ExecutionIR:
             graph_header=graph_header,
             graph_name=graph_name,
             param_template=param_template,
+            inputs=tuple(inputs),
+            outputs=tuple(outputs),
         )
         self.instances[node.name] = inst
         return inst
+
+    def insert_before(self, name: str, inst: ExecutionEntry) -> None:
+        if inst.name in self.instances:
+            raise ValueError(f'{inst.name}: an execution entry of that name already exists.')
+        if name not in self.instances:
+            raise KeyError(f'{name}: no execution entry to insert {inst.name} before.')
+        ordered = {}
+        for key, value in self.instances.items():
+            if key == name:
+                ordered[inst.name] = inst
+            ordered[key] = value
+        self.instances = ordered
+
+    def add_value(self, value: ExecutionValue) -> None:
+        if value.name in self.values:
+            raise ValueError(f'{value.name}: the execution graph already has a value of that name.')
+        self.values[value.name] = value
 
     def get(self, name: str) -> Optional[ExecutionEntry]:
         return self.instances.get(name)
@@ -353,6 +475,9 @@ class ExecutionIR:
     def clear(self) -> None:
         self.instances.clear()
         self.tensor_contracts.clear()
+        self.values.clear()
+        self.graph_inputs = ()
+        self.graph_outputs = ()
 
     def prune(self, active_names: Iterable[str]) -> bool:
         keep = set(active_names)
@@ -362,6 +487,47 @@ class ExecutionIR:
                 del self.instances[name]
                 removed = True
         return removed
+
+    def verify(self) -> None:
+        visited = set()
+        for inst in self.instances.values():
+            for item in inst.inputs:
+                value = self.values.get(item.tensor)
+                if value is None:
+                    raise RuntimeError(f'{inst.name}: reads {item.tensor!r}, which is not an execution value.')
+                if item.tensor not in inst.ports.inputs:
+                    raise RuntimeError(f'{inst.name}: reads {item.tensor!r} but binds no port to it.')
+                if value.producer is not None and value.producer not in visited:
+                    raise RuntimeError(f'{inst.name}: reads {item.tensor!r} before {value.producer} writes it.')
+                if value.producer is None and value.view is None and item.tensor not in self.graph_inputs:
+                    raise RuntimeError(f'{inst.name}: reads {item.tensor!r}, which nothing produces.')
+                if value.view is not None:
+                    for name in value.view.sources:
+                        source = self.values.get(name)
+                        if source is None:
+                            raise RuntimeError(
+                                f'{inst.name}: reads the view {item.tensor!r} over {name!r}, which is not an '
+                                'execution value.'
+                            )
+                        if source.producer is not None and source.producer not in visited:
+                            raise RuntimeError(
+                                f'{inst.name}: reads the view {item.tensor!r} over {name!r} before '
+                                f'{source.producer} writes it.'
+                            )
+                if item.shared_memory and value.producer is None:
+                    raise RuntimeError(
+                        f'{inst.name}: requires {item.tensor!r} through shared memory, but no kernel writes it.'
+                    )
+            for name in inst.outputs:
+                value = self.values.get(name)
+                if value is None or value.producer != inst.name:
+                    raise RuntimeError(f'{inst.name}: writes {name!r}, but the value names another producer.')
+                if name not in inst.ports.outputs:
+                    raise RuntimeError(f'{inst.name}: writes {name!r} but binds no port to it.')
+            visited.add(inst.name)
+        for name in self.graph_outputs:
+            if name not in self.values:
+                raise RuntimeError(f'graph output {name!r} is not an execution value.')
 
     def __iter__(self):
         return iter(self.instances.values())

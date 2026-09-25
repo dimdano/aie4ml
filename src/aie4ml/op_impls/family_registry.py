@@ -9,9 +9,23 @@ if TYPE_CHECKING:
 
 
 class FamilyResolver:
-    """Thin structural validator + variant dispatcher for one op type."""
+    """Structural validator, variant dispatcher and capability record for one op type; passes ask
+    capabilities instead of naming op types."""
 
     op_type: ClassVar[str] = ''
+    supported_fusions: ClassVar[frozenset] = frozenset()  # epilogues folded into the kernel
+    supported_output_views: ClassVar[frozenset] = frozenset()  # OUTPUT_VIEWS written directly
+
+    def spatial_access(self, _node: Any):
+        """The 2-D window read around each output pixel (sizes its producer's frame), or None."""
+        return None
+
+    def reorder_reduction_rows(self, node: Any, tensor: Any, _order) -> None:
+        """Adopt a folded view's permutation of the rows this op reduces over into its constants."""
+        raise NotImplementedError(
+            f'{node.name}: {self.op_type} cannot adopt a reordered {tensor.name!r}; its constants '
+            'assume the original row order.'
+        )
 
     def validate_structure(self, _node: Any, _device: Any) -> None:
         raise NotImplementedError
@@ -42,6 +56,10 @@ class FamilyResolverRegistry:
         if resolver is None:
             raise NotImplementedError(f'No family resolver registered for op_type={op_type!r}.')
         return resolver
+
+    def find(self, op_type: str) -> Optional[FamilyResolver]:
+        """Like `get`, but None for an op no family implements (a view)."""
+        return self._resolvers.get(op_type)
 
 
 _GLOBAL_FAMILY_RESOLVER_REGISTRY = FamilyResolverRegistry()

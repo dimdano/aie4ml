@@ -182,10 +182,14 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int) -> in
     return total // int(batch)
 
 
+def port_transfer_bytes(port) -> int:
+    """Bytes one port moves per iteration: its transfer, whatever the layout behind it."""
+    return port.transfer_bytes
+
+
 def _stream_words_512(port, direction: str) -> int:
-    """512-bit words one PLIO stream carries per iteration: the port's transfer tile (the logical
-    slice of a DMA-fed buffer port, the padded tile of a stream port), which must be word-aligned."""
-    stream_bytes = int(math.prod(port.numpy_tile_shape)) * (int(port.dtype.width) // 8)
+    """512-bit words one PLIO stream carries per iteration, which must be word-aligned."""
+    stream_bytes = port_transfer_bytes(port)
     if stream_bytes % _DDR_WORD_BYTES != 0:
         raise NotImplementedError(
             f'graph {direction}: {stream_bytes} bytes per stream is not a multiple of '
@@ -352,10 +356,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     # (incl. param-less activations) so the RTP port suffix matches the app.cpp graph index.
     layers = []
     layer_index = 0
-    for node in ctx.ir.logical:
-        inst = ctx.ir.execution.get(node.name)
-        if inst is None:
-            continue
+    for inst in ctx.ir.execution:
+        node = inst.node
         layer_index += 1
         artifacts = inst.variant.get_artifacts(inst)
         if not artifacts:
@@ -525,13 +527,12 @@ def pack_host_data(model_or_ctx, X=None):
     of that are packed -- the same storage-dtype contract the weights path uses. n-D
     boundaries are handled via the full ``numpy_boundary_shape``.
     """
-    from .simulation import _extract_port_tile, build_io_layout, prepare_inputs
+    from .simulation import _extract_port_tile, _framed, build_io_layout, prepare_inputs
 
     ctx = get_backend_context(model_or_ctx)
     layout = build_io_layout(ctx)
     in_tensor = next(iter(layout.inputs))
     in_ports = layout.inputs[in_tensor]
-    out_port0 = layout.outputs[next(iter(layout.outputs))][0]
 
     boundary = in_ports[0].numpy_boundary_shape  # full n-D shape; no (batch, feat) assumption
 
@@ -543,10 +544,12 @@ def pack_host_data(model_or_ctx, X=None):
     for p in in_ports:
         tile = _extract_port_tile(prepared, p)[0]  # this port's slice, storage dtype, n-D
         _check_storage_width(p, tile)
-        in_tiles.append(tile)
+        in_tiles.append(_framed(tile[np.newaxis], p))  # the transfer, with any framing padding
     ifm_packed = _pack_ports_to_ddr(in_tiles, len(in_ports))
 
-    out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
+    # What the graph actually emits, port by port -- the same transfer the PL movers carry, which
+    # is not the logical tensor when a port's tile is padded.
+    out_total_bytes = sum(port_transfer_bytes(port) for ports in layout.outputs.values() for port in ports)
     if out_total_bytes % 4 != 0:
         raise NotImplementedError(f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).')
     ofm_size_words = out_total_bytes // 4
