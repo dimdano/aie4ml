@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from .aie_types import QuantIntent
-from .ir.graph import ExecutionEntry, OpNode
+from .ir.graph import ExecutionInstance, OpNode
 from .op_impls.common_types import to_plain
 
 
@@ -41,7 +41,6 @@ def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
         'outputs': [t.name for t in node.outputs],
         'traits': {name: trait.data for name, trait in node.traits.items()},
         'metadata': metadata,
-        # TODO: serialize node.artifacts (external .npy blobs + references)
     }
 
 
@@ -64,7 +63,7 @@ def _serialize_quant_metadata(quant_meta: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def serialize_op_impl_instance(inst: ExecutionEntry) -> Dict[str, Any]:
+def serialize_op_impl_instance(inst: ExecutionInstance) -> Dict[str, Any]:
     return {
         'node': inst.name,
         'op_type': inst.op_type,

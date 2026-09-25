@@ -80,13 +80,13 @@ class LowerToAieIr(ModelOptimizerPass):
         created_nodes = set()
 
         for layer in layers:
+            if layer.class_name.lower() == 'input':
+                continue
             node = OpNode(
                 name=f'{layer.name}_aie',
                 op_type=self._map_op_type(layer),
                 dialect=ctx.device.dialect,
             )
-            if layer.class_name.lower() == 'input':
-                node.is_placeholder = True
             self._collect_metadata(layer, node)
             node.directives.update(extract_layer_directives(layer, model))
 
@@ -134,8 +134,6 @@ class LowerToAieIr(ModelOptimizerPass):
             if layer.name not in created_nodes:
                 continue
             node = node_map[layer.name]
-            if layer.class_name.lower() == 'input':
-                continue
 
             for src in layer.inputs:
                 var = input_var if src == 'input' else model.output_vars[src]
@@ -150,7 +148,7 @@ class LowerToAieIr(ModelOptimizerPass):
                         node.inputs.append(param_tv)
                         param_tv.consumers.append(node)
 
-            role_names = list(node.metadata.get('input_roles') or [])
+            role_names = node.metadata.pop('input_roles', None)
             if role_names:
                 set_input_roles(node, node.inputs, role_names)
 

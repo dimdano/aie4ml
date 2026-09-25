@@ -76,7 +76,6 @@ def _fold(graph, producer, producer_out, bias, add) -> None:
     producer.inputs.append(bias)
     bias.consumers = [c for c in bias.consumers if c is not add]
     bias.consumers.append(producer)
-    producer.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
     producer.roles[bias.name] = 'bias'
 
     producer.outputs = [y]

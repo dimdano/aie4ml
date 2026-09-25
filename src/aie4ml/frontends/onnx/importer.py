@@ -94,7 +94,7 @@ def _finalize(ctx: OnnxImportContext, graph_proto) -> None:
         graph.mark_graph_output(output.name)
 
     for node in graph.nodes:
-        role_names = list(node.metadata.get('input_roles') or [])
+        role_names = node.metadata.pop('input_roles', None)
         if role_names:
             set_input_roles(node, node.inputs, role_names)
 

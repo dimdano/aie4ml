@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
-from ..ir.graph import ExecutionValue, OpImplInstance, OpNode
+from ..ir.graph import ExecutionInstance, ExecutionValue, OpNode
 from .common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortMap
 
 
@@ -128,10 +128,10 @@ class OpImplVariant:
     def output_port_count(self, _node: OpNode, config: Any) -> Optional[int]:
         return int(config.parallelism.cas_num)
 
-    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         raise NotImplementedError
 
-    def get_artifacts(self, inst: OpImplInstance) -> List[Dict[str, Any]]:
+    def get_artifacts(self, inst: ExecutionInstance) -> List[Dict[str, Any]]:
         return []
 
     def input_precision(self, config: Any, role: str) -> Any:

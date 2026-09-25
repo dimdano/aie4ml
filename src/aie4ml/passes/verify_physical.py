@@ -1,6 +1,6 @@
 """The physical plan's invariants, checked before any code is generated.
 
-Every kernel graph is placed, and every edge the execution graph requires in shared memory is realised
+Exactly the kernel graphs are placed, and every edge the execution graph requires in shared memory is realised
 as one on each of its ports: a direct hand-over per port, legal by the rule placement searched under
 (`shared_buffer`), its two ports pinned to the same memory, recorded as `shared_memory`, and carrying no
 DMA access pattern.
@@ -41,9 +41,10 @@ def _kernel_ports(inst, group: str, port: int, direction: str):
 
 def verify_physical(ctx) -> None:
     execution, physical = ctx.ir.execution, ctx.ir.physical
-    missing = [inst.name for inst in execution if inst.name not in physical.placements]
-    if missing:
-        raise RuntimeError(f'physical plan places no tile for {missing}.')
+    if set(physical.placements) != set(execution.instances):
+        raise RuntimeError(
+            f'physical plan places {sorted(physical.placements)}, not the kernel graphs {sorted(execution.instances)}.'
+        )
     graphs = {}
     for inst in execution:
         name = sanitize_identifier(inst.name)

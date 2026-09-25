@@ -10,7 +10,7 @@ from ....aie_types import FloatIntent
 from ....ir.graph import (
     STAGING_CONTRACTS,
     VIEW_FLATTEN_2D,
-    OpImplInstance,
+    ExecutionInstance,
     OpNode,
     input_role,
     input_tensor_for_role,
@@ -576,7 +576,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             outputs={node.outputs[0].name: PortBinding('out1', cas_num, self.port_kind, out_endpoints)},
         )
 
-    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         """Weights per tile as Dense B tiles: [tap (ky, kx, cin block)][cout block][8 x 8].
 
         The compact `[kh, kw, Cin/groups, Cout]` tensor expands here into the dense form the mmul
@@ -657,7 +657,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 packed_bias[chain, : chunk.size] = chunk
         return {'packed_weights': packed_weights, 'packed_bias': packed_bias}
 
-    def get_artifacts(self, inst: OpImplInstance):
+    def get_artifacts(self, inst: ExecutionInstance):
         inst_name = sanitize_identifier(inst.name)
         p = inst.config
         return [

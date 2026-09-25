@@ -406,6 +406,29 @@ def test_resolving_again_repacks_the_current_weights(tmp_path):
     assert np.array_equal(ctx.ir.execution.get('dense_aie').artifacts['packed_weights'], -first)
 
 
+def test_replanning_a_context_matches_planning_a_fresh_one(tmp_path):
+    """An optimizer replans one context per candidate: neither a larger split before nor a candidate
+    that failed during placement may leave anything behind."""
+
+    def split(dense0, dense1, **extra):
+        return {'dense0': {'parallelism': dense0, **extra}, 'dense1': {'parallelism': dense1}}
+
+    def replan(model, directives):
+        for node in model.context.ir.logical:
+            node.directives = directives.get(node.name.removesuffix('_aie'), node.directives)
+        model.run_pipeline()
+
+    target = split({'cas_num': 2, 'cas_length': 2}, {'cas_num': 1})
+    fresh = _run_pipeline(_dense_stack_model(), tmp_path, directives=target, project='fresh')
+    reused = _run_pipeline(
+        _dense_stack_model(), tmp_path, directives=split({'cas_num': 4, 'cas_length': 2}, {'cas_num': 2})
+    )
+    with pytest.raises(ValueError, match='Invalid fixed anchor'):
+        replan(reused, split({'cas_num': 2, 'cas_length': 2}, {'cas_num': 1}, placement={'col': 999, 'row': 0}))
+    replan(reused, target)
+    assert to_plain(reused.context.ir.physical.to_dict()) == to_plain(fresh.context.ir.physical.to_dict())
+
+
 def test_a_tensor_read_as_two_operands_is_refused(tmp_path):
     nodes = [
         helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),

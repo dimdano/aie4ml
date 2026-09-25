@@ -171,7 +171,6 @@ class FoldViewOps(AIEPass):
                 },
             )
         )
-        node.is_placeholder = True
         return True
 
     def _fold_slice(self, node) -> bool:
@@ -212,5 +211,4 @@ class FoldViewOps(AIEPass):
                 },
             )
         )
-        node.is_placeholder = True
         return True

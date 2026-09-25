@@ -1369,17 +1369,15 @@ class PlaceKernels(AIEPass):
                 max_states=self._max_states,
             )
 
-        changed = False
-        for name, p in placed.items():
-            placement = {
+        placements = {
+            name: {
                 'col': int(p.x + col_offset),
                 'row': int(p.y + row_offset),
                 'width': int(p.rect.w),  # the tiles reserved, not only the anchor
                 'height': int(p.rect.h),
             }
-            prev = ctx.ir.physical.placements.get(name)
-            if prev != placement:
-                ctx.ir.physical.placements[name] = placement
-                changed = True
-
+            for name, p in placed.items()
+        }
+        changed = placements != ctx.ir.physical.placements
+        ctx.ir.physical.placements = placements
         return changed

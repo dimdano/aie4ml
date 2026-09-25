@@ -9,7 +9,7 @@ from .base import AIEPass
 
 def _propagate_contracts(ctx, node, inst, config) -> None:
     """
-    Propagates TensorContracts from producer outputs to consumer inputs based on the resolved execution entry.
+    Propagates TensorContracts from producer outputs to consumer inputs based on the resolved execution instance.
     Requires LogicalIR.nodes to be in producer-before-consumer (topological) order.
     """
     for tensor in node.outputs:
@@ -80,7 +80,7 @@ def _folded_views(node):
 
 def _build_execution_values(ctx) -> None:
     """The values the execution graph moves, copied once from the logical graph: its boundary, the
-    views folding left without a kernel, and every entry's outputs. From here on transport reads
+    views folding left without a kernel, and every instance's outputs. From here on transport reads
     these, never the logical tensors."""
     execution = ctx.ir.execution
     execution.values = {}
@@ -89,7 +89,7 @@ def _build_execution_values(ctx) -> None:
     for name in execution.graph_inputs:
         execution.add_value(ExecutionValue(name))
     for node in ctx.ir.logical:
-        if node.is_placeholder and ('slice_view' in node.traits or 'concat_view' in node.traits):
+        if node.is_folded_view:
             for name, view in _folded_views(node):
                 execution.add_value(ExecutionValue(name, view=view))
     for inst in execution:
@@ -98,7 +98,7 @@ def _build_execution_values(ctx) -> None:
 
 
 class Resolve(AIEPass):
-    """Resolve logical nodes into family-owned execution entries."""
+    """Resolve logical nodes into family-owned execution instances."""
 
     def __init__(self):
         self.name = 'resolve'
@@ -110,7 +110,7 @@ class Resolve(AIEPass):
         ctx.ir.execution.clear()
 
         for node in ctx.ir.logical:
-            if node.is_placeholder:
+            if node.is_folded_view:
                 continue
 
             resolver = self._registry.get(node.op_type)

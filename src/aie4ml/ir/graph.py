@@ -62,12 +62,15 @@ class OpNode:
     inputs: List[TensorVar] = field(default_factory=list)
     outputs: List[TensorVar] = field(default_factory=list)
 
-    artifacts: Dict[str, Any] = field(default_factory=dict)
     traits: Dict[str, TraitInstance] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     directives: Dict[str, Any] = field(default_factory=dict)
     roles: Dict[str, str] = field(default_factory=dict)
-    is_placeholder: bool = False
+
+    @property
+    def is_folded_view(self) -> bool:
+        """A slice, split or concat folded into its readers: no kernel implements it."""
+        return 'slice_view' in self.traits or 'concat_view' in self.traits
 
     def add_trait(self, trait: TraitInstance) -> None:
         self.traits[trait.name] = trait
@@ -84,10 +87,6 @@ def _refuse_repeated_operands(node: OpNode, names: Sequence[str]) -> None:
     repeated = sorted({name for name in names if names.count(name) > 1})
     if repeated:
         raise NotImplementedError(f'{node.name}: reads {repeated} as more than one operand, which is not supported.')
-
-
-def input_role_map(node: OpNode) -> Dict[str, str]:
-    return dict(node.roles)
 
 
 def input_role(node: OpNode, tensor_name: str) -> Optional[str]:
@@ -139,23 +138,23 @@ class LogicalIR:
         if tensor_name not in self.output_tensor_names:
             self.output_tensor_names.append(tensor_name)
 
-    def remove_node(self, node: OpNode, mode: str = 'bypass') -> None:
-        if len(node.inputs) == 1 and len(node.outputs) == 1:
-            if mode == 'bypass':
-                self._bypass_node(node)
-            elif mode == 'contract':
-                in_tv = node.inputs[0]
-                if len(in_tv.consumers) == 1:
-                    self._contract_node(node)
-                else:
-                    raise ValueError(
-                        f'Cannot contract node {node.name}: input tensor '
-                        f'{in_tv.name} has {len(in_tv.consumers)} consumers.'
-                    )
-            else:
-                raise ValueError(f'Unknown mode: {mode}')
+    def remove_node(self, node: OpNode, mode: str) -> None:
+        """Remove a one-input, one-output node: `bypass` keeps its input, `contract` keeps its output."""
+        if len(node.inputs) != 1 or len(node.outputs) != 1:
+            raise ValueError(
+                f'Cannot remove node {node.name}: it has {len(node.inputs)} inputs and {len(node.outputs)} outputs.'
+            )
+        if mode == 'bypass':
+            self._bypass_node(node)
+        elif mode == 'contract':
+            in_tv = node.inputs[0]
+            if len(in_tv.consumers) != 1:
+                raise ValueError(
+                    f'Cannot contract node {node.name}: input tensor {in_tv.name} has {len(in_tv.consumers)} consumers.'
+                )
+            self._contract_node(node)
         else:
-            self._detach_node(node)
+            raise ValueError(f'Unknown mode: {mode}')
 
         if node in self.nodes:
             self.nodes.remove(node)
@@ -205,20 +204,6 @@ class LogicalIR:
         if not in_tv.consumers:
             self._retarget_boundary(in_tv, out_tv)
             self.tensors.pop(in_tv.name, None)
-
-    def _detach_node(self, node: OpNode):
-        """Fallback: Just cut the node out without merging tensors."""
-        for t in node.inputs:
-            if node in t.consumers:
-                t.consumers.remove(node)
-
-        for t in node.outputs:
-            if t.producer is node and t.consumers:
-                raise ValueError(f'Cannot detach node {node.name}: output tensor {t.name} still has consumers.')
-            if t.producer is node:
-                t.producer = None
-            if not t.consumers and t.producer is None:
-                self.tensors.pop(t.name, None)
 
     def graph_inputs(self) -> List[TensorVar]:
         if not self.input_tensor_names:
@@ -271,7 +256,13 @@ class LogicalIR:
                     )
 
     def _verify_connectivity(self) -> None:
+        nodes = {id(node) for node in self.nodes}
         for node in self.nodes:
+            for tensor in (*node.inputs, *node.outputs):
+                if self.tensors.get(tensor.name) is not tensor:
+                    raise RuntimeError(f'{node.name}: {tensor.name!r} is not the tensor registered under that name.')
+            if not set(node.roles) <= {tensor.name for tensor in node.inputs}:
+                raise RuntimeError(f'{node.name}: roles {node.roles} name tensors it does not read.')
             for tensor in node.inputs:
                 if node not in tensor.consumers:
                     raise RuntimeError(f'{node.name}: reads {tensor.name!r}, which does not list it as a consumer.')
@@ -282,6 +273,10 @@ class LogicalIR:
                         f'{tensor.producer.name if tensor.producer else None!r}.'
                     )
         for tensor in self.tensors.values():
+            if tensor.producer is not None and (tensor.is_parameter or id(tensor.producer) not in nodes):
+                raise RuntimeError(f'{tensor.name}: its producer {tensor.producer.name!r} is not a node of this graph.')
+            if len({id(consumer) for consumer in tensor.consumers}) != len(tensor.consumers):
+                raise RuntimeError(f'{tensor.name}: lists a consumer more than once.')
             for consumer in tensor.consumers:
                 if tensor not in consumer.inputs:
                     raise RuntimeError(f'{tensor.name}: lists {consumer.name!r} as a consumer, which does not read it.')
@@ -289,6 +284,9 @@ class LogicalIR:
                 raise RuntimeError(f'{tensor.name}: has a non-positive extent in {tuple(tensor.shape)}.')
 
     def _verify_graph_boundaries(self) -> None:
+        for names in (self.input_tensor_names, self.output_tensor_names):
+            if len(set(names)) != len(names):
+                raise RuntimeError(f'graph boundary {names} names a tensor more than once.')
         for name in self.input_tensor_names:
             if name not in self.tensors:
                 raise RuntimeError(f'graph input {name!r} is not a tensor of this graph.')
@@ -339,7 +337,7 @@ class TensorContract:
 
 @dataclass(frozen=True)
 class ExecutionInput:
-    """One activation an execution entry reads. `shared_memory` requires the edge's no-DMA
+    """One activation an execution instance reads. `shared_memory` requires the edge's no-DMA
     realisation; without it placement still draws the kernels together and the plan records its choice."""
 
     tensor: str
@@ -398,7 +396,7 @@ class ExecutionValue:
 
 
 @dataclass
-class ExecutionEntry:
+class ExecutionInstance:
     """One kernel graph to build. `node` is read only: the logical node it implements, or an
     execution-only node for a kernel a lowering pass inserted. Connectivity is `inputs`/`outputs`."""
 
@@ -430,15 +428,12 @@ class ExecutionEntry:
         raise KeyError(f'{self.name}: reads no execution value {tensor!r}.')
 
 
-OpImplInstance = ExecutionEntry
-
-
 @dataclass
 class ExecutionIR:
     """The kernel graphs to build, in producer-before-consumer order. After resolution it is the only
     source of executable connectivity; the logical graph keeps the semantics."""
 
-    instances: Dict[str, ExecutionEntry] = field(default_factory=dict)
+    instances: Dict[str, ExecutionInstance] = field(default_factory=dict)
     tensor_contracts: Dict[str, TensorContract] = field(default_factory=dict)
     values: Dict[str, ExecutionValue] = field(default_factory=dict)
     graph_inputs: Tuple[str, ...] = ()
@@ -457,8 +452,8 @@ class ExecutionIR:
         param_template: str,
         inputs: Tuple[ExecutionInput, ...],
         outputs: Tuple[str, ...],
-    ) -> ExecutionEntry:
-        inst = ExecutionEntry(
+    ) -> ExecutionInstance:
+        inst = ExecutionInstance(
             node=node,
             variant=variant,
             ports=ports,
@@ -474,11 +469,11 @@ class ExecutionIR:
         self.instances[node.name] = inst
         return inst
 
-    def insert_before(self, name: str, inst: ExecutionEntry) -> None:
+    def insert_before(self, name: str, inst: ExecutionInstance) -> None:
         if inst.name in self.instances:
-            raise ValueError(f'{inst.name}: an execution entry of that name already exists.')
+            raise ValueError(f'{inst.name}: an execution instance of that name already exists.')
         if name not in self.instances:
-            raise KeyError(f'{name}: no execution entry to insert {inst.name} before.')
+            raise KeyError(f'{name}: no execution instance to insert {inst.name} before.')
         ordered = {}
         for key, value in self.instances.items():
             if key == name:
@@ -491,7 +486,7 @@ class ExecutionIR:
             raise ValueError(f'{value.name}: the execution graph already has a value of that name.')
         self.values[value.name] = value
 
-    def get(self, name: str) -> Optional[ExecutionEntry]:
+    def get(self, name: str) -> Optional[ExecutionInstance]:
         return self.instances.get(name)
 
     def clear(self) -> None:

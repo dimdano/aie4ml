@@ -323,7 +323,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     templates in ``templates/system/`` consume.
 
     Reuses :func:`aie4ml.simulation.build_io_layout` for per-PLIO-port boundary/dtype data and
-    the dense/matmul execution entries for per-layer RTP (weight/bias) loading. Scope:
+    the dense/matmul execution instances for per-layer RTP (weight/bias) loading. Scope:
     single graph input + single graph output, 512-bit-aligned sizes.
     """
     from .simulation import build_io_layout

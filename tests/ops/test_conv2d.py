@@ -533,7 +533,7 @@ def test_strided_conv_retiles_its_producers_frame(tmp_path):
 
     ctx = lower(_strided_chain_model(), tmp_path, part=AIE1_PART)
     assert [inst.name for inst in ctx.ir.execution] == ['first_aie', 'second_aie_retile', 'second_aie']
-    assert [node.name for node in ctx.ir.logical if not node.is_placeholder] == ['first_aie', 'second_aie']
+    assert [node.name for node in ctx.ir.logical if not node.is_folded_view] == ['first_aie', 'second_aie']
     logical = next(node for node in ctx.ir.logical if node.name == 'second_aie')
     assert [t.name for t in logical.inputs if t.data is None] == ['first_relu']  # untouched by lowering
 

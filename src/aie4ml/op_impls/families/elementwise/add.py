@@ -4,7 +4,7 @@ import math
 from typing import Any, ClassVar, Dict
 
 from ....aie_types import FloatIntent
-from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
+from ....ir.graph import ExecutionInstance, OpNode, input_tensor_for_role
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PortBinding, PortMap, kernel_endpoints
 from ...registry import register_variant
@@ -257,10 +257,10 @@ class AddOpImplVariant(OpImplVariant):
     def output_staging_contract(self, node, config: AddConfig, tensor_name: str):
         return str(config.parallelism.contract)
 
-    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         return {}
 
-    def get_artifacts(self, inst: OpImplInstance):
+    def get_artifacts(self, inst: ExecutionInstance):
         return []
 
     def footprint(self, node: OpNode, config: AddConfig) -> OpImplFootprint:

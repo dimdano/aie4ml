@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ....aie_types import FloatIntent
-from ....ir.graph import OpImplInstance, OpNode, input_role, input_tensor_for_role
+from ....ir.graph import ExecutionInstance, OpNode, input_role, input_tensor_for_role
 from ...base import BufferLocation, OpImplFootprint, row_flow
 from ...common_types import PortBinding, PortMap
 from ...registry import register_variant
@@ -92,10 +92,10 @@ class _MatmulVariantBase(_BaseDenseMatmulVariant):
         if not rhs_is_float and not bool(config.precision['rhs'].signed):
             raise ValueError(f'{node.name}: matmul RHS must use a signed integer precision.')
 
-    def pack(self, _inst: OpImplInstance):
+    def pack(self, _inst: ExecutionInstance):
         return {}
 
-    def get_artifacts(self, _inst: OpImplInstance):
+    def get_artifacts(self, _inst: ExecutionInstance):
         return []
 
     def footprint(self, _node, config) -> OpImplFootprint:

@@ -5,7 +5,7 @@ from typing import Any, ClassVar, Dict
 import numpy as np
 
 from ....aie_types import FloatIntent
-from ....ir.graph import OpImplInstance, OpNode, has_input_role, input_tensor_for_role
+from ....ir.graph import ExecutionInstance, OpNode, has_input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_STREAM, PortBinding, PortMap
@@ -159,7 +159,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             ),
         )
 
-    def _quantize_weight_bias(self, inst: OpImplInstance):
+    def _quantize_weight_bias(self, inst: ExecutionInstance):
         """Quantize the weight matrix and bias vector; shared by every dense contract."""
         input_tensor = inst.node.inputs[0]
         weight_tensor = inst.node.inputs[1]
@@ -219,7 +219,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
             locations.append(BufferLocation('out1', chain, last + flow.output_col, chain, (0, 3)))
         return tuple(locations)
 
-    def get_artifacts(self, inst: OpImplInstance):
+    def get_artifacts(self, inst: ExecutionInstance):
         inst_name = sanitize_identifier(inst.name)
         p = inst.config
         output_view = p.io_views[inst.node.outputs[0].name]
@@ -294,7 +294,7 @@ class DenseOpImplVariant(_DenseVariantBase):
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_inner_output_staging(config.io_views[tensor_name], port, buf_dims)
 
-    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         # 'inner': cas_num slices the columns, so chain c owns weight/bias columns
         # [c*N_slice, (c+1)*N_slice) -- which is exactly what the packers lay out.
         p = inst.config
@@ -345,7 +345,7 @@ class DenseRowWiseOpImplVariant(_DenseVariantBase):
     def describe_output_staging(self, _node, config, tensor_name, port, buf_dims=None):
         return describe_outer_output_staging(config.io_views[tensor_name], port, buf_dims)
 
-    def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
+    def pack(self, inst: ExecutionInstance) -> Dict[str, Any]:
         # The packers slice columns as chain*N_slice; here N_slice is the whole N, so pack a
         # single chain (offset 0, full width) and give every row-group that same copy.
         p = inst.config

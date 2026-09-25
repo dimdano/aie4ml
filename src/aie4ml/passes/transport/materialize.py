@@ -36,6 +36,7 @@ class BuildMemoryPlan(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
+        ctx.ir.physical.reset()
         ctx.ir.physical.plan = _MemoryPlanMaterializer(ctx).build()
         return True
 
@@ -47,6 +48,7 @@ class CollectMemoryEntries(AIEPass):
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
         ctx.ir.execution.verify()
+        ctx.ir.physical.reset()
         state = _MemoryPlanMaterializer(ctx).collect()
         ctx.ir.physical.plan = {'_memory_plan_state': state}
         return True
