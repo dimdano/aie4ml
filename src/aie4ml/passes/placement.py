@@ -595,11 +595,8 @@ def _topological_order(
                 ready.append(m)
                 ready.sort(key=lambda x: stable_index[x])
 
-    # If a cycle somehow slips in, keep the original stable order instead of
-    # pretending we found a topological order.
     if len(order) != len(names):
-        return sorted(list(names), key=lambda n: stable_index[n])
-
+        raise RuntimeError(f'placement: the kernel graph has a cycle through {sorted(set(names) - set(order))}.')
     return order
 
 

@@ -63,6 +63,7 @@ class _SoftmaxVariantBase(OpImplVariant):
     graph_name = 'softmax_hccs_graph'
     param_template = 'softmax'
     plevel = 10
+    supported_directives: ClassVar[frozenset] = frozenset({'approximation', 'layout', 'parallelism'})
 
     def matches(self, node: OpNode, device) -> bool:
         if not layout_variant_matches(node, self.layout_name):
@@ -242,10 +243,12 @@ class _SoftmaxTiledMixin:
         A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
         otherwise 4x8.
         """
-        mt = node.directives.get('microtiling') if node.directives else None
-        if isinstance(mt, dict) and 'microtile_m' in mt and 'microtile_n' in mt:
-            return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
-        return MicrotileShape(outer=4, inner=8)
+        mt = node.directives.get('microtiling')
+        if mt is None:
+            return MicrotileShape(outer=4, inner=8)
+        if set(mt) != {'microtile_m', 'microtile_n'}:
+            raise ValueError(f'{node.name}: microtiling takes microtile_m and microtile_n here, got {sorted(mt)}.')
+        return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
 
     def validate_config(self, node: OpNode, config: SoftmaxConfig, device) -> None:
         super().validate_config(node, config, device)
@@ -281,6 +284,7 @@ class _SoftmaxHccsBase(_SoftmaxVariantBase):
     exponential. Not a drop-in for float Softmax. See https://arxiv.org/pdf/2604.02292v1"""
 
     approximation = 'hccs'
+    supported_directives = _SoftmaxVariantBase.supported_directives | {'hccs'}
 
     def _extra_precision(self) -> Dict[str, Any]:
         return {'B': AIEDataType(format='int16'), 'S': AIEDataType(format='int8'), 'Dmax': AIEDataType(format='uint8')}
@@ -334,6 +338,7 @@ class SoftmaxHccsTiledOpImplVariant(_SoftmaxTiledMixin, _SoftmaxHccsBase):
 
     variant_id = 'softmax.hccs.i8.tiled.v1'
     layout_name = 'tiled'
+    supported_directives = _SoftmaxHccsBase.supported_directives | {'microtiling'}
     kernel_transposes_microtile = True
 
 
@@ -400,4 +405,5 @@ class SoftmaxExpTiledOpImplVariant(_SoftmaxTiledMixin, _SoftmaxExpBase):
 
     variant_id = 'softmax.exp.i8.tiled.v1'
     layout_name = 'tiled'
+    supported_directives = _SoftmaxExpBase.supported_directives | {'microtiling'}
     kernel_transposes_microtile = True

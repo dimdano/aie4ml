@@ -35,10 +35,14 @@ def resolve_io_route(node) -> Dict[str, Any]:
     for tensor in node.outputs:
         route['outputs'][tensor.name] = 'auto'
 
-    user = node.directives.get('io_route', {})
-    for direction in ('inputs', 'outputs'):
-        if isinstance(user.get(direction), dict):
-            route[direction].update(user[direction])
+    for direction, modes in node.directives.get('io_route', {}).items():
+        unknown = sorted(set(modes) - set(route[direction]))
+        if unknown:
+            raise ValueError(
+                f'{node.name}: io_route names {unknown}, which are not among its {direction} '
+                f'{sorted(route[direction])}.'
+            )
+        route[direction].update(modes)
     return route
 
 

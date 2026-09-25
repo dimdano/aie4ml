@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Dict
+from typing import Any, ClassVar, Dict
 
 from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
@@ -53,6 +53,7 @@ class AddOpImplVariant(OpImplVariant):
     graph_name = 'elementwise_add_graph'
     param_template = 'elementwise_add'
     plevel = 10
+    supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
 
     def matches(self, _node: OpNode, device) -> bool:
         return device.generation in ('AIE', 'AIE-ML', 'AIE-MLV2')

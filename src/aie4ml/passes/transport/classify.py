@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from ...ir import get_backend_context
+from ...ir.graph import ROUTE_MODES
 from ..base import AIEPass
 from .legality import direct_transport_failure, memtile_staging_failure, uses_stream
 from .model import TransportDecision
@@ -120,7 +121,7 @@ class ClassifyTransportEntries(AIEPass):
             if consumer_mode:
                 modes.add(str(consumer_mode))
 
-        bad = [mode for mode in modes if mode not in ('direct', 'memtile', 'auto')]
+        bad = [mode for mode in modes if mode not in ROUTE_MODES]
         if bad:
             raise ValueError(f'{entry.logical_tensor}: unsupported io_route mode(s) {bad}.')
         if 'memtile' in modes:

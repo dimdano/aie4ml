@@ -12,6 +12,8 @@ class OpImplRegistry:
         self._variants: dict[str, list[OpImplVariant]] = {}
 
     def register(self, variant: OpImplVariant) -> None:
+        if any(v.variant_id == variant.variant_id for vs in self._variants.values() for v in vs):
+            raise ValueError(f'variant {variant.variant_id!r} is already registered.')
         self._variants.setdefault(variant.op_type, []).append(variant)
 
     def candidates(self, op_type: str) -> list[OpImplVariant]:

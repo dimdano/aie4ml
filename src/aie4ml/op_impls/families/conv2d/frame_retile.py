@@ -7,7 +7,6 @@ it, so placement, transport and the build see it as the kernel it is.
 from __future__ import annotations
 
 from dataclasses import asdict
-from typing import ClassVar
 
 import numpy as np
 
@@ -28,7 +27,6 @@ class FrameRetileOpImplVariant(OpImplVariant):
     graph_header = 'frame_retile_graph.h'
     graph_name = 'frame_retile_graph'
     param_template = 'frame_retile'
-    port_kind: ClassVar[str] = PORT_KIND_BUFFER
 
     def validate_config(self, node, config: FrameRetileConfig, device) -> None:
         # The op contract's bank schedule, as for the conv it feeds: one copy of each kernel's input,

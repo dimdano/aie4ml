@@ -44,7 +44,11 @@ def verify_physical(ctx) -> None:
     missing = [inst.name for inst in execution if inst.name not in physical.placements]
     if missing:
         raise RuntimeError(f'physical plan places no tile for {missing}.')
-    graphs = {sanitize_identifier(inst.name): inst for inst in execution}
+    graphs = {}
+    for inst in execution:
+        name = sanitize_identifier(inst.name)
+        if graphs.setdefault(name, inst) is not inst:
+            raise RuntimeError(f'{graphs[name].name} and {inst.name}: both generate the graph name {name!r}.')
     accessed = {
         access['endpoint']
         for key in ('kernel_read_accesses', 'kernel_write_accesses')

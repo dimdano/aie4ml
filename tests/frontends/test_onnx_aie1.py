@@ -369,6 +369,34 @@ def test_aie1_onnx_dense_rejects_unenabled_int16_int16(tmp_path):
         _resolve_dense(_dense_model(TensorProto.INT16, TensorProto.INT16), tmp_path)
 
 
+def test_a_misspelled_directive_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="unknown directive.*'paralellism'"):
+        _resolve_dense(_dense_model(), tmp_path, directives={'paralellism': {'cas_num': 2}})
+
+
+def test_a_directive_the_variant_does_not_read_is_refused(tmp_path):
+    with pytest.raises(NotImplementedError, match=r"does not implement the directive\(s\) \['layout'\]"):
+        _resolve_dense(_dense_model(), tmp_path, directives={'layout': 'tiled'})
+
+
+def test_a_tensor_read_as_two_operands_is_refused(tmp_path):
+    nodes = [
+        helper.make_node('DequantizeLinear', ['x_q', 'x_scale', 'x_zp'], ['x'], name='x_dq'),
+        helper.make_node('Add', ['x', 'x'], ['sum'], name='add'),
+        helper.make_node('QuantizeLinear', ['sum', 'y_scale', 'y_zp'], ['y_q'], name='y_q'),
+        helper.make_node('DequantizeLinear', ['y_q', 'y_scale', 'y_zp'], ['y'], name='y_dq'),
+    ]
+    model = make_model(
+        'self_add',
+        nodes=nodes,
+        inputs=[('x_q', TensorProto.INT8, [8, 16])],
+        outputs=[('y', TensorProto.FLOAT, [8, 16])],
+        initializers=[*_qparams('x', TensorProto.INT8), *_qparams('y', TensorProto.INT8)],
+    )
+    with pytest.raises(NotImplementedError, match='as more than one operand'):
+        _run_pipeline(model, tmp_path)
+
+
 @pytest.mark.parametrize(
     ('part', 'expected_microtile'),
     [('xilinx_vek280_base_202520_1', (4, 8, 8)), ('vek385_base', (8, 8, 8))],

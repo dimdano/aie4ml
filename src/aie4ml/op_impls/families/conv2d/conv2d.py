@@ -12,7 +12,7 @@ from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives, requested_port_kind
+from ...utils import MicrotileShape, ParallelismConfig, TensorView, parse_directives
 from ...utils.math import align_up
 from ...utils.precision import (
     aie_rounding_token,
@@ -77,12 +77,7 @@ class Conv2dOpImplVariant(OpImplVariant):
     graph_name = 'conv2d_graph'
     param_template = 'conv2d'
     plevel = 10
-    port_kind: ClassVar[str] = PORT_KIND_BUFFER
-    # `placement` is the placement pass's, which serves every op; the rest the variant reads itself.
-    # Anything else -- microtiling, layout -- is refused rather than ignored.
-    supported_directives: ClassVar[frozenset] = frozenset(
-        {'ports', 'io_route', 'input_contracts', 'parallelism', 'placement'}
-    )
+    supported_directives: ClassVar[frozenset] = frozenset({'parallelism'})
 
     def matches(self, node: OpNode, device) -> bool:
         lhs = input_tensor_for_role(node, 'lhs')
@@ -95,15 +90,9 @@ class Conv2dOpImplVariant(OpImplVariant):
             resolve_exact_storage_dtype(rhs.precision, namespace='rhs', layer_name=node.name).width,
             resolve_exact_storage_dtype(out.precision, namespace='output', layer_name=node.name).width,
         )
-        return requested_port_kind(node) == self.port_kind and widths == (8, 8, 8)
+        return widths == (8, 8, 8)
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
-        unsupported = sorted(set(directives or {}) - self.supported_directives)
-        if unsupported:
-            raise NotImplementedError(
-                f'{node.name}: {self.variant_id} does not implement the directive(s) '
-                f'{unsupported}; it supports {sorted(self.supported_directives)}.'
-            )
         io_route, input_contracts, parallel_cfg = parse_directives(directives)
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')

@@ -79,7 +79,14 @@ class OpNode:
 def set_input_roles(node: OpNode, tensors: Sequence[TensorVar], role_names: Sequence[str]) -> None:
     if len(tensors) != len(role_names):
         raise ValueError(f'{node.name}: set_input_roles got {len(tensors)} tensors but {len(role_names)} role names.')
+    _refuse_repeated_operands(node, [tensor.name for tensor in tensors])
     node.roles = {tensor.name: str(role) for tensor, role in zip(tensors, role_names)}
+
+
+def _refuse_repeated_operands(node: OpNode, names: Sequence[str]) -> None:
+    repeated = sorted({name for name in names if names.count(name) > 1})
+    if repeated:
+        raise NotImplementedError(f'{node.name}: reads {repeated} as more than one operand, which is not supported.')
 
 
 def input_role_map(node: OpNode) -> Dict[str, str]:
@@ -229,6 +236,8 @@ class LogicalIR:
     def verify(self) -> None:
         """Assert structural invariants."""
         self._verify_unique_node_names()
+        for node in self.nodes:
+            _refuse_repeated_operands(node, [tensor.name for tensor in node.inputs])
         self._verify_topological_order()
         self._verify_tensor_producers()
         self._verify_connectivity()
@@ -303,8 +312,8 @@ class LogicalIR:
 STAGING_CONTRACTS: frozenset = frozenset({'outer', 'inner'})
 """Compiler-wide vocabulary of valid 2D execution partition-axis contracts."""
 
-ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'plio', 'auto'})
-"""Compiler-wide vocabulary of valid IO route modes."""
+ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'auto'})
+"""Valid `io_route` modes for an edge: a direct connection, a memory-tile stage, or the planner's choice."""
 
 
 VIEW_FLATTEN_2D = 'flatten_2d'

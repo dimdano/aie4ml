@@ -7,6 +7,8 @@ from .utils import requested_port_kind
 if TYPE_CHECKING:
     from .base import OpImplVariant
 
+COMMON_DIRECTIVES = frozenset({'placement', 'io_route', 'ports'})
+
 
 class FamilyResolver:
     """Structural validator, variant dispatcher and capability record for one op type; passes ask
@@ -34,14 +36,29 @@ class FamilyResolver:
         from .registry import get_op_impl_registry
 
         self.validate_structure(node, device)
-        for variant in get_op_impl_registry().candidates(self.op_type):
-            if variant.matches(node, device):
-                config = variant.resolve(node, device, directives)
-                return config, variant
-        raise ValueError(
-            f'{node.name}: no {self.op_type} variant matches '
-            f'(generation={device.generation!r}, ports={requested_port_kind(node)!r}).'
-        )
+        ports = requested_port_kind(node)
+        matching = [
+            variant
+            for variant in get_op_impl_registry().candidates(self.op_type)
+            if variant.port_kind == ports and variant.matches(node, device)
+        ]
+        if not matching:
+            raise ValueError(
+                f'{node.name}: no {self.op_type} variant matches (generation={device.generation!r}, ports={ports!r}).'
+            )
+        variant = matching[0]
+        if len(matching) > 1 and matching[1].plevel == variant.plevel:
+            raise RuntimeError(
+                f'{node.name}: {variant.variant_id} and {matching[1].variant_id} both match at priority '
+                f'{variant.plevel}; the choice would depend on import order.'
+            )
+        unsupported = sorted(set(node.directives) - COMMON_DIRECTIVES - variant.supported_directives)
+        if unsupported:
+            raise NotImplementedError(
+                f'{node.name}: {variant.variant_id} does not implement the directive(s) {unsupported}; it '
+                f'supports {sorted(COMMON_DIRECTIVES | variant.supported_directives)}.'
+            )
+        return variant.resolve(node, device, directives), variant
 
 
 class FamilyResolverRegistry:
@@ -49,6 +66,8 @@ class FamilyResolverRegistry:
         self._resolvers: dict[str, FamilyResolver] = {}
 
     def register(self, op_type: str, resolver: FamilyResolver) -> None:
+        if op_type in self._resolvers:
+            raise ValueError(f'a family resolver for op_type={op_type!r} is already registered.')
         self._resolvers[op_type] = resolver
 
     def get(self, op_type: str) -> FamilyResolver:

@@ -75,6 +75,7 @@ class _LayerNormVariantBase(OpImplVariant):
     graph_name = 'layer_norm_graph'
     param_template = 'layer_norm'
     plevel = 10
+    supported_directives: ClassVar[frozenset] = frozenset({'layout', 'parallelism'})
 
     def matches(self, node: OpNode, device) -> bool:
         if not layout_variant_matches(node, self.layout_name):
@@ -289,6 +290,7 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
 
     variant_id = 'layer_norm.i8.tiled.v1'
     layout_name = 'tiled'
+    supported_directives = _LayerNormVariantBase.supported_directives | {'microtiling'}
     plevel = 11
     kernel_transposes_microtile = True
 
@@ -302,10 +304,12 @@ class LayerNormTiledOpImplVariant(_LayerNormVariantBase):
         A `microtiling` directive pins it (microtile_m -> row band, microtile_n -> feature block);
         otherwise 4x8.
         """
-        mt = node.directives.get('microtiling') if node.directives else None
-        if isinstance(mt, dict) and 'microtile_m' in mt and 'microtile_n' in mt:
-            return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
-        return MicrotileShape(outer=4, inner=8)
+        mt = node.directives.get('microtiling')
+        if mt is None:
+            return MicrotileShape(outer=4, inner=8)
+        if set(mt) != {'microtile_m', 'microtile_n'}:
+            raise ValueError(f'{node.name}: microtiling takes microtile_m and microtile_n here, got {sorted(mt)}.')
+        return MicrotileShape(outer=int(mt['microtile_m']), inner=int(mt['microtile_n']))
 
     def validate_config(self, node: OpNode, config: LayerNormConfig, device) -> None:
         super().validate_config(node, config, device)

@@ -77,11 +77,9 @@ def _supported_microtile_options(generation: str, lhs_dtype, rhs_dtype):
 
 
 def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, required_lhs_microtile=None) -> MatmulMicrotileConfig:
-    microtiling_cfg = node.directives.get('microtiling', {}) or {}
-    raw = {
-        key: int(microtiling_cfg[key]) if key in microtiling_cfg else 0
-        for key in ('microtile_m', 'microtile_n', 'microtile_k')
-    }
+    microtiling_cfg = node.directives.get('microtiling')
+    if microtiling_cfg is not None and len(microtiling_cfg) != 3:
+        raise ValueError(f'{node.name}: microtiling needs microtile_m, microtile_k and microtile_n.')
     options = _supported_microtile_options(device.generation, lhs_dtype, rhs_dtype)
     if not options:
         raise ValueError(
@@ -89,9 +87,8 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype, required_lhs_microtile
             f'(input={lhs_dtype.format!r}, weight={rhs_dtype.format!r}).'
         )
 
-    user_specified = (raw['microtile_m'] > 0) and (raw['microtile_k'] > 0) and (raw['microtile_n'] > 0)
-    if user_specified:
-        candidate = (raw['microtile_m'], raw['microtile_k'], raw['microtile_n'])
+    if microtiling_cfg is not None:
+        candidate = tuple(microtiling_cfg[key] for key in ('microtile_m', 'microtile_k', 'microtile_n'))
         if candidate not in options:
             raise ValueError(
                 f'{node.name}: microtiling {candidate} not supported for Generation={device.generation} and '

@@ -8,9 +8,9 @@ from ....aie_types import FloatIntent
 from ....ir.graph import OpImplInstance, OpNode, has_input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, OpImplFootprint, OpImplVariant, row_flow
-from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
+from ...common_types import PORT_KIND_STREAM, PortBinding, PortMap
 from ...registry import register_variant
-from ...utils import ParallelismConfig, inherited_microtile, parse_directives, requested_port_kind
+from ...utils import ParallelismConfig, inherited_microtile, parse_directives
 from ...utils.precision import (
     aie_rounding_token,
     element_bytes,
@@ -42,7 +42,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     """Unregistered shared base for Dense and Matmul variants."""
 
     contract: ClassVar[str]
-    port_kind: ClassVar[str] = PORT_KIND_BUFFER
+    supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'microtiling'})
 
     def build_template_params(self, node, config, placement):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
@@ -81,11 +81,7 @@ class _DenseVariantBase(_BaseDenseMatmulVariant):
     plevel = 10
 
     def matches(self, node: OpNode, device) -> bool:
-        return (
-            requested_contract(node) == self.contract
-            and requested_port_kind(node) == self.port_kind
-            and bitwidths_supported(node, device)
-        )
+        return requested_contract(node) == self.contract and bitwidths_supported(node, device)
 
     def resolve(self, node: OpNode, device, directives=None) -> DenseConfig:
         io_route, input_contracts, parallel_cfg = parse_directives(directives)

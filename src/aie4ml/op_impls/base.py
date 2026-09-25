@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, Dict, List, Optional, Tuple
 
 from ..ir.graph import ExecutionValue, OpImplInstance, OpNode
-from .common_types import PORT_KIND_STREAM, PortMap
+from .common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortMap
 
 
 @dataclass(frozen=True)
@@ -92,6 +92,9 @@ class OpImplVariant:
     param_template: ClassVar[str] = ''
     plevel: ClassVar[int] = 10  # higher value = higher selection priority
     kernel_transposes_microtile: ClassVar[bool] = False
+    port_kind: ClassVar[str] = PORT_KIND_BUFFER  # what the `ports` directive selects on
+    # Directives read beyond placement, io_route and ports, which every variant honours; others are refused.
+    supported_directives: ClassVar[frozenset] = frozenset()
 
     def matches(self, _node: OpNode, _device: Any) -> bool:
         raise NotImplementedError

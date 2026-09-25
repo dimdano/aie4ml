@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from ..ir import TraitDefinition
-from ..ir.graph import TENSOR_LAYOUTS
+from ..ir.graph import ROUTE_MODES, STAGING_CONTRACTS, TENSOR_LAYOUTS
 from ..op_impls.common_types import PORT_KINDS
 
 
@@ -26,55 +26,64 @@ def register_default_traits(ctx) -> None:
     )
 
 
+_DIRECTIVE_FIELDS = {
+    'placement': ('col', 'row'),
+    'microtiling': ('microtile_m', 'microtile_k', 'microtile_n'),
+    'parallelism': ('cas_num', 'cas_length', 'parallel_factor', 'contract'),
+    'io_route': ('inputs', 'outputs'),
+    'hccs': ('B', 'S', 'Dmax', 'param_sets', 'inv_shift', 'use_clb'),
+}
+DIRECTIVES = frozenset({*_DIRECTIVE_FIELDS, 'layout', 'ports', 'approximation'})
+
+
+def _group(name: str, key: str, value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(f'{name}: the {key} directive must be a dict.')
+    fields = _DIRECTIVE_FIELDS[key]
+    unknown = sorted(set(value) - set(fields))
+    if unknown or not value:
+        raise ValueError(f'{name}: {key} takes some of {list(fields)}, got {sorted(value)}.')
+    return dict(value)
+
+
 def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
+    """Validate one layer's directives. Anything unknown is refused, never dropped."""
     if raw is None:
         return {}
     if not isinstance(raw, dict):
         raise TypeError(f'{name}: layer directives must be a dict.')
+    unknown = sorted(set(raw) - DIRECTIVES)
+    if unknown:
+        raise ValueError(f'{name}: unknown directive(s) {unknown}; expected some of {sorted(DIRECTIVES)}.')
 
     directives: Dict[str, Any] = {}
 
     if 'placement' in raw:
-        placement_cfg = raw['placement']
-        if not isinstance(placement_cfg, dict):
-            raise TypeError(f'{name}: placement override must be a dict.')
-        placement: Dict[str, int] = {}
-        if 'col' in placement_cfg:
-            placement['col'] = int(placement_cfg['col'])
-        if 'row' in placement_cfg:
-            placement['row'] = int(placement_cfg['row'])
-        if placement:
-            directives['placement'] = placement
+        placement = _group(name, 'placement', raw['placement'])
+        if set(placement) != {'col', 'row'}:
+            raise ValueError(f'{name}: placement needs both col and row.')
+        directives['placement'] = {key: int(value) for key, value in placement.items()}
 
     if 'microtiling' in raw:
-        tiling_cfg = raw['microtiling']
-        if not isinstance(tiling_cfg, dict):
-            raise TypeError(f'{name}: tiling override must be a dict.')
-        tiling: Dict[str, int] = {}
-        for key in ('microtile_m', 'microtile_k', 'microtile_n'):
-            if key in tiling_cfg:
-                tiling[key] = int(tiling_cfg[key])
-        if tiling:
-            directives['microtiling'] = tiling
+        directives['microtiling'] = {key: int(v) for key, v in _group(name, 'microtiling', raw['microtiling']).items()}
 
     if 'parallelism' in raw:
-        parallel_cfg = raw['parallelism']
-        if not isinstance(parallel_cfg, dict):
-            raise TypeError(f'{name}: parallelism override must be a dict.')
-        parallelism: Dict[str, Any] = {}
-        for key in ('cas_num', 'cas_length', 'parallel_factor'):
-            if key in parallel_cfg:
-                parallelism[key] = int(parallel_cfg[key])
-        if 'contract' in parallel_cfg:
-            parallelism['contract'] = str(parallel_cfg['contract'])
-        if parallelism:
-            directives['parallelism'] = parallelism
+        parallelism = _group(name, 'parallelism', raw['parallelism'])
+        directives['parallelism'] = {key: str(v) if key == 'contract' else int(v) for key, v in parallelism.items()}
+        contract = directives['parallelism'].get('contract')
+        if contract is not None and contract not in STAGING_CONTRACTS:
+            raise ValueError(f'{name}: unknown contract {contract!r}; expected one of {sorted(STAGING_CONTRACTS)}.')
 
     if 'io_route' in raw:
-        io_route = raw['io_route']
-        if not isinstance(io_route, dict):
-            raise TypeError(f'{name}: io_route override must be a dict.')
-        directives['io_route'] = dict(io_route)
+        routes: Dict[str, Dict[str, str]] = {}
+        for direction, modes in _group(name, 'io_route', raw['io_route']).items():
+            if not isinstance(modes, dict):
+                raise TypeError(f'{name}: io_route {direction} must map tensor names to route modes.')
+            bad = {tensor: mode for tensor, mode in modes.items() if mode not in ROUTE_MODES}
+            if bad:
+                raise ValueError(f'{name}: io_route modes {bad}; expected one of {sorted(ROUTE_MODES)}.')
+            routes[direction] = {str(tensor): str(mode) for tensor, mode in modes.items()}
+        directives['io_route'] = routes
 
     if 'layout' in raw:
         layout = str(raw['layout'])
@@ -92,9 +101,6 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
         directives['approximation'] = str(raw['approximation'])
 
     if 'hccs' in raw:
-        hccs_cfg = raw['hccs']
-        if not isinstance(hccs_cfg, dict):
-            raise TypeError(f'{name}: hccs override must be a dict.')
-        directives['hccs'] = dict(hccs_cfg)
+        directives['hccs'] = _group(name, 'hccs', raw['hccs'])
 
     return directives
