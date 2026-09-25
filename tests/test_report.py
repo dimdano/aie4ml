@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+
 import pytest
-from aie4ml.report import _analyze_aie_out_interval
+from aie4ml.report import _aie_clock_ghz, _analyze_aie_out_interval
 
 
 def _pipeline(elements: int) -> dict:
@@ -41,3 +43,28 @@ def test_report_groups_tlast_frames_into_logical_inferences(tmp_path, frames):
 
     assert latency['global'] == {'min_ns': 10.0, 'max_ns': 10.0, 'avg_ns': 10.0, 'samples': 2}
     assert latency['per_port']['y_p0.txt'] == latency['global']
+
+
+def test_report_reads_the_compiled_aie_clock(tmp_path):
+    """Latencies convert to cycles at the clock the design was compiled for, not an assumed one."""
+    assert _aie_clock_ghz(tmp_path) is None
+    config = tmp_path / 'Work' / 'ps' / 'c_rts' / 'aie_control_config.json'
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({'aie_metadata': {'DeviceData': {'AIEFrequency': 1000}}}))
+    assert _aie_clock_ghz(tmp_path) == 1.0
+
+
+def test_report_latency_runs_from_the_first_input(tmp_path):
+    """Latency = the host's input-start to output-start cycles plus the first sample's own output
+    duration, at the compiled clock: simulation start (configuration, weights) does not count."""
+    from aie4ml.report import measured_latency_cc
+
+    config = tmp_path / 'Work' / 'ps' / 'c_rts' / 'aie_control_config.json'
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({'aie_metadata': {'DeviceData': {'AIEFrequency': 1250}}}))
+    data_dir = tmp_path / 'aiesimulator_output' / 'data'
+    data_dir.mkdir(parents=True)
+    (data_dir / 'y_p0.txt').write_text('T 5000 ns\n1 1\nT 5080 ns\nTLAST\n1 1\nT 6000 ns\nTLAST\n1 1\n')
+    assert measured_latency_cc(tmp_path) is None  # no host measurement yet
+    (tmp_path / 'log').write_text('AIE4ML_LATENCY_START_CC 900\n...\nAIE4ML_LATENCY_START_CC 1000\n')
+    assert measured_latency_cc(tmp_path) == 1000 + 100  # the last run's count, plus 80 ns at 1.25 GHz

@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from ...utils import ParallelismConfig, TensorView
+from ...utils import ParallelismConfig, SpatialAccess2D, TensorView
 from ...utils.math import align_up
 from ..matmul.config import MatmulMicrotileConfig
 
@@ -33,10 +33,7 @@ class Conv2dConfig:
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
     spatial_blocks: int  # mmul row tiles per accumulator set (2 on AIE, 4 on AIE-ML/MLv2)
-    kernel_shape: Tuple[int, int]
-    strides: Tuple[int, int]
-    dilations: Tuple[int, int]
-    pads: Tuple[int, int, int, int]  # (top, left, bottom, right)
+    spatial: SpatialAccess2D  # the window: kernel, pads (top, left, bottom, right), strides, dilations
     groups: int
     alternating_horizontal: bool
     bank_mem_bytes: int  # one memory bank: what a bank-pinned buffer copy, and the weights, must fit
@@ -45,45 +42,52 @@ class Conv2dConfig:
 
 @dataclass(frozen=True)
 class RetileWindow:
-    """The rows one retiler kernel reads and where they land in the frame it builds.
-
-    `rows` source rows starting at `first_row` of the tensor (for a boundary source: a linear row slice)
-    fill the frame from row `origin_row`; the rest of the frame is the zero border the kernel clears.
-    `transfer_bytes` is one inference of that source in its buffer, whole 16-byte units from the boundary.
-    """
+    """One retiler kernel's window: `rows` tensor rows from `first_row` land at frame row `origin_row`,
+    `channels` from `first_channel`; `transfer_bytes` is one inference of it from the boundary."""
 
     first_row: int
     rows: int
     origin_row: int
+    first_channel: int
+    channels: int
     transfer_bytes: int
 
 
 @dataclass(frozen=True)
 class FrameRetileConfig:
-    """A retiler: the source it reads and the column-grouped frames it builds, derived once.
-
-    Both layouts are the conv's input frame view -- the tensor's padded frame, which producer and
-    consumer derive alike -- read either as the tensor itself (`from_boundary`: the boundary carries it
-    linearly) or as the frame a producing kernel wrote, columns in plain order. One kernel per window
-    builds one band of that frame: the whole frame, or one of the conv's row bands. The kernels address
-    the image in the source with the byte steps below.
-    """
+    """A retiler: one kernel per window builds one tile of the conv's column-grouped input frame (a row
+    slice, a channel slice of its cascade, or both, row-slice-major), reading the tensor linearly from
+    the boundary or the plain frame a producer wrote."""
 
     precision: Any  # the element type, as the conv's lhs precision
     source: str  # the value it reads
     target: str  # the frame it writes, which only the execution graph knows
-    frame_view: TensorView  # one band's frame: the whole frame when there is one window
+    frame_view: TensorView  # one window's frame: one row slice, one channel slice
     column_phases: int
-    band_rows: int  # frame rows between the first rows of neighbouring bands; 0 for one window
+    row_step: int  # frame rows between the first rows of neighbouring row slices; 0 for one
+    channel_slices: int  # the conv's cascade length: windows per row slice
     windows: Tuple[RetileWindow, ...]
+    parallelism: ParallelismConfig  # a kernel per window, no cascade
     from_boundary: bool
     alternating_horizontal: bool  # AIE: odd-row cores reach their east neighbour's memory, not the west's
     bank_mem_bytes: int
-    channels: int  # channels each source pixel moves
-    source_base: int
-    source_pixel: int
-    source_row: int
-    source_block: int
+
+    def source_steps(self, window: RetileWindow) -> Dict[str, int]:
+        """Byte addressing of a window's image in its source: channels per pixel, first-pixel base, and
+        pixel/row/8-channel-block steps."""
+        view = self.frame_view
+        width = int(view.logical[2])
+        _, rows, cols, padded_channels = (int(x) for x in view.tile)
+        if self.from_boundary:
+            channels = window.channels
+            return {'channels': channels, 'base': 0, 'pixel': channels, 'row': width * channels, 'block': 8}
+        return {
+            'channels': padded_channels,
+            'base': (int(view.origin[1]) * cols + int(view.origin[2])) * 8,
+            'pixel': 8,
+            'row': cols * 8,
+            'block': rows * cols * 8,
+        }
 
     @classmethod
     def for_frame(
@@ -95,46 +99,47 @@ class FrameRetileConfig:
         source: str,
         target: str,
         from_boundary: bool,
-        bands: int,
-        band_rows: int,
+        row_slices: int,
+        row_step: int,
+        channel_slices: int,
         alternating_horizontal: bool,
         bank_mem_bytes: int,
     ):
         _, height, width, channels = (int(x) for x in view.logical)
-        _, rows, cols, padded_channels = (int(x) for x in view.tile)
-        top = int(view.origin[1])
+        rows, top, slice_channels = int(view.tile[1]), int(view.origin[1]), int(view.tile[3])
         if from_boundary:
-            steps = dict(
-                channels=channels, source_base=0, source_pixel=channels, source_row=width * channels, source_block=8
-            )
             windows = []
-            for band in range(int(bands)):
-                # Band `band` covers frame rows from band * band_rows: those rows of the tensor that exist.
-                start = band * int(band_rows) - top
+            for row_slice in range(int(row_slices)):
+                # A row slice covers frame rows from row_slice * row_step: those rows of the tensor that exist.
+                start = row_slice * int(row_step) - top
                 first, last = max(0, start), min(height, start + rows)
-                transfer = align_up((last - first) * width * channels, TRANSFER_ALIGN_BYTES)
-                windows.append(RetileWindow(first, last - first, first - start, transfer))
+                for part in range(int(channel_slices)):
+                    # The slice's channels that exist: the last one may not fill its blocks.
+                    first_channel = part * slice_channels
+                    count = min(channels, first_channel + slice_channels) - first_channel
+                    transfer = align_up((last - first) * width * count, TRANSFER_ALIGN_BYTES)
+                    windows.append(RetileWindow(first, last - first, first - start, first_channel, count, transfer))
         else:
-            if int(bands) != 1:
-                raise NotImplementedError("a retiler reads a producer's frame whole, not in row bands.")
-            steps = dict(
-                channels=padded_channels,
-                source_base=(top * cols + int(view.origin[2])) * 8,
-                source_pixel=8,
-                source_row=cols * 8,
-                source_block=rows * cols * 8,
-            )
-            windows = [RetileWindow(0, height, top, int(np.prod(view.tile)))]
+            if int(row_slices) != 1:
+                raise NotImplementedError("a retiler reads a producer's frame whole, not split by rows.")
+            # Each slice is the frame the producer's chain of the same index wrote.
+            windows = [
+                RetileWindow(0, height, top, part * slice_channels, slice_channels, int(np.prod(view.tile)))
+                for part in range(int(channel_slices))
+            ]
         return cls(
             precision=precision,
             source=source,
             target=target,
             frame_view=view,
             column_phases=int(column_phases),
-            band_rows=int(band_rows),
+            row_step=int(row_step),
+            channel_slices=int(channel_slices),
             windows=tuple(windows),
+            parallelism=ParallelismConfig(
+                cas_num=len(windows), cas_length=1, contract='outer' if int(row_slices) > 1 else 'inner'
+            ),
             from_boundary=from_boundary,
             alternating_horizontal=bool(alternating_horizontal),
             bank_mem_bytes=int(bank_mem_bytes),
-            **steps,
         )

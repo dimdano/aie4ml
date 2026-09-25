@@ -48,14 +48,9 @@ class OnnxImportContext:
         self.layer_directives = layer_directives
         self.used_directives: set[str] = set()
 
-        # ONNX value name -> lowered activation/parameter tensor.
         self.value_tensors: Dict[str, TensorVar] = {}
-        # QuantizeLinear output name -> (kind, ref, intent, shape) pending a DequantizeLinear.
         self.q_aliases: Dict[str, Tuple[str, Any, QuantIntent, Tuple[int, ...]]] = {}
         self.precision_mirrors: list[Tuple[str, str]] = []
-        # How an ONNX value views its lowered tensor: order[i] is the canonical axis the ONNX
-        # value shows at axis i. Absent = identity. A Transpose composes into it instead of
-        # emitting an op, so canonical spatial tensors stay NHWC whatever the ONNX order is.
         self.value_orders: Dict[str, Tuple[int, ...]] = {}
 
     # -- directives ---------------------------------------------------------

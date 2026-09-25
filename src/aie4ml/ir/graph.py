@@ -91,7 +91,6 @@ def input_role(node: OpNode, tensor_name: str) -> Optional[str]:
 
 
 def has_input_role(node: OpNode, role: str) -> bool:
-    """Whether one of this node's inputs plays `role` -- the only record that it does."""
     return role in node.roles.values()
 
 
@@ -179,7 +178,6 @@ class LogicalIR:
         self.tensors.pop(out_tv.name, None)
 
     def _retarget_boundary(self, old: 'TensorVar', new: 'TensorVar') -> None:
-        """Move a graph-boundary marker onto the tensor that replaces `old`."""
         for names in (self.input_tensor_names, self.output_tensor_names):
             if old.name in names:
                 names[names.index(old.name)] = new.name
@@ -201,7 +199,6 @@ class LogicalIR:
 
         in_tv.producer = None
         if not in_tv.consumers:
-            # The downstream tensor takes its place, boundary marker included.
             self._retarget_boundary(in_tv, out_tv)
             self.tensors.pop(in_tv.name, None)
 
@@ -268,7 +265,6 @@ class LogicalIR:
                     )
 
     def _verify_connectivity(self) -> None:
-        """Every edge is reciprocal: a node lists the tensors that list it."""
         for node in self.nodes:
             for tensor in node.inputs:
                 if node not in tensor.consumers:
@@ -340,12 +336,8 @@ class TensorContract:
 
 @dataclass(frozen=True)
 class ExecutionInput:
-    """One activation an execution entry reads: the edge from the value's producer to this entry.
-
-    `role` is what the tensor is to the kernel (`lhs`, `rhs`, ...). `shared_memory` narrows a direct
-    edge to its no-DMA realisation: the buffer must pass through a memory both kernels reach. Without
-    it, placement still draws the two kernels together, and the plan records which realisation it chose.
-    """
+    """One activation an execution entry reads. `shared_memory` requires the edge's no-DMA
+    realisation; without it placement still draws the kernels together and the plan records its choice."""
 
     tensor: str
     role: Optional[str]
@@ -354,10 +346,7 @@ class ExecutionInput:
 
 @dataclass(frozen=True)
 class ExecutionView:
-    """A folded view (slice, split, concat): no kernel; transport maps its readers onto its sources.
-
-    `data` is the view as folding recorded it; `node` names the folded node, for messages.
-    """
+    """A folded view (slice, split, concat): no kernel; transport maps its readers onto its sources."""
 
     kind: str
     node: str
@@ -368,7 +357,6 @@ class ExecutionView:
 
     @property
     def sources(self) -> Tuple[str, ...]:
-        """The values the view reads: a slice's source, or every input a concat joins."""
         if self.kind == 'concat':
             return tuple(str(item['input']) for item in self.get('slices', ()))
         return (str(self.get('source')),)
@@ -376,11 +364,7 @@ class ExecutionView:
 
 @dataclass(frozen=True)
 class ExecutionValue:
-    """One activation as the kernel graphs move it.
-
-    Written by the entry `producer`; or, with no producer, either a folded `view` over other values
-    or a value entering at the graph boundary.
-    """
+    """One activation: written by `producer`, or else a folded `view`, or else a graph input."""
 
     name: str
     producer: Optional[str] = None
@@ -393,12 +377,8 @@ class ExecutionValue:
 
 @dataclass
 class ExecutionEntry:
-    """One kernel graph to build.
-
-    `node` is its origin and is read only: the logical node it implements, or -- for a kernel a
-    lowering pass inserted, such as a layout conversion -- an execution-only node naming it. What
-    the entry reads and writes is `inputs`/`outputs`, the execution graph's own connectivity.
-    """
+    """One kernel graph to build. `node` is read only: the logical node it implements, or an
+    execution-only node for a kernel a lowering pass inserted. Connectivity is `inputs`/`outputs`."""
 
     node: OpNode
     variant: 'OpImplVariant'
@@ -433,12 +413,8 @@ OpImplInstance = ExecutionEntry
 
 @dataclass
 class ExecutionIR:
-    """The kernel graphs to build, in producer-before-consumer order, and how they connect.
-
-    Once resolution has built it, this is the single source of executable connectivity: transport,
-    placement and code generation read it and never the logical graph, which stays the source of
-    semantics only. Lowering passes may insert entries and rewire inputs here.
-    """
+    """The kernel graphs to build, in producer-before-consumer order. After resolution it is the only
+    source of executable connectivity; the logical graph keeps the semantics."""
 
     instances: Dict[str, ExecutionEntry] = field(default_factory=dict)
     tensor_contracts: Dict[str, TensorContract] = field(default_factory=dict)
@@ -477,7 +453,6 @@ class ExecutionIR:
         return inst
 
     def insert_before(self, name: str, inst: ExecutionEntry) -> None:
-        """Add an entry that feeds `name`, ahead of it in execution order."""
         if inst.name in self.instances:
             raise ValueError(f'{inst.name}: an execution entry of that name already exists.')
         if name not in self.instances:
@@ -514,13 +489,6 @@ class ExecutionIR:
         return removed
 
     def verify(self) -> None:
-        """The execution graph's invariants, checked where it is handed to transport and placement.
-
-        Every value an entry reads exists and is produced earlier in execution order, or is a graph
-        input or a view whose sources are; the entry binds a port to each value it reads or writes;
-        each value has one producer; a shared-memory edge joins two kernels, not a view or the
-        boundary; every graph output is a value.
-        """
         visited = set()
         for inst in self.instances.values():
             for item in inst.inputs:

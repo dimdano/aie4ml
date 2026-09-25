@@ -41,7 +41,6 @@ def _insert(ctx, inst: ExecutionEntry, conversion) -> None:
         graph_header=variant.graph_header,
         graph_name=variant.graph_name,
         param_template=variant.param_template,
-        # The converter takes over the edge the op had, requirement and all.
         inputs=(source,),
         outputs=(conversion.target,),
     )

@@ -7,7 +7,7 @@ from typing import Any, ClassVar, Dict
 import numpy as np
 
 from ....aie_types import FloatIntent
-from ....ir.graph import STAGING_CONTRACTS, VIEW_FLATTEN_2D, OpImplInstance, OpNode, input_role, input_tensor_for_role
+from ....ir.graph import STAGING_CONTRACTS, OpImplInstance, OpNode, input_role, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import BufferLocation, LayoutConversion, OpImplFootprint, OpImplVariant, row_flow
 from ...common_types import PORT_KIND_BUFFER, PORT_KIND_STREAM, PortBinding, PortMap
@@ -56,13 +56,19 @@ Measured on AIE-ML (3x3, Cin 8 -> Cout 32): at OUT_W 16 the 4-tile blocking is 2
 """
 
 
+def _padded_blocks(blocks: int) -> int:
+    """Output blocks a tile's weights and bias hold: the paired core steps blocks two at a time, so it
+    pads an odd count; a tile of one block runs the one-block core, which needs no padding."""
+    return blocks if blocks == 1 else blocks + blocks % 2
+
+
 @register_variant
 class Conv2dOpImplVariant(OpImplVariant):
     """int8 Conv2D as an implicit GEMM over the Dense mmul core, on channel-blocked NHWC frames.
 
     Partitioning uses the Dense vocabulary on the frame: `cas_length` splits the reduction (input
     channel blocks) across a cascade chain, and `cas_num` splits either the output channel blocks
-    ('inner') or the output rows ('outer', row bands that overlap by the window span).
+    ('inner') or the output rows ('outer', row slices that overlap by the window span).
     """
 
     variant_id = 'conv2d.b.r.v1'
@@ -102,20 +108,20 @@ class Conv2dOpImplVariant(OpImplVariant):
         lhs = input_tensor_for_role(node, 'lhs')
         rhs = input_tensor_for_role(node, 'rhs')
         out = node.outputs[0]
-        access = spatial_access_of(node)
+        spatial = spatial_access_of(node)
         # Kernel limits, as opposed to what the operation means (which the family verified).
         if int(lhs.shape[0]) != 1:
             raise NotImplementedError(f'{node.name}: {self.variant_id} runs one sample per call, got N={lhs.shape[0]}.')
-        if access.dilations != (1, 1):
+        if spatial.dilations != (1, 1):
             raise NotImplementedError(
-                f'{node.name}: {self.variant_id} does not implement dilations {access.dilations}.'
+                f'{node.name}: {self.variant_id} does not implement dilations {spatial.dilations}.'
             )
         if (
-            max(access.pads[0], access.pads[2]) >= access.kernel[0]
-            or max(access.pads[1], access.pads[3]) >= access.kernel[1]
+            max(spatial.pads[0], spatial.pads[2]) >= spatial.kernel[0]
+            or max(spatial.pads[1], spatial.pads[3]) >= spatial.kernel[1]
         ):
             raise NotImplementedError(
-                f'{node.name}: {self.variant_id} pads {access.pads} must stay inside the kernel {access.kernel}.'
+                f'{node.name}: {self.variant_id} pads {spatial.pads} must stay inside the kernel {spatial.kernel}.'
             )
 
         precision, accumulator_tag = resolve_operand_precision(node, device)
@@ -129,15 +135,13 @@ class Conv2dOpImplVariant(OpImplVariant):
         parallelism = self._resolve_parallelism(node, parallel_cfg, input_contracts, flatten=bool(view))
         block = spatial_blocks * m
         outer = parallelism.contract == 'outer'
-        bands = parallelism.cas_num if outer else 1
+        row_slices = parallelism.cas_num if outer else 1
         io_views = {
             lhs.name: frame_view(
-                lhs, column_block=block, column_align=m, channel_slices=parallelism.cas_length, bands=bands
+                lhs, column_block=block, column_align=m, channel_slices=parallelism.cas_length, row_slices=row_slices
             ),
         }
         if view:
-            if view['kind'] != VIEW_FLATTEN_2D:
-                raise NotImplementedError(f'{node.name}: {self.variant_id} cannot write {view["kind"]}.')
             if int(rhs.shape[-1]) % CHANNEL_BLOCK:
                 raise NotImplementedError(
                     f'{node.name}: a flattened conv needs output channels in whole {CHANNEL_BLOCK}-blocks, '
@@ -159,29 +163,18 @@ class Conv2dOpImplVariant(OpImplVariant):
                 column_block=block,
                 column_align=m,
                 channel_slices=1 if outer else parallelism.cas_num,
-                bands=bands,
+                row_slices=row_slices,
             )
             if outer and any(io_views[out.name].origin):
                 raise NotImplementedError(
-                    f'{node.name}: a band-split output cannot carry the zero border its consumer reads; '
-                    'partition the channels instead, or let the consumer pad its own input.'
+                    f"{node.name}: an output split by rows (contract 'outer') cannot carry the zero border its "
+                    'consumer reads; partition the channels instead, or let the consumer pad its own input.'
                 )
 
         shift = resolve_accumulator_output_shift(lhs.precision, out.precision, rhs.precision)
         shift += resolve_output_scale_shift(node, is_float=False)
         fused_act = node.traits.get('fused_activation')
         use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
-
-        if self.port_kind == PORT_KIND_BUFFER and int(access.strides[1]) > 1:
-            # A retiler kernel per row band feeds a strided conv; splitting its channels would need one
-            # per channel slice (cas_length) or one frame for several chains (inner cas_num).
-            banded = parallelism.contract == 'outer' and int(parallelism.cas_length) == 1
-            if int(parallelism.cas_num) * int(parallelism.cas_length) > 1 and not banded:
-                raise NotImplementedError(
-                    f'{node.name}: {self.variant_id} splits a strided conv only into row bands '
-                    f"(contract 'outer', cas_length 1); cas_num={parallelism.cas_num}, "
-                    f'cas_length={parallelism.cas_length} with contract {parallelism.contract!r} is not implemented.'
-                )
 
         return Conv2dConfig(
             precision=precision,
@@ -193,10 +186,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             accumulator_tag=accumulator_tag,
             rounding_mode=aie_rounding_token(precision['output']),
             spatial_blocks=spatial_blocks,
-            kernel_shape=access.kernel,
-            strides=access.strides,
-            dilations=access.dilations,
-            pads=access.pads,
+            spatial=spatial,
             groups=int(node.metadata['groups']),
             alternating_horizontal=device.cascade_layout == 'alternating_horizontal',
             bank_mem_bytes=int(device.bank_mem_bytes),
@@ -209,27 +199,30 @@ class Conv2dOpImplVariant(OpImplVariant):
         if contract not in STAGING_CONTRACTS:
             raise ValueError(f'{node.name}: unknown parallelism contract {contract!r}.')
         lhs = input_tensor_for_role(node, 'lhs')
-        access = spatial_access_of(node)
+        spatial = spatial_access_of(node)
         in_blocks = align_up(int(lhs.shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
         out_blocks = align_up(int(input_tensor_for_role(node, 'rhs').shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
-        reads_neighbour_rows = access.window[0] > 1 or access.pads[0] or access.pads[2]
+        reads_neighbour_rows = spatial.window[0] > 1 or spatial.pads[0] or spatial.pads[2]
 
         cas_length = int(parallel_cfg.get('cas_length', 1))
         producer = input_contracts.get(lhs.name)
         if producer is not None and producer.contract == 'outer':
-            # The rows arrive already split into bands; a window that reaches past its own band
-            # would need rows another band owns.
+            # The rows arrive already split ('outer'); a window that reaches past its own row slice
+            # would need rows another chain owns.
             if reads_neighbour_rows:
                 raise NotImplementedError(
-                    f'{node.name}: its input arrives in row bands, but its {access.kernel} window with pads '
-                    f'{access.pads} reads rows the neighbouring band owns.'
+                    f"{node.name}: its input arrives split by rows (contract 'outer'), but its {spatial.kernel} "
+                    f'window with pads {spatial.pads} reads rows a neighbouring chain owns.'
                 )
             if contract == 'inner' and 'contract' in parallel_cfg:
-                raise ValueError(f'{node.name}: its input is banded, so it cannot be partitioned by channel.')
+                raise ValueError(
+                    f"{node.name}: its input is split by rows (contract 'outer'), so it cannot be partitioned "
+                    'by channel.'
+                )
             if flatten:
                 raise NotImplementedError(
-                    f'{node.name}: its input arrives in row bands, but a flattened output is one row that '
-                    'the consuming Dense reads whole.'
+                    f"{node.name}: its input arrives split by rows (contract 'outer'), but a flattened output is one "
+                    'row that the consuming Dense reads whole.'
                 )
             return ParallelismConfig(cas_num=len(producer.port_staging), cas_length=1, contract='outer')
         if producer is not None:
@@ -244,20 +237,23 @@ class Conv2dOpImplVariant(OpImplVariant):
             cas_length = required
         cas_num = int(parallel_cfg.get('cas_num', 1))
         if contract == 'outer':
-            # Bands overlap by the window span, so a band reads rows its neighbours also read.
+            # Row slices overlap by the window span, so a chain reads rows its neighbours also read.
             # Only the graph boundary can serve that: the host clips each port's window against
             # the tensor and zero-fills the rest, while a producing kernel writes each row once.
             if lhs.producer is not None and reads_neighbour_rows:
                 raise NotImplementedError(
-                    f'{node.name}: a band-split input whose window reads neighbouring rows must come from the '
-                    'graph boundary, because the bands overlap and a kernel writes every row exactly once.'
+                    f"{node.name}: an input split by rows (contract 'outer') whose window reads neighbouring rows "
+                    'must come from the graph boundary, because the row slices overlap and a kernel writes every '
+                    'row exactly once.'
                 )
             if flatten:
-                raise NotImplementedError(f'{node.name}: a flattened output cannot be split into row bands.')
-            out_rows = access.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+                raise NotImplementedError(
+                    f"{node.name}: a flattened output cannot be split by rows (contract 'outer')."
+                )
+            out_rows = spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
             if cas_num < 1 or out_rows % cas_num:
                 raise ValueError(
-                    f'{node.name}: cas_num={cas_num} does not split {out_rows} output rows into equal bands.'
+                    f'{node.name}: cas_num={cas_num} does not split {out_rows} output rows into equal row slices.'
                 )
             if cas_length < 1 or in_blocks % cas_length:
                 raise ValueError(
@@ -284,10 +280,11 @@ class Conv2dOpImplVariant(OpImplVariant):
         # The kernel computes whole register tiles, so it reads past the last output pixel. A strided
         # frame holds its columns in `stride_w` polyphase classes and every class must reach that
         # far; at stride 1 there is one class, the whole row. Mirrors the kernel's static_assert.
-        stride_w = int(config.strides[1])
+        stride_w = int(config.spatial.strides[1])
         phase_cols = int(params['in_cols']) // stride_w
         read_span = (
-            params['out_w_computed'] + (config.kernel_shape[1] - 1 + params['in_origin_c'] - config.pads[1]) // stride_w
+            params['out_w_computed']
+            + (config.spatial.kernel[1] - 1 + params['in_origin_c'] - config.spatial.pads[1]) // stride_w
         )
         if int(params['in_cols']) % stride_w or read_span > phase_cols:
             raise RuntimeError(
@@ -299,13 +296,13 @@ class Conv2dOpImplVariant(OpImplVariant):
             # the weights in bank 2 of the kernel's tile, stack and bias in bank 1.
             bank = int(config.bank_mem_bytes)
             for what, size, splits in (
-                ('input frame', params['in_bytes'], "row bands (contract 'outer') or `cas_length` over input channels"),
-                ('output frame', params['out_bytes'], "row bands (contract 'outer') or `cas_num` over output channels"),
+                ('input frame', params['in_bytes'], "`cas_num` over rows ('outer') or `cas_length` over channels"),
+                ('output frame', params['out_bytes'], "`cas_num` over rows (contract 'outer') or over output channels"),
                 (
                     'weights',
                     params['weight_count'],
                     '`cas_length` over input channels or `cas_num` over output '
-                    'channels; row bands copy the weights to every tile',
+                    'channels; a split by rows copies the weights to every chain',
                 ),
             ):
                 if int(size) > bank:
@@ -340,7 +337,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         boundary carries the tensor in plain order, and a producing kernel writes whole register
         tiles, which span several groups. The stream variant refuses stride altogether.
         """
-        return self.port_kind == PORT_KIND_BUFFER and int(config.strides[1]) > 1
+        return self.port_kind == PORT_KIND_BUFFER and int(config.spatial.strides[1]) > 1
 
     @staticmethod
     def retiled_frame(node) -> str:
@@ -359,28 +356,33 @@ class Conv2dOpImplVariant(OpImplVariant):
             )
         view = config.io_views[lhs.name]
         from_boundary = source.producer is None
-        bands = int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else 1
-        if bands > 1 and not from_boundary:
+        row_slices = int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else 1
+        if row_slices > 1 and not from_boundary:
             raise NotImplementedError(
-                f'{node.name}: its strided input arrives from {source.producer} in row bands; a retiler reads a '
+                f'{node.name}: its strided input arrives from {source.producer} split by rows; a retiler reads a '
                 "producer's frame whole."
             )
         frame = self.retiled_frame(node)
         retile = FrameRetileConfig.for_frame(
             config.precision['lhs'],
             view,
-            int(config.strides[1]),
+            int(config.spatial.strides[1]),
             source=lhs.name,
             target=frame,
             from_boundary=from_boundary,
-            bands=bands,
-            band_rows=self._band_input_rows(node, config),
+            row_slices=row_slices,
+            row_step=self._input_row_step(node, config),
+            channel_slices=int(config.parallelism.cas_length),
             alternating_horizontal=config.alternating_horizontal,
             bank_mem_bytes=config.bank_mem_bytes,
         )
-        # A performance constraint, not a functional one: a DMA copy of the finished frame would be
-        # exact, but its latency, interval and descriptor limits are unmeasured, while the shared hand-
-        # over is what every retiler figure was measured with. Until the copy is, the edge requires it.
+        # A performance constraint, not a functional one: a retiler beside its conv tile hands the frame
+        # over in shared memory, which every single-tile figure was measured with. A cascade's tiles read
+        # their inputs in their own row, which the retilers stacked beside it cannot reach, and chains
+        # of output channels each read every slice, so there the frame moves by DMA.
+        one_reader = int(config.parallelism.cas_length) == 1 and (
+            config.parallelism.contract == 'outer' or int(config.parallelism.cas_num) == 1
+        )
         return (
             LayoutConversion(
                 name=f'{node.name}_retile',
@@ -388,7 +390,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 target=frame,
                 variant=FrameRetileOpImplVariant(),
                 config=retile,
-                shared_memory=True,
+                shared_memory=one_reader,
             ),
         )
 
@@ -413,7 +415,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         """Output rows one core call covers. A buffer kernel does the whole tile in one call; a
         stream kernel walks the image in bands, keeping only a window of it."""
         lhs = input_tensor_for_role(node, 'lhs')
-        out_rows = spatial_access_of(node).output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        out_rows = config.spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
         if self.port_kind == PORT_KIND_BUFFER:
             return out_rows // int(config.parallelism.cas_num) if config.parallelism.contract == 'outer' else out_rows
         band = min(STREAM_BAND_ROWS, out_rows)
@@ -426,7 +428,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         out = node.outputs[0]
         in_view, out_view = config.io_views[lhs.name], config.io_views[out.name]
         _, in_rows, in_cols, in_channels = (int(x) for x in in_view.tile)
-        kh, kw = config.kernel_shape
+        kh, kw = config.spatial.kernel
         _, in_h, in_w, cin = (int(x) for x in lhs.shape)
         outer = config.parallelism.contract == 'outer'
         cout = int(input_tensor_for_role(node, 'rhs').shape[-1])
@@ -435,8 +437,8 @@ class Conv2dOpImplVariant(OpImplVariant):
         out_blocks = align_up(cout, CHANNEL_BLOCK) // CHANNEL_BLOCK
         if config.parallelism.contract == 'inner':
             out_blocks //= int(config.parallelism.cas_num)
-        out_blocks_padded = out_blocks + out_blocks % 2
-        out_h, out_w = spatial_access_of(node).output_extent(in_h, in_w)
+        out_blocks_padded = _padded_blocks(out_blocks)
+        out_h, out_w = config.spatial.output_extent(in_h, in_w)
         band = self.band_rows(node, config)
         streamed = self.port_kind == PORT_KIND_STREAM
         if outer:
@@ -477,7 +479,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         if streamed:
             # A streamed kernel holds one band, not the image: the rows its window reads and the
             # rows it writes. Everything else about the frame is unchanged.
-            span_h = spatial_access_of(node).window[0]
+            span_h = config.spatial.window[0]
             params.update(
                 in_rows=band + span_h - 1,
                 out_h=band,
@@ -511,34 +513,34 @@ class Conv2dOpImplVariant(OpImplVariant):
     def output_port_count(self, _node, config):
         return int(config.parallelism.cas_num)
 
-    def _band_rows(self, node, config) -> int:
+    def _rows_per_chain(self, node, config) -> int:
         """Output rows one chain owns, or 0 when the chains split channels instead."""
         if config.parallelism.contract != 'outer':
             return 0
         lhs = input_tensor_for_role(node, 'lhs')
-        out_rows = spatial_access_of(node).output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        out_rows = config.spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
         return out_rows // int(config.parallelism.cas_num)
 
-    def _band_input_rows(self, node, config) -> int:
-        """Frame rows between the windows of neighbouring bands: each band's output rows, strided."""
-        return self._band_rows(node, config) * int(config.strides[0])
+    def _input_row_step(self, node, config) -> int:
+        """Frame rows between the windows of neighbouring row slices: each one's output rows, strided."""
+        return self._rows_per_chain(node, config) * int(config.spatial.strides[0])
 
     def describe_input_staging(self, node, config, tensor_name, port, _buf_dims=None, _producer=None):
         if self.port_kind == PORT_KIND_STREAM:
             return describe_logical_staging(config.io_views[tensor_name], 'read')
         # 'inner': the port is a channel slice every chain reads. 'outer': the port belongs to one
-        # (band, channel slice) tile, so it selects both. A retiled frame is the same frame, its
+        # (row slice, channel slice) tile, so it selects both. A retiled frame is the same frame, its
         # columns grouped by residue, and the port reads it from the retiler.
         cas_length = int(config.parallelism.cas_length)
         outer = config.parallelism.contract == 'outer'
-        band, channel_port = (int(port) // cas_length, int(port) % cas_length) if outer else (0, int(port))
+        row_slice, channel_port = (int(port) // cas_length, int(port) % cas_length) if outer else (0, int(port))
         return describe_frame_staging(
             config.io_views[input_tensor_for_role(node, 'lhs').name],
             'read',
             channel_port,
-            band=band,
-            band_rows=self._band_input_rows(node, config),
-            column_phases=int(config.strides[1]) if self.retiles_input(config) else 1,
+            row_slice=row_slice,
+            row_step=self._input_row_step(node, config),
+            column_phases=int(config.spatial.strides[1]) if self.retiles_input(config) else 1,
         )
 
     def describe_output_staging(self, node, config, tensor_name, port, buf_dims=None):
@@ -552,8 +554,8 @@ class Conv2dOpImplVariant(OpImplVariant):
             view,
             'write',
             0 if outer else int(port),
-            band=int(port) if outer else 0,
-            band_rows=self._band_rows(node, config),
+            row_slice=int(port) if outer else 0,
+            row_step=self._rows_per_chain(node, config),
         )
 
     def build_ports(self, node: OpNode, config: Conv2dConfig):
@@ -563,7 +565,7 @@ class Conv2dOpImplVariant(OpImplVariant):
         # A retiled conv reads the frame its retiler writes, not the tensor itself.
         in_tensor = self.retiled_frame(node) if self.retiles_input(config) else lhs.name
         if config.parallelism.contract == 'outer':
-            # Every tile reads its own band, so no port is shared.
+            # Every tile reads its own row slice, so no port is shared.
             lhs_endpoints = tuple((f'kk[{tile}].in[0]',) for tile in range(cas_num * cas_length))
         else:
             # One input port per reduction column, multicast to the chain owning each output slice.
@@ -605,9 +607,9 @@ class Conv2dOpImplVariant(OpImplVariant):
         cout_g = cout // groups
         in_channels = int(p.io_views[lhs.name].full[-1])
         blocks = align_up(cout, CHANNEL_BLOCK) // CHANNEL_BLOCK
-        bands = p.parallelism.contract == 'outer'
-        chain_blocks = blocks if bands else blocks // cas_num
-        chain_blocks_padded = chain_blocks + chain_blocks % 2
+        outer = p.parallelism.contract == 'outer'
+        chain_blocks = blocks if outer else blocks // cas_num
+        chain_blocks_padded = _padded_blocks(chain_blocks)
         column_blocks = in_channels // CHANNEL_BLOCK // cas_length
 
         dense = np.zeros((kh, kw, in_channels, blocks * CHANNEL_BLOCK), dtype=np_dtype_for_spec(p.precision['rhs']))
@@ -624,7 +626,7 @@ class Conv2dOpImplVariant(OpImplVariant):
             dtype=tiles.dtype,
         )
         for chain in range(cas_num):
-            block_base = 0 if bands else chain * chain_blocks
+            block_base = 0 if outer else chain * chain_blocks
             for column in range(cas_length):
                 tile = np.zeros(
                     (kh, kw, column_blocks, chain_blocks_padded, CHANNEL_BLOCK, CHANNEL_BLOCK), dtype=tiles.dtype
@@ -653,7 +655,7 @@ class Conv2dOpImplVariant(OpImplVariant):
                 )
             ).reshape(-1)
             for chain in range(cas_num):
-                base = 0 if bands else chain * chain_blocks * CHANNEL_BLOCK
+                base = 0 if outer else chain * chain_blocks * CHANNEL_BLOCK
                 chunk = values[base : base + chain_blocks * CHANNEL_BLOCK]
                 packed_bias[chain, : chunk.size] = chunk
         return {'packed_weights': packed_weights, 'packed_bias': packed_bias}
@@ -703,9 +705,9 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
 
     def resolve(self, node: OpNode, device, directives=None) -> Conv2dConfig:
         config = super().resolve(node, device, directives)
-        if config.strides != (1, 1):
+        if config.spatial.strides != (1, 1):
             raise NotImplementedError(
-                f'{node.name}: {self.variant_id} does not implement strides {config.strides}; the '
+                f'{node.name}: {self.variant_id} does not implement strides {config.spatial.strides}; the '
                 'band it keeps and the columns it places are both written for a dense window.'
             )
         if config.parallelism.cas_num != 1 or config.parallelism.cas_length != 1:
@@ -718,7 +720,7 @@ class Conv2dStreamOpImplVariant(Conv2dOpImplVariant):
         super().validate_config(node, config, device)
         params = self.build_template_params(node, config, {'row': 0, 'col': 0})
         lhs = input_tensor_for_role(node, 'lhs')
-        out_rows = spatial_access_of(node).output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
+        out_rows = config.spatial.output_extent(int(lhs.shape[1]), int(lhs.shape[2]))[0]
         if int(params['bands']) * int(params['band_rows']) != out_rows:
             raise NotImplementedError(
                 f'{node.name}: {out_rows} output rows do not divide into whole bands of {params["band_rows"]}.'

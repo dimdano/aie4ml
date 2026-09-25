@@ -15,11 +15,11 @@ struct {{L.struct_name}} {
   // CB / NB are this tile's share of the layer's channel blocks (see CAS_LENGTH / CAS_NUM).
   static constexpr int CIN = {{P.cin}}, CB = {{P.in_blocks}};
   static constexpr int COUT = {{P.cout}}, NB = {{P.out_blocks}}, NBP = {{P.out_blocks_padded}};
-  static constexpr int KH = {{P.kernel_shape[0]}}, KW = {{P.kernel_shape[1]}};
-  static constexpr int PAD_T = {{P.pads[0]}}, PAD_L = {{P.pads[1]}};
+  static constexpr int KH = {{P.spatial.kernel[0]}}, KW = {{P.spatial.kernel[1]}};
+  static constexpr int PAD_T = {{P.spatial.pads[0]}}, PAD_L = {{P.spatial.pads[1]}};
   // A strided conv keeps its frame columns in STRIDE_W polyphase classes, so that the taps of one
   // output pixel stay contiguous and the compute core reads them exactly as it does at stride 1.
-  static constexpr int STRIDE_H = {{P.strides[0]}}, STRIDE_W = {{P.strides[1]}};
+  static constexpr int STRIDE_H = {{P.spatial.strides[0]}}, STRIDE_W = {{P.spatial.strides[1]}};
   // Input frame [CB][IN_ROWS][IN_COLS][8]; the IN_H x IN_W image starts at (IN_ORIGIN_R, IN_ORIGIN_C).
   // FILLS_BORDER: this kernel zeroes the frame's border, because the kernel upstream wrote only
   // the image. At the graph boundary the host delivers the padded window instead, and a strided

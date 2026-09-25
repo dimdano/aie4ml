@@ -6,7 +6,7 @@
 
 #include "conv2d.h"
 
-#include "conv2d_core.h"  // implementations stay out of the header the ADF graph parses
+#include "conv2d_core_one_block.h"  // implementations stay out of the header the ADF graph parses
 
 using namespace adf;
 
@@ -23,7 +23,7 @@ void conv2d_single<ConfigT>::run(input_buffer<data_t>& ifm,
                                  const bias_t (&bias)[ConfigT::BN],
                                  output_buffer<result_t>& ofm)
 {
-  conv2d_tile<ConfigT, false, false>(const_cast<data_t*>(ifm.data()), wts, bias, ofm.data(), nullptr, nullptr);
+  conv2d_compute<ConfigT, false, false>(const_cast<data_t*>(ifm.data()), wts, bias, ofm.data(), nullptr, nullptr);
 }
 
 template<typename ConfigT>
@@ -31,7 +31,7 @@ void conv2d_first<ConfigT>::run(input_buffer<data_t>& ifm,
                                 const weight_t (&wts)[ConfigT::WN],
                                 output_cascade<acc_scalar_t>* outCascade)
 {
-  conv2d_tile<ConfigT, false, true>(
+  conv2d_compute<ConfigT, false, true>(
       const_cast<data_t*>(ifm.data()), wts, nullptr, nullptr, nullptr, outCascade);
 }
 
@@ -41,7 +41,7 @@ void conv2d_middle<ConfigT>::run(input_buffer<data_t>& ifm,
                                  input_cascade<acc_scalar_t>* inCascade,
                                  output_cascade<acc_scalar_t>* outCascade)
 {
-  conv2d_tile<ConfigT, true, true>(
+  conv2d_compute<ConfigT, true, true>(
       const_cast<data_t*>(ifm.data()), wts, nullptr, nullptr, inCascade, outCascade);
 }
 
@@ -52,5 +52,5 @@ void conv2d_last<ConfigT>::run(input_buffer<data_t>& ifm,
                                const bias_t (&bias)[ConfigT::BN],
                                output_buffer<result_t>& ofm)
 {
-  conv2d_tile<ConfigT, true, false>(const_cast<data_t*>(ifm.data()), wts, bias, ofm.data(), inCascade, nullptr);
+  conv2d_compute<ConfigT, true, false>(const_cast<data_t*>(ifm.data()), wts, bias, ofm.data(), inCascade, nullptr);
 }

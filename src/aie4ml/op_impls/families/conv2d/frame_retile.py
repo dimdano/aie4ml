@@ -6,6 +6,7 @@ it, so placement, transport and the build see it as the kernel it is.
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import ClassVar
 
 import numpy as np
@@ -19,8 +20,8 @@ from .config import FrameRetileConfig
 class FrameRetileOpImplVariant(OpImplVariant):
     """Reads the tensor the boundary carries, or the frame a producer wrote, and writes the frame a
     strided conv reads: its columns grouped by residue, the image inside a zero border it clears
-    every inference. One kernel per window, on consecutive rows: the whole frame, or one kernel per
-    row band of a conv split into bands, each beside the band's conv tile."""
+    every inference. One kernel per window, on consecutive rows: the whole frame, or one per tile the
+    conv splits it into -- a row slice ('outer' chains), a channel slice of its cascade, or both."""
 
     variant_id = 'frame_retile.b.v1'
     op_type = 'frame_retile'
@@ -37,17 +38,18 @@ class FrameRetileOpImplVariant(OpImplVariant):
             if int(size) > int(config.bank_mem_bytes):
                 raise ValueError(
                     f"{node.name}: a retiler's {what} is {size} B but one {device.platform} memory bank holds "
-                    f'{config.bank_mem_bytes} B; split the strided conv it feeds into more row bands.'
+                    f"{config.bank_mem_bytes} B; split the strided conv it feeds by rows (contract 'outer', a larger "
+                    'cas_num).'
                 )
 
     def buffer_locations(self, _node, config: FrameRetileConfig, anchor_row):
         """The op contract (`row_flow`), as for Dense and the conv it feeds: each kernel's input and frame
         in banks 0 and 3 of the neighbouring tile both kernels of the hand-over reach."""
         locations = []
-        for band in range(len(config.windows)):
-            flow = row_flow(config.alternating_horizontal, int(anchor_row) + band, 1)
-            locations.append(BufferLocation('in1', band, flow.input_col, band, (0, 3)))
-            locations.append(BufferLocation('out1', band, flow.output_col, band, (0, 3)))
+        for window in range(int(config.parallelism.cas_num)):
+            flow = row_flow(config.alternating_horizontal, int(anchor_row) + window, 1)
+            locations.append(BufferLocation('in1', window, flow.input_col, window, (0, 3)))
+            locations.append(BufferLocation('out1', window, flow.output_col, window, (0, 3)))
         return tuple(locations)
 
     def build_template_params(self, node, config: FrameRetileConfig, placement):
@@ -55,13 +57,9 @@ class FrameRetileOpImplVariant(OpImplVariant):
         _, rows, cols, channels = (int(x) for x in view.tile)
         return {
             'precision': config.precision,
-            'windows': config.windows,
+            'parallelism': config.parallelism,
+            'windows': [{**asdict(window), **config.source_steps(window)} for window in config.windows],
             'src_w': int(view.logical[2]),
-            'src_c': config.channels,
-            'src_base': config.source_base,
-            'src_pixel': config.source_pixel,
-            'src_row': config.source_row,
-            'src_block': config.source_block,
             'rows': rows,
             'cols': cols,
             'blocks': channels // 8,
@@ -72,22 +70,22 @@ class FrameRetileOpImplVariant(OpImplVariant):
         }
 
     def build_ports(self, _node, config: FrameRetileConfig) -> PortMap:
-        bands = range(len(config.windows))
+        windows = range(int(config.parallelism.cas_num))
         return PortMap(
             inputs={
                 config.source: PortBinding(
-                    'in1', len(bands), PORT_KIND_BUFFER, tuple((f'kk[{band}].in[0]',) for band in bands)
+                    'in1', len(windows), PORT_KIND_BUFFER, tuple((f'kk[{w}].in[0]',) for w in windows)
                 )
             },
             outputs={
                 config.target: PortBinding(
-                    'out1', len(bands), PORT_KIND_BUFFER, tuple((f'kk[{band}].out[0]',) for band in bands)
+                    'out1', len(windows), PORT_KIND_BUFFER, tuple((f'kk[{w}].out[0]',) for w in windows)
                 )
             },
         )
 
     def footprint(self, _node, config: FrameRetileConfig) -> OpImplFootprint:
-        return OpImplFootprint(width=1, height=len(config.windows))
+        return OpImplFootprint(width=int(config.parallelism.cas_length), height=int(config.parallelism.cas_num))
 
     def describe_input_staging(
         self, _node, config: FrameRetileConfig, _tensor_name, port, _buf_dims=None, _producer=None
@@ -99,16 +97,18 @@ class FrameRetileOpImplVariant(OpImplVariant):
                 'read',
                 transfer_bytes=window.transfer_bytes,
                 rows=(window.first_row, window.rows),
+                channels=(window.first_channel, window.channels),
             )
-        return describe_frame_staging(config.frame_view, 'read', 0)
+        return describe_frame_staging(config.frame_view, 'read', int(port) % config.channel_slices)
 
     def describe_output_staging(self, _node, config: FrameRetileConfig, _tensor_name, port, _buf_dims=None):
+        row_slice, part = divmod(int(port), config.channel_slices)
         return describe_frame_staging(
             config.frame_view,
             'write',
-            0,
-            band=int(port),
-            band_rows=config.band_rows,
+            part,
+            row_slice=row_slice,
+            row_step=config.row_step,
             column_phases=config.column_phases,
         )
 
@@ -119,10 +119,10 @@ class FrameRetileOpImplVariant(OpImplVariant):
         return config.precision
 
     def output_staging_contract(self, _node, config: FrameRetileConfig, _tensor_name):
-        return 'outer' if len(config.windows) > 1 else 'inner'
+        return config.parallelism.contract
 
     def output_port_count(self, _node, config: FrameRetileConfig):
-        return len(config.windows)
+        return int(config.parallelism.cas_num)
 
     def pack(self, _inst):
         return {}

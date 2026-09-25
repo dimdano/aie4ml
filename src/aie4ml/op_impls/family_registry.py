@@ -9,30 +9,19 @@ if TYPE_CHECKING:
 
 
 class FamilyResolver:
-    """Structural validator, variant dispatcher and capability record for one op type.
-
-    The capabilities let a pass ask what a family can do instead of naming op types.
-    """
+    """Structural validator, variant dispatcher and capability record for one op type; passes ask
+    capabilities instead of naming op types."""
 
     op_type: ClassVar[str] = ''
-    supported_fusions: ClassVar[frozenset] = frozenset()
-    """Epilogues this family folds into its kernel: 'bias', 'relu'."""
-    supported_output_views: ClassVar[frozenset] = frozenset()
-    """Output views this family can write directly instead of its natural layout (OUTPUT_VIEWS)."""
+    supported_fusions: ClassVar[frozenset] = frozenset()  # epilogues folded into the kernel
+    supported_output_views: ClassVar[frozenset] = frozenset()  # OUTPUT_VIEWS written directly
 
     def spatial_access(self, _node: Any):
-        """The 2-D window this op reads around each output pixel, or None when it is not windowed.
-
-        A producer asks its consumers this to size the padded frame it must write.
-        """
+        """The 2-D window read around each output pixel (sizes its producer's frame), or None."""
         return None
 
     def reorder_reduction_rows(self, node: Any, tensor: Any, _order) -> None:
-        """Adopt a permutation of `tensor`'s rows, which this op reduces over, into its constants.
-
-        A folded view can leave the rows of an input in a different order than the frontend's
-        weights assume; a family that reduces over those rows fixes its constants here.
-        """
+        """Adopt a folded view's permutation of the rows this op reduces over into its constants."""
         raise NotImplementedError(
             f'{node.name}: {self.op_type} cannot adopt a reordered {tensor.name!r}; its constants '
             'assume the original row order.'
@@ -69,7 +58,7 @@ class FamilyResolverRegistry:
         return resolver
 
     def find(self, op_type: str) -> Optional[FamilyResolver]:
-        """The resolver for `op_type`, or None for a semantic op no family implements (a view)."""
+        """Like `get`, but None for an op no family implements (a view)."""
         return self._resolvers.get(op_type)
 
 

@@ -126,7 +126,7 @@ def _valid_model(k: int):
 def _frame_model(channels_in=CIN, channels_out=C3, name='conv_frame'):
     """A same-padded conv straight from the graph input, writing its frame to the boundary.
 
-    Nothing gathers row bands back together, so a banded chain ends here; a streamed conv also
+    Nothing gathers row slices back together, so a chain split by rows ends here; a streamed conv also
     has to start here, because its frame must arrive with the border already in it.
     """
     nodes: list = []
@@ -200,8 +200,8 @@ def _nchw_output_model():
     )
 
 
-def _band_model():
-    return _frame_model(name='conv_bands')
+def _row_split_model():
+    return _frame_model(name='conv_row_split')
 
 
 def _stream_model():
@@ -210,7 +210,7 @@ def _stream_model():
     return _frame_model(channels_in=C1, channels_out=C2, name='conv_stream')
 
 
-BAND_DIRECTIVES = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
+ROW_SPLIT = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}
 STREAM_DIRECTIVES = {'b': {'ports': 'stream'}}
 
 
@@ -234,7 +234,7 @@ def test_conv_chain_lowers_to_blocked_frames(conv_model, tmp_path):
     assert fc.variant.variant_id == 'dense.b.r.v1'
     assert 'fused_activation' in c1.node.traits and 'bias' in c1.node.roles.values()
     assert c3.node.trait_data('output_view')['kind'] == 'flatten_2d' and c3.config.flags.emit_flattened
-    assert (c2.config.kernel_shape, c2.config.pads, c2.config.groups) == ((3, 3), (1, 1, 1, 1), C2)
+    assert (c2.config.spatial.kernel, c2.config.spatial.pads, c2.config.groups) == ((3, 3), (1, 1, 1, 1), C2)
 
     # The graph input's frame: 3 channels padded to one 8-block, a 1-pixel zero border, and the
     # image at column 2 so every stored register tile stays aligned.
@@ -272,7 +272,7 @@ def test_valid_conv_frame_covers_the_computed_width(k, tmp_path):
     out_w = H - k + 1
     assert params['out_w'] == out_w
     assert params['out_w_computed'] == -(-out_w // 4) * 4  # 2 register tiles x M=2 on AIE1
-    assert params['in_origin_c'] - conv.config.pads[1] + params['out_w_computed'] + k - 1 <= params['in_cols']
+    assert params['in_origin_c'] - conv.config.spatial.pads[1] + params['out_w_computed'] + k - 1 <= params['in_cols']
 
 
 def test_conv_weights_pack_compact_groups_into_dense_tiles(conv_model, tmp_path):
@@ -282,7 +282,7 @@ def test_conv_weights_pack_compact_groups_into_dense_tiles(conv_model, tmp_path)
     assert tuple(c2.node.inputs[1].shape) == (3, 3, 1, C2)
     packed = c2.artifacts['packed_weights']
     blocks = C2 // 8
-    padded = blocks + blocks % 2  # the kernel walks output blocks in pairs
+    padded = blocks if blocks == 1 else blocks + blocks % 2  # output blocks in pairs, except a lone block
     assert packed.shape == (1, 1, 9 * (C1 // 8) * padded * 64)
     tiles = packed.reshape(9, C1 // 8, padded, 8, 8)  # (tap, cin block, cout block, 8, 8)
     # Depthwise: a tap's (cin, cout) plane is block-diagonal, and each diagonal holds the one
@@ -329,8 +329,8 @@ def test_conv_partitions_channel_blocks_across_tiles(conv_model, tmp_path):
 def test_conv_rejects_partitions_it_cannot_cut(conv_model, tmp_path):
     with pytest.raises(ValueError, match='cas_num=5 does not split'):
         lower(conv_model, tmp_path, {'c1': {'parallelism': {'cas_num': 5}}}, part=AIE1_PART)
-    # c1 feeds a 3x3 conv, so its output frame carries a border no band can own.
-    with pytest.raises(NotImplementedError, match='band-split output'):
+    # c1 feeds a 3x3 conv, so its output frame carries a border no row slice can own.
+    with pytest.raises(NotImplementedError, match='output split by rows'):
         lower(conv_model, tmp_path, {'c1': {'parallelism': {'contract': 'outer', 'cas_num': 2}}}, part=AIE1_PART)
 
 
@@ -354,25 +354,25 @@ def test_frame_refuses_consumers_that_read_different_windows(tmp_path):
         lower(_model('conv_fanout', nodes, inits), tmp_path, part=AIE1_PART)
 
 
-def test_outer_splits_rows_into_overlapping_bands(tmp_path):
-    """Bands overlap by the window span, and a band's window may open before the image: the host
+def test_outer_splits_rows_into_overlapping_slices(tmp_path):
+    """Row slices overlap by the window span, and a slice's window may open before the image: the host
     clips it against the tensor and zero-fills the rest, so no kernel has to own that border."""
-    ctx = lower(_band_model(), tmp_path, BAND_DIRECTIVES, part=AIE1_PART)
+    ctx = lower(_row_split_model(), tmp_path, ROW_SPLIT, part=AIE1_PART)
     conv = ctx.ir.execution.get('b_aie')
     assert conv.config.parallelism.contract == 'outer' and conv.config.parallelism.cas_num == 2
 
     view = conv.config.io_views[conv.node.inputs[0].name]
-    assert view.full[1] == H + 2 and view.tile[1] == H // 2 + 2  # a band of 4 rows plus its halo
+    assert view.full[1] == H + 2 and view.tile[1] == H // 2 + 2  # a slice of 4 rows plus its halo
     ports = [conv.variant.describe_input_staging(conv.node, conv.config, conv.node.inputs[0].name, p) for p in (0, 1)]
-    assert [d['offset'][2] for d in ports] == [0, 4]  # the second band starts 4 frame rows in
-    assert [d['logical_origin'][2] for d in ports] == [-1, 3]  # band 0 opens on the top border
+    assert [d['offset'][2] for d in ports] == [0, 4]  # the second slice starts 4 frame rows in
+    assert [d['logical_origin'][2] for d in ports] == [-1, 3]  # slice 0 opens on the top border
     assert all(d['tiling_dimension'][2] == H // 2 + 2 for d in ports)
 
     params = conv.variant.build_template_params(conv.node, conv.config, {'row': 0, 'col': 0})
     assert (params['out_h'], params['in_rows']) == (H // 2, H // 2 + 2)
-    assert not params['fills_border']  # the host delivers each band's window, border included
+    assert not params['fills_border']  # the host delivers each slice's window, border included
 
-    # Each band writes its own rows of the output, which the host reassembles.
+    # Each slice writes its own rows of the output, which the host reassembles.
     out_ports = [
         conv.variant.describe_output_staging(conv.node, conv.config, conv.node.outputs[0].name, p) for p in (0, 1)
     ]
@@ -435,10 +435,21 @@ def test_conv_refuses_dilation(tmp_path):
 @pytest.mark.requires_vitis
 @pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
 def test_stream_conv_matches_onnx(tmp_path, part):
-    """The wire order and the blocked frame must agree, or the image lands scrambled."""
-    feed = np.random.default_rng(12).integers(-40, 40, size=(1, H, W, C1), dtype=np.int8)
+    """The wire order and the blocked frame must agree, or the image lands scrambled. Two different
+    inputs, because the band frame and the beat cursor outlive the call: the second inference must
+    not inherit the rows and the half beat the first one left behind."""
+    feeds = np.random.default_rng(12).integers(-40, 40, size=(2, 1, H, W, C1), dtype=np.int8)
     assert_x86_matches_onnx(
-        _stream_model(), {'x_q': feed}, STREAM_DIRECTIVES, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+        _stream_model(),
+        {'x_q': feeds},
+        STREAM_DIRECTIVES,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=2,
+        per_iteration=True,
     )
 
 
@@ -551,6 +562,18 @@ def test_strided_conv_retiles_its_producers_frame(tmp_path):
 
     assert pinned(retile, 'out1') == pinned(second, 'in1') != set()
 
+    # Two producer chains feed a cascade of two: one retiler kernel per chain, each reading that
+    # chain's slice of the frame in place.
+    ctx = lower(_strided_chain_model(), tmp_path / 'chains', {'first': {'parallelism': {'cas_num': 2}}}, part=AIE1_PART)
+    retile = ctx.ir.execution.get('second_aie_retile')
+    assert [w.first_channel for w in retile.config.windows] == [0, 8]
+    for port in range(2):
+        write = output_staging(ctx, 'first_aie', port)
+        read = retile.variant.describe_input_staging(retile.node, retile.config, 'first_relu', port)
+        assert write['offset'] == read['offset']
+    legs = [e for e in ctx.ir.physical.plan['direct_edges'] if e['tensor'] == 'first_relu']
+    assert [e['realization'] for e in legs] == ['shared_memory'] * 2
+
 
 def test_shared_edge_needs_room_for_one_buffer(tmp_path):
     """Pinning the strided conv right beside its producer puts the conv's input memory in the
@@ -634,38 +657,60 @@ def test_strided_boundary_conv_is_retiled(tmp_path):
     assert port.staging['storage_layout'] == 'linear'
 
 
-def _banded_strided_conv():
-    """18x18, 3x3 stride 2, padded: nine output rows, three bands of three."""
-    return _strided_model(stride=2, k=3, channels_in=8, channels_out=8, size=18, name='conv_banded_s2', pad=1)
+def _row_split_strided_conv(channels_in=8):
+    """18x18, 3x3 stride 2, padded: nine output rows, three row slices of three."""
+    return _strided_model(
+        stride=2, k=3, channels_in=channels_in, channels_out=8, size=18, name='conv_row_split_s2', pad=1
+    )
 
 
-BANDS = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 3}}}
+ROW_SPLIT_3 = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 3}}}
+# Twelve channels in a cascade of two: an 8-channel slice and a 4-channel one that does not fill its block.
+ROW_SPLIT_X_CASCADE = {'b': {'parallelism': {'contract': 'outer', 'cas_num': 3, 'cas_length': 2}}}
 
 
-def test_strided_conv_splits_into_row_bands(tmp_path):
-    """Each row band gets a retiler kernel of its own, beside the band's conv tile, reading only the rows
-    of the tensor its window covers -- the first band's window opens on the top pad, which that kernel
-    builds -- and handing its frame over as one shared buffer on every row. A channel split is refused."""
+def test_strided_conv_splits_by_rows(tmp_path):
+    """Each row slice gets a retiler kernel of its own, beside the slice's conv tile, reading only the
+    rows of the tensor its window covers -- the first slice's window opens on the top pad, which that kernel
+    builds -- and handing its frame over as one shared buffer on every row. Chains of output channels
+    all read one retiler kernel's frame, by DMA."""
     from aie4ml.op_impls.families.conv2d.config import RetileWindow
 
-    ctx = lower(_banded_strided_conv(), tmp_path / 'bands', BANDS, part=AIE1_PART)
+    ctx = lower(_row_split_strided_conv(), tmp_path / 'rows', ROW_SPLIT_3, part=AIE1_PART)
     retile, conv = ctx.ir.execution.get('b_aie_retile'), ctx.ir.execution.get('b_aie')
     # Output rows 3b..3b+2 read frame rows 6b..6b+6: tensor rows 6b-1..6b+5, clipped to the tensor.
     assert retile.config.windows == (
-        RetileWindow(first_row=0, rows=6, origin_row=1, transfer_bytes=864),
-        RetileWindow(first_row=5, rows=7, origin_row=0, transfer_bytes=1008),
-        RetileWindow(first_row=11, rows=7, origin_row=0, transfer_bytes=1008),
+        RetileWindow(first_row=0, rows=6, origin_row=1, first_channel=0, channels=8, transfer_bytes=864),
+        RetileWindow(first_row=5, rows=7, origin_row=0, first_channel=0, channels=8, transfer_bytes=1008),
+        RetileWindow(first_row=11, rows=7, origin_row=0, first_channel=0, channels=8, transfer_bytes=1008),
     )
     reads = [conv.variant.describe_input_staging(conv.node, conv.config, conv.inputs[0].tensor, b) for b in range(3)]
     writes = [retile.variant.describe_output_staging(retile.node, retile.config, '', b) for b in range(3)]
     assert [d['offset'] for d in reads] == [d['offset'] for d in writes]
-    assert [d['offset'][2] for d in reads] == [0, 6, 12]  # three output rows a band, stride 2
+    assert [d['offset'][2] for d in reads] == [0, 6, 12]  # three output rows a slice, stride 2
     edges = [e for e in ctx.ir.physical.plan['direct_edges'] if e['tensor'] == conv.inputs[0].tensor]
     assert [e['realization'] for e in edges] == ['shared_memory'] * 3
 
+    # With a cascade, each row slice's window splits into channel slices: one retiler kernel per (row,
+    # slice), in the conv's port order. The cascade reads its inputs in its own row, beyond the
+    # retilers' reach, so the hand-over is not required to be shared.
+    ctx = lower(_row_split_strided_conv(channels_in=12), tmp_path / 'cascade', ROW_SPLIT_X_CASCADE, part=AIE1_PART)
+    retile, conv = ctx.ir.execution.get('b_aie_retile'), ctx.ir.execution.get('b_aie')
+    assert [(w.first_row, w.first_channel, w.channels) for w in retile.config.windows] == [
+        (row, first, count) for row in (0, 5, 11) for first, count in ((0, 8), (8, 4))
+    ]
+    reads = [conv.variant.describe_input_staging(conv.node, conv.config, conv.inputs[0].tensor, p) for p in range(6)]
+    writes = [retile.variant.describe_output_staging(retile.node, retile.config, '', p) for p in range(6)]
+    assert [d['offset'] for d in reads] == [d['offset'] for d in writes]
+    assert not conv.inputs[0].shared_memory
+
+    # Chains of output channels each read the whole frame: one retiler kernel, multicast by DMA.
     two_blocks = _strided_model(stride=2, k=3, channels_in=8, channels_out=16, size=16)
-    with pytest.raises(NotImplementedError, match='only into row bands'):
-        lower(two_blocks, tmp_path / 'inner', {'b': {'parallelism': {'cas_num': 2}}}, part=AIE1_PART)
+    ctx = lower(two_blocks, tmp_path / 'inner', {'b': {'parallelism': {'cas_num': 2}}}, part=AIE1_PART)
+    retile, conv = ctx.ir.execution.get('b_aie_retile'), ctx.ir.execution.get('b_aie')
+    assert [(w.first_channel, w.channels) for w in retile.config.windows] == [(0, 8)]
+    assert [b.endpoints for b in conv.ports.inputs.values()] == [(('kk[0].in[0]', 'kk[1].in[0]'),)]
+    assert not conv.inputs[0].shared_memory
 
 
 def test_physical_plan_proves_each_shared_edge(tmp_path):
@@ -753,14 +798,44 @@ def test_strided_conv_matches_onnx_on_the_core(tmp_path):
 
 
 @pytest.mark.requires_vitis
-def test_banded_strided_conv_matches_onnx_on_the_core(tmp_path):
-    """Three row bands through aiesim, each behind its own retiler kernel -- the first band's window
-    opening on the top pad, the middle band on AIE's odd row -- over six different inputs, exact."""
-    feeds = np.random.default_rng(29).integers(-40, 40, size=(6, 1, 18, 18, 8), dtype=np.int8)
+def test_wide_pixel_retiler_matches_onnx_on_the_core(tmp_path):
+    """Sixteen channels from the boundary, which the retiler moves four pixels a group. On AIE the
+    13-column image starts two pixels into its first group and fills three of its last, so both
+    carry border zeros, neither may read past its row, and the odd width leaves every other row off
+    the 32-byte grid. Two chains of output channels read that one frame, multicast by DMA. Six
+    different inputs through aiesim, exact."""
+    feeds = np.random.default_rng(31).integers(-40, 40, size=(6, 1, 13, 13, 16), dtype=np.int8)
     assert_aie_matches_onnx(
-        _banded_strided_conv(),
+        _strided_model(stride=2, k=3, channels_in=16, channels_out=16, size=13, pad=1, name='conv_wide_pixel'),
         {'x_q': feeds},
-        BANDS,
+        {'b': {'parallelism': {'cas_num': 2}}},
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=AIE1_PART,
+        iterations=6,
+        per_iteration=True,
+    )
+    # The host measures latency from the first input beat, after configuration and weight loading.
+    from aie4ml.report import report
+
+    measured = report(tmp_path / 'proj')
+    latency = measured['latency']
+    assert 0 < latency['latency_cc'] < latency['first_output_from_sim_start_ns'] * measured['aie_clock_GHz']
+
+
+@pytest.mark.requires_vitis
+def test_row_split_strided_conv_matches_onnx_on_the_core(tmp_path):
+    """Three row slices, each a cascade of two, through aiesim over six different inputs, exact: a
+    retiler kernel per row and channel slice -- the first row slice's window opening on the top pad, the
+    second channel slice's 4 channels not filling their block -- handing over by DMA, and the middle row slice's
+    cascade on AIE's odd row, where it runs east to west."""
+    feeds = np.random.default_rng(29).integers(-40, 40, size=(6, 1, 18, 18, 12), dtype=np.int8)
+    assert_aie_matches_onnx(
+        _row_split_strided_conv(channels_in=12),
+        {'x_q': feeds},
+        ROW_SPLIT_X_CASCADE,
         tmp_path,
         batch=1,
         frac=FRAC,
@@ -773,62 +848,57 @@ def test_banded_strided_conv_matches_onnx_on_the_core(tmp_path):
 
 @pytest.mark.requires_vitis
 def test_stream_conv_matches_onnx_on_the_core(tmp_path):
-    """One shape on aiesim, twice over, as the smoke test for what x86 cannot see.
+    """One shape on aiesim, over six different inputs, as the smoke test for what x86 cannot see.
 
     x86 loads unaligned addresses happily and schedules nothing, so alignment and pipelining
     failures pass there; both have reached the benchmark from a green suite. The shape is picked to
     touch what the x86 tests miss in one build: an input and an output channel count that each
     leave a partial block, a band whose bytes do not divide into beats, and a second inference over
-    whatever the first one left behind.
+    whatever the previous one left behind.
     """
-    feed = np.random.default_rng(15).integers(-40, 40, size=(1, 6, 6, 4), dtype=np.int8)
+    feeds = np.random.default_rng(15).integers(-40, 40, size=(6, 1, 6, 6, 4), dtype=np.int8)
     assert_aie_matches_onnx(
         _beat_carry_model(),
-        {'x_q': feed},
+        {'x_q': feeds},
         STREAM_DIRECTIVES,
         tmp_path,
         batch=1,
         frac=FRAC,
-        max_code_diff=1,
+        max_code_diff=0,
         part=AIE1_PART,
-        iterations=2,
-    )
-
-
-@pytest.mark.requires_vitis
-def test_stream_conv_repeats_without_stale_state(tmp_path):
-    """The band frame and the beat cursor outlive the call, so a second inference must not inherit
-    the rows and the half beat the first one left behind."""
-    feed = np.random.default_rng(12).integers(-40, 40, size=(1, H, W, C1), dtype=np.int8)
-    assert_x86_matches_onnx(
-        _stream_model(),
-        {'x_q': feed},
-        STREAM_DIRECTIVES,
-        tmp_path,
-        batch=1,
-        frac=FRAC,
-        max_code_diff=1,
-        part=AIE1_PART,
-        iterations=2,
+        iterations=6,
+        per_iteration=True,
     )
 
 
 @pytest.mark.requires_vitis
 @pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
-def test_outer_bands_match_onnx(tmp_path, part):
-    """Same-padded conv in two row bands: the halo rows and the delivered top/bottom border are
-    what this checks, so any mistake in the band windows shows up as wrong pixels."""
+def test_outer_split_matches_onnx(tmp_path, part):
+    """Same-padded conv split by rows into two slices: the halo rows and the delivered top/bottom border
+    are what this checks, so any mistake in the slice windows shows up as wrong pixels."""
     assert_x86_matches_onnx(
-        _band_model(), {'x_q': _feed()}, BAND_DIRECTIVES, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+        _row_split_model(), {'x_q': _feed()}, ROW_SPLIT, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
     )
 
 
 @pytest.mark.requires_vitis
 @pytest.mark.parametrize('part', [AIE1_PART, PART], ids=['aie1', 'aie-ml'])
 def test_conv_chain_matches_onnx(conv_model, tmp_path, part):
-    """One compile covers the single-tile conv, a 3-chain output split, a three-tile cascade
+    """One aiesim build covers the single-tile conv, a 3-chain output split, a three-tile cascade
     (first + middle + last, whose last tile owns the bias), a depthwise group and flatten -> Dense.
-    The biases are non-zero and differ per channel, so a chain that dropped one would show up."""
-    assert_x86_matches_onnx(
-        conv_model, {'x_q': _feed()}, DIRECTIVES, tmp_path, batch=1, frac=FRAC, max_code_diff=1, part=part
+    The biases are non-zero and differ per channel, so a chain that dropped one would show up. The
+    cascade sits on row 1, where AIE runs it east to west."""
+    feeds = np.random.default_rng(11).integers(-40, 40, size=(6, 1, H, W, CIN), dtype=np.int8)
+    directives = {**DIRECTIVES, 'c2': {**DIRECTIVES['c2'], 'placement': {'col': 9, 'row': 1}}}
+    assert_aie_matches_onnx(
+        conv_model,
+        {'x_q': feeds},
+        directives,
+        tmp_path,
+        batch=1,
+        frac=FRAC,
+        max_code_diff=0,
+        part=part,
+        iterations=6,
+        per_iteration=True,
     )

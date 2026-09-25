@@ -3,21 +3,12 @@
 
 #pragma once
 #include <adf.h>
+#include "buffer_location.h"
 #include "conv2d.h"
 #include "conv2d_stream.h"
 #include "parameters.h"
 
 using namespace adf;
-
-// Pins one buffer port where the op contract lists it (see BufferLocation): ping and pong one per bank.
-template<typename PortT, typename LocationT>
-void conv2d_pin_buffer(PortT& port, const LocationT& at, int COL_START, int ROW_START)
-{
-  adf::location<adf::buffer>(port) = {
-    adf::bank(COL_START + at.col, ROW_START + at.row, at.bank0),
-    adf::bank(COL_START + at.col, ROW_START + at.row, at.bank1)
-  };
-}
 
 template<typename ConfigT>
 class conv2d_graph : public graph {
@@ -25,7 +16,6 @@ public:
   static constexpr unsigned CAS_NUM = ConfigT::CAS_NUM;
   static constexpr unsigned CAS_LENGTH = ConfigT::CAS_LENGTH;
 
-  // 'inner': one port per reduction column, multicast to every chain. 'outer': one per tile.
   static constexpr bool OUTER = ConfigT::PARALLELISM_CONTRACT_OUTER;
   static constexpr unsigned IN_PORTS = OUTER ? CAS_NUM * CAS_LENGTH : CAS_LENGTH;
 
@@ -49,11 +39,11 @@ public:
       if constexpr (!STREAM_IO) {
         // The Dense bank schedule: stack and bias in bank 1, weights in bank 2, and the activations
         // where IN1/OUT1_BUFFER_LOCATIONS put them -- one copy per bank.
-        conv2d_pin_buffer(kk[idx].in[0], ConfigT::IN1_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
+        pin_buffer(kk[idx].in[0], ConfigT::IN1_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
         adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
         adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
         if (pos == CAS_LENGTH - 1) {
-          conv2d_pin_buffer(kk[idx].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[chain], COL_START, ROW_START);
+          pin_buffer(kk[idx].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[chain], COL_START, ROW_START);
           adf::location<adf::buffer>(kk[idx].in[CAS_LENGTH == 1 ? 2 : 3]) = adf::bank(tileCol, tileRow, 1);
         }
       }

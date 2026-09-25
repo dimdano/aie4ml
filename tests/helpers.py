@@ -240,7 +240,8 @@ def _assert_matches_onnx(
         runs = [sess.run(None, feeds)] * iterations
     ref = {name: [run[j] for run in runs] for j, name in enumerate(names)}
 
-    got = aie_model.predict(feeds, simulator=simulator, quantize_in=False, dequantize_out=False)
+    # Outputs only: per-kernel profiling slows aiesim by ~40% and no check reads it.
+    got = aie_model.predict(feeds, simulator=simulator, quantize_in=False, dequantize_out=False, aie_profile=False)
     if not isinstance(got, dict):
         got = {next(iter(ref)): got}
 

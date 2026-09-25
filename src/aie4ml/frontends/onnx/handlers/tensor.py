@@ -16,10 +16,6 @@ from ..utils import attr
 
 @onnx_handler('Transpose')
 def _transpose(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> None:
-    """A transpose of an activation is a change of view, not of data: it composes into how the
-    ONNX value sees its canonical tensor. A consumer that needs the canonical order refuses a
-    non-identity view; one that reads the view (Conv) says so.
-    """
     if len(node.input) != 1:
         raise ValueError(f'{node_name}: Transpose must have exactly 1 input.')
     src = ctx.source_for(node.input[0], node_name)
@@ -63,8 +59,6 @@ def _flatten(ctx: OnnxImportContext, node, node_name: str, directives: dict) -> 
         roles=['lhs'],
         metadata={
             'view': VIEW_FLATTEN_2D,
-            # Which order the axes were ravelled in: the ONNX value's own, which may differ from
-            # the canonical order of the tensor it views.
             'axis_order': ctx.order_of(src_name) or tuple(range(len(logical))),
             'layer_class': node.op_type,
             'source_layer': node_name,

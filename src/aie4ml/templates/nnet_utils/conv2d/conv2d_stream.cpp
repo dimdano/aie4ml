@@ -3,7 +3,7 @@
 
 #include "conv2d_stream.h"
 
-#include "conv2d_core.h"  // implementations stay out of the header the ADF graph parses
+#include "conv2d_core_one_block.h"  // implementations stay out of the header the ADF graph parses
 
 using namespace adf;
 
@@ -298,7 +298,7 @@ void conv2d_stream<ConfigT>::run(input_stream<data_t>* ifm,
   int image_row = ConfigT::IN_ROWS - ConfigT::IN_ORIGIN_R;
 
   for (int band = 0; band < ConfigT::BANDS; ++band) {
-    conv2d_tile<ConfigT, false, false>(frame, wts, bias, out, nullptr, nullptr);
+    conv2d_compute<ConfigT, false, false>(frame, wts, bias, out, nullptr, nullptr);
     conv2d_wire_band<ConfigT>(ofm, writer, out);
     if (band + 1 == ConfigT::BANDS) break;
     // Keep the rows the next band's window still reads, and fill the rest from the wire.

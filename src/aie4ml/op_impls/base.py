@@ -9,12 +9,8 @@ from .common_types import PORT_KIND_STREAM, PortMap
 
 @dataclass(frozen=True)
 class BufferLocation:
-    """One transport-visible buffer's footprint-relative location.
-
-    Only an op's input and output buffers -- what a direct edge connects, per port -- are listed;
-    weights, stacks and cascade resources stay the op graph's own business. The op's graph pins every
-    listed buffer where it says, ping and pong one per bank, so each copy must fit one bank.
-    """
+    """A port buffer's footprint-relative location; the op's graph pins it there, ping and pong one
+    per bank. Weights, stacks and cascade resources are not listed."""
 
     port_group: str
     port: int
@@ -36,14 +32,9 @@ class BufferLocation:
 
 @dataclass(frozen=True)
 class RowFlow:
-    """How one row of an op's kernels hands activations on, from the device's memory reach.
-
-    Data flows left to right, except along a cascade on a row whose cascade runs right to left (odd
-    rows on AIE), where the chain is reversed. Each hand-over buffer lives in the neighbouring tile
-    both kernels reach: the upstream one where the reading kernel reaches it, otherwise the reading
-    kernel's own. `input_col` offsets the tile holding a kernel's input from that kernel's column;
-    `output_col` offsets the tile holding a chain's output from its last kernel's column.
-    """
+    """Hand-over geometry of one row. `input_col`/`output_col` offset the tile holding a kernel's input
+    (a chain's output) from that kernel's (the chain's last kernel's) column; `reversed` marks a cascade
+    running right to left (odd rows on AIE)."""
 
     reversed: bool
     input_col: int
@@ -51,8 +42,7 @@ class RowFlow:
 
 
 def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow:
-    """The flow on absolute row `row`. On AIE (`alternating_horizontal`) odd-row cores reach their
-    east neighbour's memory and even-row cores their west's; on AIE-ML every core reaches west."""
+    """On AIE odd-row cores reach their east neighbour's memory, even rows the west's; on AIE-ML all west."""
     reaches_east = bool(alternating_horizontal and int(row) % 2)
     if reaches_east and int(cas_length) > 1:
         return RowFlow(reversed=True, input_col=1, output_col=0)
@@ -63,14 +53,8 @@ def row_flow(alternating_horizontal: bool, row: int, cas_length: int) -> RowFlow
 
 @dataclass(frozen=True)
 class LayoutConversion:
-    """A kernel graph that re-lays one input before the op reads it.
-
-    The op reads `target`, a value that exists only in the execution graph and that its ports bind,
-    instead of `source`; `variant` builds the converting graph from `config`, and `name` is that
-    graph's instance name. `shared_memory` requires the hand-over to the op to pass through a
-    memory both kernels reach, never a DMA -- a constraint the converter sets when a copy would be
-    illegal or is not accounted for, not merely preferred.
-    """
+    """A kernel graph re-laying `source` into `target`, an execution-only value the op reads instead.
+    `shared_memory` makes the hand-over to the op a hard no-DMA requirement."""
 
     name: str
     source: str
@@ -124,20 +108,14 @@ class OpImplVariant:
     def input_conversions(
         self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]
     ) -> Tuple['LayoutConversion', ...]:
-        """Inputs this op reads in a layout their source does not write, each converted by a kernel
-        graph of its own that the layout legalization pass inserts ahead of the op.
-
-        `sources` maps each tensor the op reads to its execution value -- what actually writes it
-        (a kernel, a folded view, or the graph boundary), which decides the layout it arrives in.
-        """
+        """Conversions for inputs whose `sources` (execution values) arrive in a layout the op cannot read."""
         return ()
 
     def buffer_locations(self, _node: OpNode, _config: Any, _anchor_row: int) -> Tuple[BufferLocation, ...]:
         """Return transport-visible buffers relative to an op anchor.
 
-        Repeated group/port pairs describe multicast graph ports. An edge that must pass through
-        shared memory needs both of its ports listed, at the same place: placement accepts only
-        positions where they coincide.
+        Repeated group/port pairs describe multicast graph ports. A shared-memory edge lists both of its
+        ports at the same place.
         """
         return ()
 

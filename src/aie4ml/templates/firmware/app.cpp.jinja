@@ -1,5 +1,8 @@
 #include "parameters.h"
 #include "top_graph.h"
+#if defined(__AIESIM__)
+#include <cstdio>
+#endif
 
 using namespace adf;
 
@@ -121,7 +124,18 @@ int main() {
   {% endfor %}
 {% endfor %}
 
+#if defined(__AIESIM__)
+  // First input to first output beat, in AIE cycles. Input flows only after run(), even with async RTP weights,
+  // so array configuration and weight writes never count.
+  event::handle latency = event::start_profiling(
+      dut.plio_data[0], dut.plio_ofm[0], event::io_stream_start_difference_cycles);
   dut.run(N_ITER);
+  dut.wait();
+  std::printf("AIE4ML_LATENCY_START_CC %lld\n", static_cast<long long>(event::read_profiling(latency)));
+  event::stop_profiling(latency);
+#else
+  dut.run(N_ITER);
+#endif
   dut.end();
   return 0;
 }

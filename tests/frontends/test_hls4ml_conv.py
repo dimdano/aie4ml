@@ -74,6 +74,6 @@ def test_hls4ml_depthwise_reaches_the_compact_group_contract(lowered):
     assert dw.metadata['groups'] == COUT
     tiles = lowered.ir.execution.get(dw.name).artifacts['packed_weights']
     blocks = COUT // 8
-    padded = blocks + blocks % 2
+    padded = blocks if blocks == 1 else blocks + blocks % 2  # pairs, except a lone block
     grid = tiles.reshape(9, blocks, padded, 8, 8)
     assert np.count_nonzero(grid[0, 0, 0]) == np.count_nonzero(np.diag(grid[0, 0, 0]))

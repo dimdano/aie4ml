@@ -280,6 +280,7 @@ def test_aie1_catalog_capabilities_and_raw_part_target(tmp_path):
     )
     AIEProjectEmitter()._render_makefile(tmp_path, ctx, env, None)
     makefile = (tmp_path / 'Makefile').read_text()
+    assert '--target=hw $(AIE_FLAGS_HW) $(AIE_JOBS)' in makefile  # make -jN reaches the kernel compile
     assert f'AIE_PART      ?= {AIE1_PART}' in makefile
     assert 'AIE_TARGET    := --part=$(AIE_PART)' in makefile
     assert '--platform=$(PLATFORM) $(APP_NAME).cpp' not in makefile
