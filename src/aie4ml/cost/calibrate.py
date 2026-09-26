@@ -91,7 +91,7 @@ def calibrate(
     space = DESCRIPTORS[variant.op_type].space
     work = workdir / device.part / compiler
     evidence = Evidence(work / 'evidence.json')
-    plan = Plan(space, variant, device.part, region, work / 'designs', jobs)
+    plan = Plan(space, variant, device.part, compiler, region, work / 'designs', jobs)
 
     groups = plan.groups(only)
     print(f'{variant_id}: {len(groups)} code groups', flush=True)
@@ -166,8 +166,9 @@ class Plan:
     """Per code group and chain length, the designs calibration builds: points sampled far apart among the
     legal lattice points, each kept as what lowering showed of it and rebuilt when compiled."""
 
-    def __init__(self, space, variant, part: str, region: Dict[str, int], out: Path, jobs: int):
-        self.space, self.variant, self.part, self.region, self.out, self.jobs = space, variant, part, region, out, jobs
+    def __init__(self, space, variant, part: str, compiler: str, region: Dict[str, int], out: Path, jobs: int):
+        self.space, self.variant, self.part, self.compiler = space, variant, part, compiler
+        self.region, self.out, self.jobs = region, out, jobs
         self.lattice = [dict(zip(space.shape, values)) for values in itertools.product(*space.shape.values())]
         self.spans = {a: (math.log2(min(v)), math.log2(max(v))) for a, v in space.shape.items()}
         self.choices: Dict[str, Dict[str, Any]] = {}  # group -> the choices that reach it
@@ -253,7 +254,7 @@ class Plan:
         return self.surveyed[(group, length)]
 
     def _job(self, choice: Dict[str, Any], point: Dict[str, int], length: int) -> Tuple:
-        return (self.variant.variant_id, self.part, choice, point, length, self.out)
+        return (self.variant.variant_id, self.part, self.compiler, choice, point, length, self.out)
 
     def _farthest(self, taken: List[Dict], candidates: List[Dict]) -> Dict:
         """The candidate farthest from the taken points in the log-scaled lattice; the least one when none is taken;
@@ -273,7 +274,7 @@ class Plan:
 def _survey(job: Tuple) -> Optional[Dict]:
     """One choice, shape point and chain length of a variant, lowered: what its kernels are, or None if lowering
     refuses it or it selects another variant."""
-    variant_id, part, choice, point, length, out = job
+    variant_id, part, compiler, choice, point, length, out = job
     warnings.filterwarnings('ignore')
     variant = _variant(variant_id)
     name = f'{variant.op_type}_{_digest([choice, point, length])}'
@@ -288,7 +289,6 @@ def _survey(job: Tuple) -> Optional[Dict]:
         if spec.variant_id != variant_id:
             return None
         templates = _templates(spec.kernel, spec.parameters)
-        compiler = _compiler(m.context.device.generation)
         kernels += [
             {
                 'instance': sanitize_identifier(inst.name),
@@ -431,7 +431,7 @@ def _build(
         futures = {
             pool.submit(_measure, (d['name'], *plan.model(d), s, threads, plan.part), out): d for d, s in todo.values()
         }
-        for future in as_completed(futures):
+        for done, future in enumerate(as_completed(futures), start=1):
             design = futures[future]
             try:
                 found = future.result()
@@ -439,9 +439,8 @@ def _build(
                 found = {k['key']: {**_REFUSED, 'refusal': str(error)[-500:]} for k in design['kernels']}
                 failed.add(design['name'])
             evidence.add(found)
-            print(
-                f"  {design['name']}: {'failed' if design['name'] in failed else f'{len(found)} kernels'}", flush=True
-            )
+            outcome = 'failed' if design['name'] in failed else f'{len(found)} kernels'
+            print(f"  [{done}/{len(futures)}] {design['name']}: {outcome}", flush=True)
     return failed | {d['name'] for d in designs if d['kernels'] and evidence.refused(d)}
 
 

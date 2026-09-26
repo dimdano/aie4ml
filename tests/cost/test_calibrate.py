@@ -15,7 +15,7 @@ def test_calibration_picks_legal_points_inside_the_region_and_holds_validation_p
     )
     variant = next(v for v in get_op_impl_registry().candidates('dense') if v.variant_id == 'dense.b.r.v1')
     region = {'tile_inner_lhs': 48, 'tile_inner_rhs': 32}
-    plan = Plan(space, variant, 'xcvc1902-vsva2197-2mp-e-s', region, tmp_path, jobs=2)
+    plan = Plan(space, variant, 'xcvc1902-vsva2197-2mp-e-s', 'C', region, tmp_path, jobs=2)
     (group,) = plan.groups({})  # int8 x int16 weights: refused by lowering
     plan.extend(group, 1, fit=6, validate=2, least=True)
     picked = plan.picked[(group, 1)]
@@ -39,7 +39,7 @@ def test_a_design_vitis_fails_to_build_is_refused_once_and_calibration_goes_on(t
         shape={'rows': (4,), 'k': (48, 96), 'n': (32,)},
     )
     variant = next(v for v in get_op_impl_registry().candidates('dense') if v.variant_id == 'dense.b.r.v1')
-    plan = Plan(space, variant, 'xcvc1902-vsva2197-2mp-e-s', {}, tmp_path / 'designs', jobs=1)
+    plan = Plan(space, variant, 'xcvc1902-vsva2197-2mp-e-s', 'C', {}, tmp_path / 'designs', jobs=1)
     (group,) = plan.groups({})
     plan.extend(group, 1, fit=2, validate=0, least=False)
     evidence = calibrate.Evidence(tmp_path / 'evidence.json')
