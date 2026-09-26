@@ -77,3 +77,41 @@ def test_hls4ml_depthwise_reaches_the_compact_group_contract(lowered):
     padded = blocks if blocks == 1 else blocks + blocks % 2  # pairs, except a lone block
     grid = tiles.reshape(9, blocks, padded, 8, 8)
     assert np.count_nonzero(grid[0, 0, 0]) == np.count_nonzero(np.diag(grid[0, 0, 0]))
+
+
+def test_layers_without_bias_lower_with_only_their_operands(tmp_path):
+    """hls4ml gives each layer without bias a zero bias weight for its own templates; aie4ml lowers none."""
+    hls4ml = pytest.importorskip('hls4ml')
+    pytest.importorskip('qkeras')
+    import aie4ml
+    from keras.models import Sequential
+    from qkeras import QActivation, QConv2D, QDense, QDepthwiseConv2D, quantized_bits, quantized_relu
+
+    q_w = quantized_bits(BITS, 2, alpha=1)
+    model = Sequential(
+        [
+            tf.keras.layers.InputLayer(input_shape=(H, W, CIN)),
+            QConv2D(COUT, (3, 3), padding='same', kernel_quantizer=q_w, use_bias=False, name='conv'),
+            QActivation(quantized_relu(BITS, 2), name='relu'),
+            QDepthwiseConv2D((3, 3), padding='same', depthwise_quantizer=q_w, use_bias=False, name='dw'),
+            QActivation(quantized_relu(BITS, 2), name='dwrelu'),
+            tf.keras.layers.Flatten(name='flatten'),
+            QDense(CLASSES, kernel_quantizer=q_w, use_bias=False, name='fc'),
+        ]
+    )
+    config = hls4ml.utils.config_from_keras_model(model, granularity='name')
+    config['Model']['Precision'] = f'ap_fixed<{BITS},3>'
+    hls_model = hls4ml.converters.convert_from_keras_model(
+        model,
+        backend='AIE',
+        io_type='io_parallel',
+        output_dir=str(tmp_path / 'proj'),
+        part=PART,
+        hls_config=config,
+        project_name='proj',
+        batch_size=1,
+    )
+    weighted = [n for n in aie4ml.from_hls4ml(hls_model).context.ir.logical if n.op_type in ('conv2d', 'dense')]
+    assert [n.op_type for n in weighted] == ['conv2d', 'conv2d', 'dense']
+    for node in weighted:
+        assert sorted(node.roles.values()) == ['lhs', 'rhs'] and len(node.inputs) == 2, node.name

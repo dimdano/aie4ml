@@ -126,9 +126,11 @@ def _create_weight_tensors(layer, graph: LogicalIR):
     )
     graph.add_tensor(weight_tv)
 
+    if layer.get_attr('bias_data') is None:
+        return weight_tv, None
     bias_var = layer.weights.get('bias')
     if bias_var is None or bias_var.data is None:
-        return weight_tv, None
+        raise RuntimeError(f'Layer {layer.name}: has bias data but no bias weight.')
 
     bias_precision = getattr(bias_var.type, 'precision', None)
     if bias_precision is None:
