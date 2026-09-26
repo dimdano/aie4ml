@@ -1,6 +1,7 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
+from functools import lru_cache
 from pathlib import Path
 from shutil import copyfile
 
@@ -9,12 +10,44 @@ from jinja2 import Environment, FileSystemLoader
 from .passes.utils import sanitize_identifier
 from .serialization import dump_pipeline_ir
 
+TEMPLATE_ROOT = Path(__file__).resolve().parent / 'templates'
+
+
+@lru_cache(maxsize=None)
+def _firmware_env() -> Environment:  # one per process: Jinja keeps each template it compiled
+    return Environment(loader=FileSystemLoader(str(TEMPLATE_ROOT / 'firmware')), trim_blocks=True, lstrip_blocks=True)
+
+
+def _layer(inst, placement, struct_name: str) -> dict:
+    """What an instance's parameter template renders from."""
+    params = inst.variant.build_template_params(inst.node, inst.config, placement)
+    layer = {
+        'struct_name': struct_name,
+        'op_impl': {
+            'graph_header': inst.graph_header,
+            'graph_name': inst.graph_name,
+            'param_template': inst.param_template,
+            'parameters': params,
+        },
+        'placement': placement,
+    }
+    layer.update({k: inst.node.metadata[k] for k in ('n_in', 'n_out') if k in inst.node.metadata})
+    return layer
+
+
+def kernel_config(inst) -> str:
+    """The configuration struct an instance's kernels are compiled against, rendered at one fixed anchor
+    (tile 0,0) so it names the kernel, not a placement: the compiler schedules a kernel from it, whatever
+    tiles and banks it is then given. Rendered for identity only, never built."""
+    template = _firmware_env().get_template(f'variants/{inst.param_template}/parameters.h.jinja')
+    return template.render(L=_layer(inst, {'col': 0, 'row': 0}, 'KernelCfg'))
+
 
 class AIEProjectEmitter:
     """Framework-agnostic project emitter. Takes a populated AIEBackendContext and writes all output files."""
 
     def __init__(self):
-        self._template_root = Path(__file__).resolve().parent / 'templates'
+        self._template_root = TEMPLATE_ROOT
 
     def emit(self, ctx):
         output_dir = ctx.project_config.output_dir
@@ -24,12 +57,7 @@ class AIEProjectEmitter:
         graph_plan = ctx.ir.physical.plan or {}
         dump_pipeline_ir(ctx, output_dir / 'aie_pipeline.json')
 
-        firmware_dir = self._template_root / 'firmware'
-        env = Environment(
-            loader=FileSystemLoader(str(firmware_dir)),
-            trim_blocks=True,
-            lstrip_blocks=True,
-        )
+        env = _firmware_env()
 
         self._emit_kernel_artifacts(output_dir, layers, env)
         self._copy_kernel_sources(output_dir, ctx.project_config.custom_sources)
@@ -71,22 +99,14 @@ class AIEProjectEmitter:
             artifacts = variant.get_artifacts(inst)
 
             sanitized_name = sanitize_identifier(inst.name)
-            entry = {
-                'index': layer_index,
-                'inst_name': sanitized_name,
-                'op_impl_name': sanitized_name,
-                'struct_name': f'L{layer_index}Cfg',
-                'op_impl': {
-                    'graph_header': inst.graph_header,
-                    'graph_name': inst.graph_name,
-                    'param_template': inst.param_template,
-                    'parameters': variant.build_template_params(node, inst.config, placement),
-                },
-                'port_views': inst.port_views,
-                'placement': placement,
-                'artifacts': artifacts,
-            }
-            entry.update({k: node.metadata[k] for k in ('n_in', 'n_out') if k in node.metadata})
+            entry = _layer(inst, placement, f'L{layer_index}Cfg')
+            entry.update(
+                index=layer_index,
+                inst_name=sanitized_name,
+                op_impl_name=sanitized_name,
+                port_views=inst.port_views,
+                artifacts=artifacts,
+            )
             layers.append(entry)
 
         return layers

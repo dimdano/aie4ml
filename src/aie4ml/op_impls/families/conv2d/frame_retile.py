@@ -50,7 +50,7 @@ class FrameRetileOpImplVariant(OpImplVariant):
             locations.append(BufferLocation('out1', window, flow.output_col, window, (0, 3)))
         return tuple(locations)
 
-    def build_template_params(self, node, config: FrameRetileConfig, placement):
+    def kernel_params(self, node, config: FrameRetileConfig):
         view = config.frame_view
         _, rows, cols, channels = (int(x) for x in view.tile)
         return {
@@ -64,7 +64,6 @@ class FrameRetileOpImplVariant(OpImplVariant):
             'stride': config.column_phases,
             'origin_c': int(view.origin[2]),
             'frame_bytes': int(np.prod(view.tile)),
-            'buffer_locations': self.buffer_locations(node, config, int(placement['row'])),
         }
 
     def build_ports(self, _node, config: FrameRetileConfig) -> PortMap:

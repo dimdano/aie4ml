@@ -247,7 +247,7 @@ class OnnxImportContext:
         roles: Optional[Sequence[str]] = None,
     ) -> OpNode:
         """Create a semantic OpNode, wire it, and register its outputs."""
-        op = OpNode(name=f'{node_name}_aie', op_type=op_type, dialect=self.device.dialect)
+        op = OpNode(name=f'{node_name}_aie', op_type=op_type)
         op.metadata.update(metadata)
         if roles is not None:
             op.metadata['input_roles'] = list(roles)

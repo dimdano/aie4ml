@@ -36,7 +36,6 @@ def serialize_logical_node(node: OpNode) -> Dict[str, Any]:
     return {
         'name': node.name,
         'op_type': node.op_type,
-        'dialect': node.dialect,
         'inputs': [t.name for t in node.inputs],
         'outputs': [t.name for t in node.outputs],
         'traits': {name: trait.data for name, trait in node.traits.items()},

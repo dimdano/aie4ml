@@ -178,12 +178,11 @@ class _SoftmaxVariantBase(OpImplVariant):
                 f'got output frac={config.precision["output"].frac}.'
             )
 
-    def build_template_params(self, node: OpNode, config: SoftmaxConfig, placement):
+    def kernel_params(self, node: OpNode, config: SoftmaxConfig):
         in_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         params.update(rows=int(in_view.compacted_tile_outer), cols=int(in_view.full_inner))
         params['packed_hccs'] = self._packed_hccs(config, int(in_view.full_inner))
-        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def _packed_hccs(self, config: SoftmaxConfig, cols: int) -> Dict[str, Any]:

@@ -44,7 +44,7 @@ class _BaseDenseMatmulVariant(OpImplVariant):
     contract: ClassVar[str]
     supported_directives: ClassVar[frozenset] = frozenset({'parallelism', 'microtiling'})
 
-    def build_template_params(self, node, config, placement):
+    def kernel_params(self, node, config):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         lhs_view = config.io_views[lhs_tensor.name]
         output_view = config.io_views[node.outputs[0].name]
@@ -58,7 +58,6 @@ class _BaseDenseMatmulVariant(OpImplVariant):
             tile_inner_lhs_raw=lhs_view.tile_raw_inner,
             tile_inner_rhs_raw=output_view.tile_raw_inner,
         )
-        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         params['stream_io'] = self.port_kind == PORT_KIND_STREAM
         return params
 

@@ -227,11 +227,10 @@ class AddOpImplVariant(OpImplVariant):
                     f'does not match output_port_count {port_count}.'
                 )
 
-    def build_template_params(self, node: OpNode, config: AddConfig, placement):
+    def kernel_params(self, node: OpNode, config: AddConfig):
         lhs_view = config.io_views[input_tensor_for_role(node, 'lhs').name]
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
         params['tile_elements'] = int(math.prod(lhs_view.tile))
-        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):

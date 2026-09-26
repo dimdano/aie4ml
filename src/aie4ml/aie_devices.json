@@ -1,111 +1,125 @@
 {
-  "vek385_base": {
-    "DeviceName": "Vek385",
-    "Generation": "AIE-MLV2",
-    "Columns": 36,
-    "Rows": 4,
-    "ColumnStart": 7,
-    "RowStart": 0,
-    "PLIOWidthBits": 128,
-    "CoreStreamInputs": 1,
-    "CoreStreamOutputs": 1,
-    "StreamSwitchWidthBits": 64,
-    "CascadeWidthBits": 512,
-    "PLClockFreqMHz": 312.5,
-    "Memory": {
-      "BankMemBytes": 16384
+  "generations": {
+    "AIE": {
+      "VectorBytes": 32,
+      "TileMemBytes": 32768,
+      "BankCount": 4,
+      "Memory": {
+        "BankMemBytes": 8192
+      },
+      "CoreStreamInputs": 2,
+      "CoreStreamOutputs": 2,
+      "StreamSwitchWidthBits": 32,
+      "CascadeWidthBits": 384,
+      "CascadeOutputFifoDepth": 2,
+      "CascadeInputFifoDepth": 2,
+      "HasMemTile": false,
+      "MaxMemTileInPorts": 0,
+      "MaxMemTileOutPorts": 0,
+      "CascadeLayout": "alternating_horizontal",
+      "PLIOWidthBits": 128,
+      "StoreBytes": 32
     },
-    "MaxMemTileInPorts": 8,
-    "MaxMemTileOutPorts": 8,
-    "VectorBytes": 64,
-    "HasMemTile": true,
-    "BankCount": 4,
-    "TileMemBytes": 65536,
-    "CascadeLayout": "uniform_right"
-  },
-  "xilinx_vek280_base": {
-    "DeviceName": "Vek280",
-    "Generation": "AIE-ML",
-    "Columns": 38,
-    "Rows": 8,
-    "ColumnStart": 7,
-    "RowStart": 0,
-    "PLIOWidthBits": 128,
-    "CoreStreamInputs": 1,
-    "CoreStreamOutputs": 1,
-    "StreamSwitchWidthBits": 32,
-    "CascadeWidthBits": 512,
-    "PLClockFreqMHz": 312.5,
-    "Memory": {
-      "BankMemBytes": 16384
+    "AIE-ML": {
+      "VectorBytes": 64,
+      "TileMemBytes": 65536,
+      "BankCount": 4,
+      "Memory": {
+        "BankMemBytes": 16384
+      },
+      "CoreStreamInputs": 1,
+      "CoreStreamOutputs": 1,
+      "StreamSwitchWidthBits": 32,
+      "CascadeWidthBits": 512,
+      "CascadeOutputFifoDepth": 2,
+      "CascadeInputFifoDepth": 2,
+      "HasMemTile": true,
+      "MaxMemTileInPorts": 8,
+      "MaxMemTileOutPorts": 8,
+      "CascadeLayout": "uniform_right",
+      "PLIOWidthBits": 128,
+      "StoreBytes": 32
     },
-    "MaxMemTileInPorts": 8,
-    "MaxMemTileOutPorts": 8,
-    "VectorBytes": 64,
-    "HasMemTile": true,
-    "BankCount": 4,
-    "TileMemBytes": 65536,
-    "CascadeLayout": "uniform_right",
-    "UltraRAM": {
-      "BlockBytes": 36864,
-      "Blocks": 264,
-      "Depth": 4096,
-      "WidthBits": 72
-    },
-    "BlockRAM": {
-      "BlockBytes": 4608,
-      "Blocks": 600,
-      "Depth": 512,
-      "WidthBits": 72
+    "AIE-MLV2": {
+      "VectorBytes": 64,
+      "TileMemBytes": 65536,
+      "BankCount": 4,
+      "Memory": {
+        "BankMemBytes": 16384
+      },
+      "CoreStreamInputs": 1,
+      "CoreStreamOutputs": 1,
+      "StreamSwitchWidthBits": 64,
+      "CascadeWidthBits": 512,
+      "HasMemTile": true,
+      "MaxMemTileInPorts": 8,
+      "MaxMemTileOutPorts": 8,
+      "CascadeLayout": "uniform_right",
+      "PLIOWidthBits": 128,
+      "StoreBytes": 64
     }
   },
-  "xcvp2802-vsva5601-2mhp-e-s": {
-    "DeviceName": "VP2802",
-    "Generation": "AIE",
-    "AIECompilerTarget": "part",
-    "Columns": 59,
-    "Rows": 8,
-    "ColumnStart": 7,
-    "RowStart": 0,
-    "PLIOWidthBits": 128,
-    "CoreStreamInputs": 2,
-    "CoreStreamOutputs": 2,
-    "StreamSwitchWidthBits": 32,
-    "CascadeWidthBits": 384,
-    "PLClockFreqMHz": 312.5,
-    "Memory": {
-      "BankMemBytes": 8192
+  "parts": {
+    "xcvc1902-vsva2197-2mp-e-s": {
+      "DeviceName": "VC1902",
+      "Generation": "AIE",
+      "Columns": 50,
+      "Rows": 8,
+      "ColumnStart": 7,
+      "RowStart": 0,
+      "PLClockFreqMHz": 312.5,
+      "AIEClockFreqMHz": 1250
     },
-    "MaxMemTileInPorts": 0,
-    "MaxMemTileOutPorts": 0,
-    "VectorBytes": 32,
-    "HasMemTile": false,
-    "BankCount": 4,
-    "TileMemBytes": 32768,
-    "CascadeLayout": "alternating_horizontal"
+    "xcvp2802-vsva5601-2mhp-e-s": {
+      "DeviceName": "VP2802",
+      "Generation": "AIE",
+      "Columns": 59,
+      "Rows": 8,
+      "ColumnStart": 7,
+      "RowStart": 0,
+      "PLClockFreqMHz": 312.5,
+      "AIEClockFreqMHz": 1250
+    },
+    "xcve2802-vsvh1760-2mp-e-s": {
+      "DeviceName": "VE2802",
+      "Generation": "AIE-ML",
+      "Columns": 38,
+      "Rows": 8,
+      "ColumnStart": 7,
+      "RowStart": 0,
+      "PLClockFreqMHz": 312.5,
+      "BlockRAM": {
+        "Blocks": 600,
+        "Depth": 512,
+        "WidthBits": 72
+      },
+      "UltraRAM": {
+        "Blocks": 264,
+        "Depth": 4096,
+        "WidthBits": 72
+      },
+      "AIEClockFreqMHz": 1000
+    },
+    "xc2ve3858-ssva2112-2mp-e-s": {
+      "DeviceName": "2VE3858",
+      "Generation": "AIE-MLV2",
+      "Columns": 36,
+      "Rows": 4,
+      "ColumnStart": 7,
+      "RowStart": 0,
+      "PLClockFreqMHz": 312.5,
+      "AIEClockFreqMHz": 1250
+    }
   },
-  "xilinx_vck190_base": {
-    "DeviceName": "VCK190",
-    "Generation": "AIE",
-    "Columns": 50,
-    "Rows": 8,
-    "ColumnStart": 7,
-    "RowStart": 0,
-    "PLIOWidthBits": 128,
-    "CoreStreamInputs": 2,
-    "CoreStreamOutputs": 2,
-    "StreamSwitchWidthBits": 32,
-    "CascadeWidthBits": 384,
-    "PLClockFreqMHz": 312.5,
-    "Memory": {
-      "BankMemBytes": 8192
+  "platforms": {
+    "xilinx_vck190_base": {
+      "Part": "xcvc1902-vsva2197-2mp-e-s"
     },
-    "MaxMemTileInPorts": 0,
-    "MaxMemTileOutPorts": 0,
-    "VectorBytes": 32,
-    "HasMemTile": false,
-    "BankCount": 4,
-    "TileMemBytes": 32768,
-    "CascadeLayout": "alternating_horizontal"
+    "xilinx_vek280_base": {
+      "Part": "xcve2802-vsvh1760-2mp-e-s"
+    },
+    "vek385_base": {
+      "Part": "xc2ve3858-ssva2112-2mp-e-s"
+    }
   }
 }

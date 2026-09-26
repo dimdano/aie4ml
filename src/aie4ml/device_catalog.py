@@ -1,7 +1,7 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Helpers for loading the AIE device catalog."""
+"""The AIE device catalog (aie_devices.json): hardware facts by part, shared by generation."""
 
 from __future__ import annotations
 
@@ -22,12 +22,7 @@ def load_device_catalog() -> Dict[str, Any]:
     """Return the cached device catalog loaded from aie_devices.json."""
     global _DEVICE_CATALOG
     if _DEVICE_CATALOG is None:
-        catalog_path = Path(__file__).with_name('aie_devices.json')
-        if catalog_path.exists():
-            with open(catalog_path, 'r') as handle:
-                _DEVICE_CATALOG = json.load(handle)
-        else:
-            _DEVICE_CATALOG = {}
+        _DEVICE_CATALOG = json.loads(Path(__file__).with_name('aie_devices.json').read_text())
     return _DEVICE_CATALOG
 
 
@@ -35,15 +30,27 @@ _RELEASE_SUFFIX = re.compile(r'_\d{6}_\d+$')
 
 
 def lookup_device(part_name: str) -> Dict[str, Any]:
-    """Return the catalog entry for a Vitis platform or raw device part."""
-
+    """The facts of a Vitis platform or device part and its AIECompilerTarget; {} for a name the catalog lacks."""
     catalog = load_device_catalog()
-    name = str(part_name)
-    for key in (name, name.lower(), _RELEASE_SUFFIX.sub('', name.lower())):
-        entry = catalog.get(key)
-        if entry:
-            return entry
+    name = str(part_name).lower()
+    for key in (name, _RELEASE_SUFFIX.sub('', name)):
+        if key in catalog['platforms']:
+            platform = dict(catalog['platforms'][key])
+            return _facts(catalog, platform.pop('Part'), platform, 'platform')
+        if key in catalog['parts']:
+            return _facts(catalog, key, {}, 'part')
     return {}
+
+
+def _facts(catalog: Dict[str, Any], part: str, platform: Dict[str, Any], target: str) -> Dict[str, Any]:
+    facts = {'AIECompilerTarget': target, 'Part': part}
+    entry = catalog['parts'][part]
+    for layer in (catalog['generations'][entry['Generation']], entry, platform):
+        for key, value in layer.items():
+            if key in facts:
+                raise ValueError(f'aie_devices.json gives {key!r} for part {part!r} more than once.')
+            facts[key] = value
+    return facts
 
 
 PART_HELP = (
@@ -53,7 +60,8 @@ PART_HELP = (
 
 
 def known_boards() -> str:
-    return ', '.join(sorted(load_device_catalog())) or '<none>'
+    catalog = load_device_catalog()
+    return ', '.join(sorted([*catalog['platforms'], *catalog['parts']]))
 
 
 def installed_platforms() -> list[str]:
@@ -74,10 +82,9 @@ def resolve_device(part_name: Any, aie_cfg: Dict[str, Any]) -> tuple[DeviceSpec,
         raise ValueError(f'Unknown part "{part_name}". {PART_HELP.format(boards=known_boards())}')
     merged = dict(entry)
     merged.update(aie_cfg)
-    merged.setdefault('Generation', entry.get('Generation', ''))
 
     installed = installed_platforms()
-    if merged.get('AIECompilerTarget', 'platform') == 'platform' and installed and str(part_name) not in installed:
+    if merged.get('AIECompilerTarget') == 'platform' and installed and str(part_name) not in installed:
         warnings.warn(
             f'Part "{part_name}" is not in this Vitis install, so the generated Makefile will '
             f'point at a missing .xpfm. Installed: {", ".join(installed)}.',

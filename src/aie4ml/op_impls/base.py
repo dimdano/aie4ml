@@ -105,8 +105,15 @@ class OpImplVariant:
     def validate_config(self, _node: OpNode, _config: Any, _device: Any) -> None:
         """Post-lowering attribute verifier. Override to enforce kernel ABI rules."""
 
-    def build_template_params(self, _node: OpNode, config: Any, _placement: Dict[str, int]) -> Dict[str, Any]:
-        return config
+    def kernel_params(self, _node: OpNode, _config: Any) -> Dict[str, Any]:
+        """What the kernel's configuration struct is generated from, placement aside: everything the compiler
+        schedules the kernel from."""
+        raise NotImplementedError(f'{self.variant_id} does not separate its kernel parameters from its placement.')
+
+    def build_template_params(self, node: OpNode, config: Any, placement: Dict[str, int]) -> Dict[str, Any]:
+        """The kernel parameters, then where placement puts its buffers."""
+        locations = self.buffer_locations(node, config, int(placement['row']))
+        return {**self.kernel_params(node, config), 'buffer_locations': locations}
 
     def input_conversions(
         self, _node: OpNode, _config: Any, _sources: Dict[str, ExecutionValue]

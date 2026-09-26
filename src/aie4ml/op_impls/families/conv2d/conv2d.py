@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, ClassVar, Dict
+from typing import Any, ClassVar, Dict, Tuple
 
 import numpy as np
 
@@ -56,11 +56,7 @@ the frame it holds stays a fraction of the whole image.
 """
 
 _SPATIAL_BLOCKS = {'AIE': 2, 'AIE-ML': 4, 'AIE-MLV2': 4}
-"""Register blocking measured best per generation: mmul row tiles per accumulator set.
-
-Measured on AIE-ML (3x3, Cin 8 -> Cout 32): at OUT_W 16 the 4-tile blocking is 22% faster
-(15.6 vs 20.1 cycles/pixel); at OUT_W 8 the two tie within 2%, so one constant serves both.
-"""
+"""Register blocking measured best per generation: mmul row tiles per accumulator set."""
 
 
 def _padded_blocks(blocks: int) -> int:
@@ -420,38 +416,50 @@ class Conv2dOpImplVariant(OpImplVariant):
             band -= 1
         return band
 
-    def build_template_params(self, node, config: Conv2dConfig, placement):
+    def _tile_extent(self, node, config: Conv2dConfig) -> Tuple[int, int, int, int, int]:
+        """What one tile computes per call: its input and output channel blocks, its output rows and
+        columns, and the columns it computes (whole register tiles)."""
+        lhs = input_tensor_for_role(node, 'lhs')
+        _, in_h, in_w, _ = (int(x) for x in lhs.shape)
+        in_blocks = int(config.io_views[lhs.name].tile[3]) // CHANNEL_BLOCK
+        out_blocks = align_up(int(input_tensor_for_role(node, 'rhs').shape[-1]), CHANNEL_BLOCK) // CHANNEL_BLOCK
+        out_h, out_w = config.spatial.output_extent(in_h, in_w)
+        # 'inner' chains own a share of the output channels; 'outer' chains own rows and each
+        # computes every channel.
+        if config.parallelism.contract == 'inner':
+            out_blocks //= int(config.parallelism.cas_num)
+        else:
+            out_h //= int(config.parallelism.cas_num)
+        out_w_computed = align_up(out_w, config.spatial_blocks * config.microtiling.microtile_m)
+        return in_blocks, out_blocks, out_h, out_w, out_w_computed
+
+    def fills_border(self, node, config: Conv2dConfig) -> bool:
+        """Who puts the zeros around the image: the kernel re-fills the border of a buffer another kernel
+        wrote; the host delivers it with the padded window at the boundary, the stream wrapper keeps it in
+        a frame it owns, and a retiler builds the whole frame."""
+        producer = input_tensor_for_role(node, 'lhs').producer
+        return producer is not None and self.port_kind == PORT_KIND_BUFFER and not self.retiles_input(config)
+
+    def kernel_params(self, node, config: Conv2dConfig):
         lhs = input_tensor_for_role(node, 'lhs')
         out = node.outputs[0]
         in_view, out_view = config.io_views[lhs.name], config.io_views[out.name]
-        _, in_rows, in_cols, in_channels = (int(x) for x in in_view.tile)
+        _, in_rows, in_cols, _ = (int(x) for x in in_view.tile)
         kh, kw = config.spatial.kernel
         _, in_h, in_w, cin = (int(x) for x in lhs.shape)
         outer = config.parallelism.contract == 'outer'
         cout = int(input_tensor_for_role(node, 'rhs').shape[-1])
-        # 'inner' chains own a share of the output channels; 'outer' chains own rows and each
-        # computes every channel.
-        out_blocks = align_up(cout, CHANNEL_BLOCK) // CHANNEL_BLOCK
-        if config.parallelism.contract == 'inner':
-            out_blocks //= int(config.parallelism.cas_num)
+        in_blocks, out_blocks, out_h, out_w, out_w_computed = self._tile_extent(node, config)
         out_blocks_padded = _padded_blocks(out_blocks)
-        out_h, out_w = config.spatial.output_extent(in_h, in_w)
         band = self.band_rows(node, config)
         streamed = self.port_kind == PORT_KIND_STREAM
-        if outer:
-            out_h //= int(config.parallelism.cas_num)
-        # Who puts the zeros around the image: the kernel re-fills the border of a buffer another
-        # kernel wrote, the host delivers it with the padded window at the boundary, the stream
-        # wrapper keeps it in a frame it owns, and a retiler builds the whole frame.
-        retile = self.retiles_input(config)
-        fills_border = lhs.producer is not None and self.port_kind == PORT_KIND_BUFFER and not retile
         # A band's window starts mid-image, so the image no longer sits at the frame's origin.
         whole_image = not outer
         params = {field: getattr(config, field) for field in config.__dataclass_fields__}
         params.update(
             cin=cin,
             cout=cout,
-            in_blocks=in_channels // CHANNEL_BLOCK,
+            in_blocks=in_blocks,
             out_blocks=out_blocks,
             out_blocks_padded=out_blocks_padded,
             in_h=in_h if whole_image else in_rows,
@@ -459,18 +467,17 @@ class Conv2dOpImplVariant(OpImplVariant):
             bands=out_h // band,
             in_w=in_w,
             in_rows=in_rows,
-            fills_border=fills_border,
+            fills_border=self.fills_border(node, config),
             in_cols=in_cols,
             in_origin_r=int(in_view.origin[1]) if whole_image else 0,
             in_origin_c=int(in_view.origin[2]),
             out_h=out_h,
             out_w=out_w,
-            out_w_computed=align_up(out_w, config.spatial_blocks * config.microtiling.microtile_m),
+            out_w_computed=out_w_computed,
             in_bytes=int(np.prod(in_view.tile)),
             out_bytes=int(np.prod(out_view.tile)),
-            weight_count=kh * kw * (in_channels // CHANNEL_BLOCK) * out_blocks_padded * CHANNEL_BLOCK**2,
+            weight_count=kh * kw * in_blocks * out_blocks_padded * CHANNEL_BLOCK**2,
             bias_count=out_blocks_padded * CHANNEL_BLOCK,
-            buffer_locations=self.buffer_locations(node, config, int(placement['row'])),
             stream_io=self.port_kind == PORT_KIND_STREAM,
         )
         if streamed:

@@ -179,9 +179,8 @@ class _LayerNormVariantBase(OpImplVariant):
                 'integer LayerNorm cannot left-shift or exceed NORM_SHIFT=15.'
             )
 
-    def build_template_params(self, node: OpNode, config: LayerNormConfig, placement):
+    def kernel_params(self, node: OpNode, config: LayerNormConfig):
         params = {f: getattr(config, f) for f in config.__dataclass_fields__}
-        params['buffer_locations'] = self.buffer_locations(node, config, int(placement['row']))
         return params
 
     def describe_input_staging(self, _node, config, tensor_name, port, buf_dims=None, _producer=None):

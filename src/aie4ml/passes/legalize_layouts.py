@@ -24,7 +24,7 @@ def _insert(ctx, inst: ExecutionInstance, conversion) -> None:
     source = inst.input(conversion.source)
     variant, config = conversion.variant, conversion.config
     # The converter implements no logical op: its node only names it.
-    node = OpNode(name=conversion.name, op_type=variant.op_type, dialect='aie')
+    node = OpNode(name=conversion.name, op_type=variant.op_type)
     variant.validate_config(node, config, ctx.device)
     routes = inst.io_route.get('inputs', {})
     view = inst.port_views[conversion.source]

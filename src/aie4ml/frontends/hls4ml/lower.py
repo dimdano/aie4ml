@@ -85,7 +85,6 @@ class LowerToAieIr(ModelOptimizerPass):
             node = OpNode(
                 name=f'{layer.name}_aie',
                 op_type=self._map_op_type(layer),
-                dialect=ctx.device.dialect,
             )
             self._collect_metadata(layer, node)
             node.directives.update(extract_layer_directives(layer, model))

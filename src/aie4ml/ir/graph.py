@@ -57,7 +57,6 @@ class OpNode:
 
     name: str
     op_type: str
-    dialect: str
 
     inputs: List[TensorVar] = field(default_factory=list)
     outputs: List[TensorVar] = field(default_factory=list)

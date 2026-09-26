@@ -356,7 +356,7 @@ def test_a_transpose_never_folds_under_a_view_op():
         ('t', 'transpose', [x], [view], {'perm': [1, 0], 'data_format': 'channels_last'}),
         ('slice', 'slice', [view], [cut], {'axis': 1, 'slices': [{'start': 0, 'extent': 4}]}),
     ):
-        node = OpNode(name, op, 'aie', inputs=inputs, outputs=outputs, metadata=meta)
+        node = OpNode(name, op, inputs=inputs, outputs=outputs, metadata=meta)
         for tensor in inputs:
             tensor.consumers.append(node)
         for tensor in outputs:

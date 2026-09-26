@@ -134,17 +134,7 @@ class AIEModel:
 
         ctx = self.context
         output_dir = ctx.project_config.output_dir
-        if not output_dir.exists():
-            raise FileNotFoundError(
-                f'Output directory "{output_dir}" does not exist. Run write() and compile() before predicting.'
-            )
-
-        self._ensure_runtime_plan()
-        layout = build_io_layout(self)
-        iterations = int(ctx.aie_config['Iterations'])
-        plio_width = ctx.device.plio_width_bits
-        prepared_inputs = prepare_inputs(layout, X, iterations=iterations, quantize=quantize_in)
-        write_input_files(output_dir, layout, prepared_inputs, plio_width_bits=plio_width)
+        layout = self.write_inputs(X, quantize_in=quantize_in)
 
         log.info('Running %s simulation using make %s', ctx.project_config.project_name, make_target)
         run_simulation_target(output_dir, make_target)
@@ -159,6 +149,18 @@ class AIEModel:
         if len(final_out) == 1:
             return _flatten_iters(next(iter(final_out.values())))
         return {k: _flatten_iters(v) for k, v in final_out.items()}
+
+    def write_inputs(self, X, *, quantize_in: bool = True):
+        """Write `X` into the written project's simulator input files, as `predict` does; returns the I/O layout."""
+        ctx = self.context
+        output_dir = ctx.project_config.output_dir
+        if not output_dir.exists():
+            raise FileNotFoundError(f'Output directory "{output_dir}" does not exist. Run write() first.')
+        self._ensure_runtime_plan()
+        layout = build_io_layout(self)
+        prepared = prepare_inputs(layout, X, iterations=int(ctx.aie_config['Iterations']), quantize=quantize_in)
+        write_input_files(output_dir, layout, prepared, plio_width_bits=ctx.device.plio_width_bits)
+        return layout
 
     def report(self):
         """Resource, latency and per-kernel cycle report for this project."""

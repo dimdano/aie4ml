@@ -48,8 +48,6 @@ def _max_preloadable_iterations(
     stream, no ping-pong -> copies=1); the memory_stream movers stream instead.
     """
     avail_blocks, depth, width, _ = _pl_pool(ctx, pl_memory)
-    if avail_blocks <= 0:
-        raise RuntimeError('PL on-chip budget is unknown for this device (missing UltraRAM/BlockRAM block geometry).')
 
     def _blocks(n_iter: int) -> int:
         return _onchip_blocks(512, ifm_per_stream * n_iter, n_ifm, depth, width, copies=1) + _onchip_blocks(
@@ -78,12 +76,11 @@ def _max_preloadable_iterations(
 def _pl_pool(ctx, pl_memory: str):
     """(usable_blocks, depth, width_bits, label) for the on-chip RAM pool PLMemory selects, read
     from the device catalog (aie_devices.json -> ctx.device)."""
-    d = ctx.device
-    if pl_memory == 'bram':
-        blocks, depth, width, label = int(d.bram_blocks), int(d.bram_depth), int(d.bram_width_bits), 'BRAM'
-    else:
-        blocks, depth, width, label = int(d.uram_blocks), int(d.uram_depth), int(d.uram_width_bits), 'URAM'
-    return int(blocks * _PL_USABLE_FRACTION), depth, width, label
+    label = 'BRAM' if pl_memory == 'bram' else 'URAM'
+    pool = ctx.device.bram if pl_memory == 'bram' else ctx.device.uram
+    if pool is None:
+        raise RuntimeError(f'aie_devices.json gives no {label} pool for {ctx.device.platform}: no PL buffers to plan.')
+    return int(pool.blocks * _PL_USABLE_FRACTION), pool.depth, pool.width_bits, label
 
 
 def _onchip_blocks(
@@ -113,14 +110,14 @@ def _check_memory_stream_fits(
     the on-chip pool, counted in BLOCKS. Suggests the other pool when it would fit. Returns blocks."""
     avail, _, width, label = _pl_pool(ctx, pl_memory)
     needed = _stream_buffer_blocks(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
-    if avail and needed > avail:
+    if needed > avail:
         other = 'bram' if pl_memory == 'uram' else 'uram'
-        o_avail, _, _, o_label = _pl_pool(ctx, other)
-        o_needed = _stream_buffer_blocks(ctx, other, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
-        if o_avail and o_needed <= o_avail:
-            hint = f" PLMemory='{other}' would fit ({o_needed}/{o_avail} {o_label}); try that."
-        else:
-            hint = ' Reduce the PLIO count (coarser slice) or target a larger device.'
+        hint = ' Reduce the PLIO count (coarser slice) or target a larger device.'
+        if (ctx.device.bram if other == 'bram' else ctx.device.uram) is not None:
+            o_avail, _, _, o_label = _pl_pool(ctx, other)
+            o_needed = _stream_buffer_blocks(ctx, other, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+            if o_needed <= o_avail:
+                hint = f" PLMemory='{other}' would fit ({o_needed}/{o_avail} {o_label}); try that."
         raise RuntimeError(
             f'memory_stream buffers need {needed} {label} blocks but only {avail} are '
             f'available (2 ping-pong x [{n_ifm} ifm + {n_ofm} ofm] banks; each 512-bit word '
