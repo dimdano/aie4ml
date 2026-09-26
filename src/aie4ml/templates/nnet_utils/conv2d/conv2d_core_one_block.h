@@ -28,9 +28,8 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
 
   if constexpr (ConfigT::FILLS_BORDER) conv2d_zero_border<ConfigT>(frame);
 
-  // The storing tile owns the bias: initial value at a chain's start, added to partial sums otherwise.
   aie::vector<bias_t, M * 8> bb;
-  if constexpr (!CASC_OUT) {
+  if constexpr (!CASC_IN) {
     aie::vector<bias_t, 8> b = aie::load_v<8>(bias);
     for (int m = 0; m < M; ++m) bb.template insert<8>(m, b);
   }
@@ -47,17 +46,15 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
           C3 = MMUL(readincr_v<MMUL::size_C>(inCascade));
         }
       } else {
-        aie::vector<bias_t, M * 8> init = bb;
-        if constexpr (CASC_OUT) init = aie::zeros<bias_t, M * 8>();
-        C0 = init; C1 = init;
-        if constexpr (MB == 4) { C2 = init; C3 = init; }
+        C0 = bb; C1 = bb;
+        if constexpr (MB == 4) { C2 = bb; C3 = bb; }
       }
 
-      const weight_t* __restrict pB = wts;
+      const weight_t __aie_dm_resource_a* __restrict pB = (const weight_t __aie_dm_resource_a*)wts;
       for (int t = 0; t < G::T; ++t)
         chess_prepare_for_pipelining
       {
-        const data_t* __restrict a = pA + G::TBL.off[t];
+        const data_t __aie_dm_resource_b* __restrict a = (const data_t __aie_dm_resource_b*)(pA + G::TBL.off[t]);
         aie::vector<weight_t, SB> B = aie::load_v<SB>(pB);
         pB += SB;
         if constexpr (MB == 2) {
@@ -87,7 +84,6 @@ static inline void conv2d_tile_one_block(typename ConfigT::data_t* frame,
         }
       } else {
         auto store_tile = [&](int mm, MMUL& acc) {
-          if constexpr (CASC_IN) acc = MMUL(aie::add(acc.to_accum(), bb));  // bias, once per chain
           aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
           if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
           if constexpr (ConfigT::FLATTEN) {

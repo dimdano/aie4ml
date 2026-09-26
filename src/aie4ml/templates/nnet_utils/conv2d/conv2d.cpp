@@ -29,10 +29,11 @@ void conv2d_single<ConfigT>::run(input_buffer<data_t>& ifm,
 template<typename ConfigT>
 void conv2d_first<ConfigT>::run(input_buffer<data_t>& ifm,
                                 const weight_t (&wts)[ConfigT::WN],
+                                const bias_t (&bias)[ConfigT::BN],
                                 output_cascade<acc_scalar_t>* outCascade)
 {
   conv2d_compute<ConfigT, false, true>(
-      const_cast<data_t*>(ifm.data()), wts, nullptr, nullptr, nullptr, outCascade);
+      const_cast<data_t*>(ifm.data()), wts, bias, nullptr, nullptr, outCascade);
 }
 
 template<typename ConfigT>
@@ -49,8 +50,7 @@ template<typename ConfigT>
 void conv2d_last<ConfigT>::run(input_buffer<data_t>& ifm,
                                const weight_t (&wts)[ConfigT::WN],
                                input_cascade<acc_scalar_t>* inCascade,
-                               const bias_t (&bias)[ConfigT::BN],
                                output_buffer<result_t>& ofm)
 {
-  conv2d_compute<ConfigT, true, false>(const_cast<data_t*>(ifm.data()), wts, bias, ofm.data(), inCascade, nullptr);
+  conv2d_compute<ConfigT, true, false>(const_cast<data_t*>(ifm.data()), wts, nullptr, ofm.data(), inCascade, nullptr);
 }

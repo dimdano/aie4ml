@@ -225,7 +225,7 @@ static inline void store_tile_pair(typename ConfigT::result_t* __restrict band, 
 // READ the raw chunks of the next band are read, with WRITE the row chunks of the
 // previous band are written, from inside the K loop: a fixed number per tile-pair
 // iteration so every loop keeps a constant trip count.
-// A single kernel seeds the accumulator with the bias; the end of a cascade adds it.
+// The first kernel of a chain, or a single one, seeds its accumulators with the bias.
 // ---------------------------------------------------------------------------
 template<typename ConfigT, bool CASC_IN, bool CASC_OUT, bool BIAS, bool READ, bool WRITE>
 static inline void dense_stream_band(const typename ConfigT::data_t* __restrict pA,
@@ -245,8 +245,7 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
   using bias_t   = typename T::bias_t;
   using MMUL     = typename T::MMUL;
   constexpr int M = T::M, K = T::K, N = T::N, colA = T::colA, colB = T::colB;
-  constexpr bool BIAS_INIT = BIAS && !CASC_IN && !CASC_OUT;
-  constexpr bool BIAS_END  = BIAS && CASC_IN && !CASC_OUT;
+  constexpr bool BIAS_INIT = BIAS && !CASC_IN;
   constexpr unsigned CHUNK_A = T::CHUNK_A, CHUNK_C = T::CHUNK_C;
   constexpr unsigned NJ = colB / (2 * N);      // tile-pair iterations per band
   constexpr unsigned NI = colA / K - 1;        // pipelined K steps per tile pair (first step peeled)
@@ -274,12 +273,6 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
     const weight_t* __restrict pB1 = pB + j * MMUL::size_B;
     const weight_t* __restrict pB2 = pB + (j + 1) * MMUL::size_B;
 
-    aie::vector<bias_t, M * N> bias_block_0, bias_block_1;
-    if constexpr (BIAS_INIT || BIAS_END) {
-      bias_block_0 = stream_row_replicator<M, bias_t, N>::run(aie::load_v<N>(pBias + j * N));
-      bias_block_1 = stream_row_replicator<M, bias_t, N>::run(aie::load_v<N>(pBias + (j + 1) * N));
-    }
-
     MMUL C00, C01, C10, C11;
     if constexpr (CASC_IN) {
       C00 = readincr_v<MMUL::size_C>(inCascade);
@@ -287,6 +280,8 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
       C10 = readincr_v<MMUL::size_C>(inCascade);
       C11 = readincr_v<MMUL::size_C>(inCascade);
     } else if constexpr (BIAS_INIT) {
+      auto bias_block_0 = stream_row_replicator<M, bias_t, N>::run(aie::load_v<N>(pBias + j * N));
+      auto bias_block_1 = stream_row_replicator<M, bias_t, N>::run(aie::load_v<N>(pBias + (j + 1) * N));
       C00 = bias_block_0; C01 = bias_block_1;
       C10 = bias_block_0; C11 = bias_block_1;
     }
@@ -341,12 +336,6 @@ static inline void dense_stream_band(const typename ConfigT::data_t* __restrict 
       writeincr(outCascade, C10.to_accum());
       writeincr(outCascade, C11.to_accum());
     } else {
-      if constexpr (BIAS_END) {
-        C00 = aie::add(C00.to_accum(), bias_block_0);
-        C01 = aie::add(C01.to_accum(), bias_block_1);
-        C10 = aie::add(C10.to_accum(), bias_block_0);
-        C11 = aie::add(C11.to_accum(), bias_block_1);
-      }
       store_tile_pair<ConfigT>(band_c, 0, j, C00, C01);
       store_tile_pair<ConfigT>(band_c, 1, j, C10, C11);
     }
@@ -420,9 +409,10 @@ void dense_single_stream<ConfigT>::run(input_stream<data_t>* ifm,
 template<typename ConfigT>
 void dense_first_stream<ConfigT>::run(input_stream<data_t>* ifm,
                                       const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                                      const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                       output_cascade<acc_scalar_t>* outCascade)
 {
-  dense_stream_rows<ConfigT, false, true, false>(ifm, wts, nullptr, nullptr, outCascade, nullptr);
+  dense_stream_rows<ConfigT, false, true, ConfigT::USE_BIAS>(ifm, wts, bias, nullptr, outCascade, nullptr);
 }
 
 template<typename ConfigT>
@@ -438,8 +428,7 @@ template<typename ConfigT>
 void dense_last_stream<ConfigT>::run(input_stream<data_t>* ifm,
                                      const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
                                      input_cascade<acc_scalar_t>* inCascade,
-                                     const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                      output_stream<result_t>* ofm)
 {
-  dense_stream_rows<ConfigT, true, false, ConfigT::USE_BIAS>(ifm, wts, bias, inCascade, nullptr, ofm);
+  dense_stream_rows<ConfigT, true, false, false>(ifm, wts, nullptr, inCascade, nullptr, ofm);
 }

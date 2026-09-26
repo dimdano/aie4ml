@@ -142,10 +142,8 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
     for (int z = 0; z < ConfigT::OUT_W_COMPUTED; z += MB * M) {
       const data_t* pA = frame + oy * ConfigT::STRIDE_H * G::RB + z * 8;
       for (int j = 0; j < NB; j += 2) {
-        // The tile that stores the result owns the bias: it starts from it when it is also the
-        // start of the chain, and adds it to the incoming partial sums otherwise.
         aie::vector<bias_t, M * 8> bb0, bb1;
-        if constexpr (!CASC_OUT) {
+        if constexpr (!CASC_IN) {
           aie::vector<bias_t, 8> b0 = aie::load_v<8>(bias + j * 8);
           aie::vector<bias_t, 8> b1 = aie::load_v<8>(bias + (j + 1) * 8);
           for (int m = 0; m < M; ++m) {
@@ -166,20 +164,15 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             C31 = MMUL(readincr_v<MMUL::size_C>(inCascade));
           }
         } else {
-          aie::vector<bias_t, M * 8> init0 = bb0, init1 = bb1;
-          if constexpr (CASC_OUT) {
-            init0 = aie::zeros<bias_t, M * 8>();
-            init1 = init0;
-          }
-          C00 = init0; C10 = init0; C01 = init1; C11 = init1;
-          if constexpr (MB == 4) { C20 = init0; C30 = init0; C21 = init1; C31 = init1; }
+          C00 = bb0; C10 = bb0; C01 = bb1; C11 = bb1;
+          if constexpr (MB == 4) { C20 = bb0; C30 = bb0; C21 = bb1; C31 = bb1; }
         }
 
-        const weight_t* __restrict pB = wts + j * SB;
+        const weight_t __aie_dm_resource_a* __restrict pB = (const weight_t __aie_dm_resource_a*)(wts + j * SB);
         for (int t = 0; t < G::T; ++t)
           chess_prepare_for_pipelining
         {
-          const data_t* __restrict a = pA + G::TBL.off[t];
+          const data_t __aie_dm_resource_b* __restrict a = (const data_t __aie_dm_resource_b*)(pA + G::TBL.off[t]);
           aie::vector<weight_t, SB> B0 = aie::load_v<SB>(pB);
           aie::vector<weight_t, SB> B1 = aie::load_v<SB>(pB + SB);
           pB += NBP * SB;
@@ -216,9 +209,8 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
             writeincr(outCascade, C31.to_accum());
           }
         } else {
-          auto store_tile = [&](int nb, int mm, MMUL& acc, const aie::vector<bias_t, M * 8>& bb) {
+          auto store_tile = [&](int nb, int mm, MMUL& acc) {
             if (nb >= NB) return;
-            if constexpr (CASC_IN) acc = MMUL(aie::add(acc.to_accum(), bb));  // bias, once per chain
             aie::vector<result_t, SA> tile = acc.template to_vector<result_t>(ConfigT::SHIFT);
             if constexpr (ConfigT::USE_RELU) tile = aie::max(tile, result_t(0));
             if constexpr (ConfigT::FLATTEN) {
@@ -239,11 +231,11 @@ static inline void conv2d_tile(typename ConfigT::data_t* frame,
               aie::store_v(o, tile);
             }
           };
-          store_tile(j, 0, C00, bb0); store_tile(j, 1, C10, bb0);
-          store_tile(j + 1, 0, C01, bb1); store_tile(j + 1, 1, C11, bb1);
+          store_tile(j, 0, C00); store_tile(j, 1, C10);
+          store_tile(j + 1, 0, C01); store_tile(j + 1, 1, C11);
           if constexpr (MB == 4) {
-            store_tile(j, 2, C20, bb0); store_tile(j, 3, C30, bb0);
-            store_tile(j + 1, 2, C21, bb1); store_tile(j + 1, 3, C31, bb1);
+            store_tile(j, 2, C20); store_tile(j, 3, C30);
+            store_tile(j + 1, 2, C21); store_tile(j + 1, 3, C31);
           }
         }
       }

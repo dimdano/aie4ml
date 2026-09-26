@@ -42,9 +42,11 @@ public:
         pin_buffer(kk[idx].in[0], ConfigT::IN1_BUFFER_LOCATIONS[idx], COL_START, ROW_START);
         adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
         adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
+        if (pos == 0) {  // the chain's first kernel seeds its accumulators with the bias
+          adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);
+        }
         if (pos == CAS_LENGTH - 1) {
           pin_buffer(kk[idx].out[0], ConfigT::OUT1_BUFFER_LOCATIONS[chain], COL_START, ROW_START);
-          adf::location<adf::buffer>(kk[idx].in[CAS_LENGTH == 1 ? 2 : 3]) = adf::bank(tileCol, tileRow, 1);
         }
       }
     }
@@ -80,11 +82,11 @@ public:
       if constexpr (!STREAM_IO) {
         dimensions(kk[idx].in[0]) = { ConfigT::IN_BYTES };
       }
+      if (col == 0) {
+        connect<parameter>(bias[chain], async(kk[idx].in[2]));
+        single_buffer(kk[idx].in[2]);
+      }
       if (col == CAS_LENGTH - 1) {
-        // The bias argument follows the cascade input on every chain longer than one tile.
-        const unsigned bias_port = (CAS_LENGTH == 1) ? 2 : 3;
-        connect<parameter>(bias[chain], async(kk[idx].in[bias_port]));
-        single_buffer(kk[idx].in[bias_port]);
         connect<>(kk[idx].out[0], out1[chain]);
         if constexpr (!STREAM_IO) {
           dimensions(kk[idx].out[0]) = { ConfigT::OUT_BYTES };

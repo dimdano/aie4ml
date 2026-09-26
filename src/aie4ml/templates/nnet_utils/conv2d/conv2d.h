@@ -51,10 +51,12 @@ class conv2d_first : public conv2d_base<ConfigT> {
 public:
   using data_t   = typename ConfigT::data_t;
   using weight_t = typename ConfigT::weight_t;
+  using bias_t   = typename ConfigT::bias_t;
   using acc_scalar_t = typename ConfigT::acc_scalar_t;
 
   void run(input_buffer<data_t>&  ifm,
            const weight_t (&wts)[ConfigT::WN],
+           const bias_t (&bias)[ConfigT::BN],
            output_cascade<acc_scalar_t>* outCascade);
 
   static void registerKernelClass() { REGISTER_FUNCTION(conv2d_first::run); }
@@ -81,13 +83,11 @@ public:
   using data_t   = typename ConfigT::data_t;
   using weight_t = typename ConfigT::weight_t;
   using result_t = typename ConfigT::result_t;
-  using bias_t   = typename ConfigT::bias_t;
   using acc_scalar_t = typename ConfigT::acc_scalar_t;
 
   void run(input_buffer<data_t>&  ifm,
            const weight_t (&wts)[ConfigT::WN],
            input_cascade<acc_scalar_t>* inCascade,
-           const bias_t (&bias)[ConfigT::BN],
            output_buffer<result_t>& ofm);
 
   static void registerKernelClass() { REGISTER_FUNCTION(conv2d_last::run); }

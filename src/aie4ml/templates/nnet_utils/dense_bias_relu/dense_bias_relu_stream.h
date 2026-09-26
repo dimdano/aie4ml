@@ -44,9 +44,11 @@ public:
   using weight_t      = typename ConfigT::weight_t;
   using result_t      = typename ConfigT::result_t;
   using acc_scalar_t  = typename ConfigT::acc_scalar_t;
+  using bias_t        = typename ConfigT::bias_t;
 
   void run(input_stream<data_t>*          ifm,
            const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+           const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
            output_cascade<acc_scalar_t>*  outCascade);
 
   static void registerKernelClass() { REGISTER_FUNCTION(dense_first_stream::run); }
@@ -75,12 +77,10 @@ public:
   using weight_t      = typename ConfigT::weight_t;
   using result_t      = typename ConfigT::result_t;
   using acc_scalar_t  = typename ConfigT::acc_scalar_t;
-  using bias_t        = typename ConfigT::bias_t;
 
   void run(input_stream<data_t>*          ifm,
            const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
            input_cascade<acc_scalar_t>*   inCascade,
-           const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
            output_stream<result_t>*       ofm);
 
   static void registerKernelClass() { REGISTER_FUNCTION(dense_last_stream::run); }

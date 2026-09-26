@@ -64,6 +64,9 @@ void place_graph(int COL_START, int ROW_START)
 
     adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
     adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
+    if (pos == 0) {  // the chain's first kernel seeds its accumulators with the bias
+      adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);
+    }
 
     if (is_last) {
       if constexpr (!STREAM_IO) {
@@ -77,12 +80,6 @@ void place_graph(int COL_START, int ROW_START)
             adf::bank(COL_START + outputLocation.col, ROW_START + outputLocation.row, outputLocation.bank1)
           };
         }
-      }
-
-      if constexpr (CAS_LENGTH == 1) {
-        adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);
-      } else {
-        adf::location<adf::buffer>(kk[idx].in[3]) = adf::bank(tileCol, tileRow, 1);
       }
     }
   }
@@ -126,14 +123,9 @@ void place_graph(int COL_START, int ROW_START)
         runtime<ratio>(kk[idx]) = 1.0;
         single_buffer(kk[idx].in[1]);
         connect<parameter>(wts[idx], async(kk[idx].in[1]));
-        if (col == CAS_LENGTH - 1){
-          if (col == 0){ // match the bias argument for kernel dense_first/dense_last
-            connect<parameter>(bias[row], async(kk[idx].in[2]));
-            single_buffer(kk[idx].in[2]);
-           } else {
-            connect<parameter>(bias[row], async(kk[idx].in[3]));
-            single_buffer(kk[idx].in[3]);
-           }
+        if (col == 0) {
+          connect<parameter>(bias[row], async(kk[idx].in[2]));
+          single_buffer(kk[idx].in[2]);
         }
 
     }

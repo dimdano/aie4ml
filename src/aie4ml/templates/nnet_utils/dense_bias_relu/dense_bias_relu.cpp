@@ -81,7 +81,7 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
 
   const data_t*      pA    = ifm.data();
-  const weight_t*    pB    = wts;
+  const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
   const bias_t* pBias = bias;
   result_t*          pC    = ofm.data();
 
@@ -92,8 +92,8 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
     for (unsigned j = 0; j < colB / N; j += 2) {
       const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
       if constexpr (ConfigT::TRANSPOSE_INPUT) {
@@ -169,6 +169,7 @@ void dense_single<ConfigT>::run(input_buffer<data_t>& ifm,
 template<typename ConfigT>
 void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
                                const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                               const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
                                output_cascade<acc_scalar_t>* outCascade)
 {
   static constexpr int rowA = ConfigT::padded_independent_extent;
@@ -181,14 +182,15 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
 
   const data_t*   pA = ifm.data();
-  const weight_t* pB = wts;
+  const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
+  const bias_t* pBias = bias;
 
   for (unsigned z = 0; z < rowA / M; z += 2) {
     for (unsigned j = 0; j < colB / N; j += 2) {
       const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
       if constexpr (ConfigT::TRANSPOSE_INPUT) {
@@ -203,10 +205,20 @@ void dense_first<ConfigT>::run(input_buffer<data_t>& ifm,
       aie::vector<weight_t, MMUL::size_B> B0 = aie::load_v<MMUL::size_B>(pB1); pB1 += MMUL::size_B * (colB / N);
       aie::vector<weight_t, MMUL::size_B> B1 = aie::load_v<MMUL::size_B>(pB2); pB2 += MMUL::size_B * (colB / N);
 
-      MMUL C00; C00.mul(A0, B0);
-      MMUL C01; C01.mul(A0, B1);
-      MMUL C10; C10.mul(A1, B0);
-      MMUL C11; C11.mul(A1, B1);
+      MMUL C00, C01, C10, C11;
+      if constexpr (ConfigT::USE_BIAS) {
+        auto bias_block_0 = replicate_rows<M, bias_t, N>(aie::load_v<N>(pBias + j * N));
+        auto bias_block_1 = replicate_rows<M, bias_t, N>(aie::load_v<N>(pBias + (j + 1) * N));
+        C00 = bias_block_0; C00.mac(A0, B0);
+        C01 = bias_block_1; C01.mac(A0, B1);
+        C10 = bias_block_0; C10.mac(A1, B0);
+        C11 = bias_block_1; C11.mac(A1, B1);
+      } else {
+        C00.mul(A0, B0);
+        C01.mul(A0, B1);
+        C10.mul(A1, B0);
+        C11.mul(A1, B1);
+      }
 
       for (unsigned i = 1; i < colA / K; ++i)
         chess_prepare_for_pipelining
@@ -254,7 +266,7 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
 
   const data_t*   pA = ifm.data();
-  const weight_t* pB = wts;
+  const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
 
   for (unsigned z = 0; z < rowA / M; z += 2) {
     for (unsigned j = 0; j < colB / N; j += 2) {
@@ -270,8 +282,8 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
 
       const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       aie::vector<data_t, MMUL::size_A> A0, A1;
       if constexpr (ConfigT::TRANSPOSE_INPUT) {
@@ -321,19 +333,12 @@ void dense_middle<ConfigT>::run(input_buffer<data_t>& ifm,
 }
 
 
-template<typename ConfigT, bool USE_BIAS, bool USE_RELU>
-static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
-                                   const typename ConfigT::weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
-                                   input_cascade<typename ConfigT::acc_scalar_t>* inCascade,
-                                   const typename ConfigT::bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
-                                   output_buffer<typename ConfigT::result_t>& ofm)
+template<typename ConfigT>
+void dense_last<ConfigT>::run(input_buffer<data_t>& ifm,
+                              const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
+                              input_cascade<acc_scalar_t>* inCascade,
+                              output_buffer<result_t>& ofm)
 {
-  using data_t       = typename ConfigT::data_t;
-  using weight_t     = typename ConfigT::weight_t;
-  using bias_t  = typename ConfigT::bias_t;
-  using result_t     = typename ConfigT::result_t;
-  using acc_scalar_t = typename ConfigT::acc_scalar_t;
-
   static constexpr int rowA  = ConfigT::padded_independent_extent;
   static constexpr int colA  = ConfigT::IN_FEAT_SLICE;
   static constexpr int colB  = ConfigT::OUT_FEAT_SLICE;
@@ -345,8 +350,7 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
   using MMUL = aie::mmul<M, K, N, data_t, weight_t, acc_scalar_t>;
 
   const data_t*      pA    = ifm.data();
-  const weight_t*    pB    = wts;
-  const bias_t* pBias = bias;
+  const weight_t __aie_dm_resource_a* pB = (const weight_t __aie_dm_resource_a*)wts;
   result_t*          pC    = ofm.data();
 
   for (unsigned z = 0; z < rowA / M; z += 2) {
@@ -356,8 +360,8 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
     for (unsigned j = 0; j < colB / N; j += 2) {
       const data_t*   __restrict pA1 = pA + (      z * (colA / K) + 0) * MMUL::size_A;
       const data_t*   __restrict pA2 = pA + ((z + 1) * (colA / K) + 0) * MMUL::size_A;
-      const weight_t* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
-      const weight_t* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB1 = pB + (0 * (colB / N) +       j) * MMUL::size_B;
+      const weight_t __aie_dm_resource_a* __restrict pB2 = pB + (0 * (colB / N) + (j + 1)) * MMUL::size_B;
 
       MMUL C00(readincr_v<MMUL::size_C>(inCascade));
       MMUL C01(readincr_v<MMUL::size_C>(inCascade));
@@ -401,20 +405,7 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
         C11.mac(A1, B1);
       }
 
-      if constexpr (USE_BIAS) {
-        aie::vector<bias_t, N> bias_v_0 = aie::load_v<N>(pBias + j * N);
-        aie::vector<bias_t, N> bias_v_1 = aie::load_v<N>(pBias + (j + 1) * N);
-
-        auto bias_block_0 = replicate_rows<M, bias_t, N>(bias_v_0);
-        auto bias_block_1 = replicate_rows<M, bias_t, N>(bias_v_1);
-
-        C00 = aie::add(C00.to_accum(), bias_block_0);
-        C01 = aie::add(C01.to_accum(), bias_block_1);
-        C10 = aie::add(C10.to_accum(), bias_block_0);
-        C11 = aie::add(C11.to_accum(), bias_block_1);
-      }
-
-      if constexpr (USE_RELU) {
+      if constexpr (ConfigT::USE_RELU) {
         aie::store_v(pC1, aie::max(C00.template to_vector<result_t>(SHIFT), result_t(0))); pC1 += MMUL::size_C;
         aie::store_v(pC1, aie::max(C01.template to_vector<result_t>(SHIFT), result_t(0))); pC1 += MMUL::size_C;
         aie::store_v(pC2, aie::max(C10.template to_vector<result_t>(SHIFT), result_t(0))); pC2 += MMUL::size_C;
@@ -426,26 +417,5 @@ static inline void dense_last_impl(input_buffer<typename ConfigT::data_t>& ifm,
         aie::store_v(pC2, C11.template to_vector<result_t>(SHIFT)); pC2 += MMUL::size_C;
       }
     }
-  }
-}
-
-//weird but might help the compiler to avoid avoids DSFG/postamble bugs?
-template<typename ConfigT>
-void dense_last<ConfigT>::run(input_buffer<data_t>& ifm,
-                              const weight_t (&wts)[ConfigT::IN_FEAT_SLICE * ConfigT::OUT_FEAT_SLICE],
-                              input_cascade<acc_scalar_t>* inCascade,
-                              const bias_t (&bias)[ConfigT::OUT_FEAT_SLICE],
-                              output_buffer<result_t>& ofm)
-{
-  if constexpr (ConfigT::USE_BIAS) {
-    if constexpr (ConfigT::USE_RELU)
-      dense_last_impl<ConfigT, true,  true>(ifm, wts, inCascade, bias, ofm);
-    else
-      dense_last_impl<ConfigT, true,  false>(ifm, wts, inCascade, bias, ofm);
-  } else {
-    if constexpr (ConfigT::USE_RELU)
-      dense_last_impl<ConfigT, false, true>(ifm, wts, inCascade, bias, ofm);
-    else
-      dense_last_impl<ConfigT, false, false>(ifm, wts, inCascade, bias, ofm);
   }
 }
